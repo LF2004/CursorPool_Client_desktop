@@ -1,3 +1,9 @@
+# 项目截图
+<img  width="820"  alt="image" src="https://github.com/LF2004/CursorPool_Client_desktop/blob/main/assets/images/PixPin_2026-06-18_23-24-39.png" />
+<img  width="820"  alt="image" src="https://github.com/LF2004/CursorPool_Client_desktop/blob/main/assets/images/PixPin_2026-06-18_23-25-11.png" />
+<img  width="820"  alt="image" src="https://github.com/LF2004/CursorPool_Client_desktop/blob/main/assets/images/PixPin_2026-06-18_23-25-20.png" />
+<img  width="820"  alt="image" src="https://github.com/LF2004/CursorPool_Client_desktop/blob/main/assets/images/PixPin_2026-06-18_23-25-33.png" />
+
 # Cursor Relay Local — 本地 Agent 能力还原说明
 
 纯本地版 Cursor Agent 中继工具。不依赖任何远程后端，仅在本机完成：
@@ -277,4 +283,4 @@ skills/cursor_modes/agent/        # Agent system prompt & tools schema
 
 1095670525
 点击链接加入群聊【Mirai帆米CursorPool使用群】：https://qm.qq.com/q/SGuNwetVM6
-<img  width="820"  alt="image" src="./assets/images/qrcode_1781793808669.jpg" />
+<img  width="820"  alt="image" src="https://github.com/LF2004/CursorPool_Client_desktop/blob/main/assets/images/qrcode_1781793808669.jpg" />
