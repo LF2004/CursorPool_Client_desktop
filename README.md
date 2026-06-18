@@ -229,6 +229,7 @@ AgentSession
 ```bash
 npm install
 npm run dev
+npm run build
 ```
 
 1. 打开「本地代理」→ 新增模型配置（Base URL、API Key、模型名、端点类型）
