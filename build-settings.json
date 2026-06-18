@@ -1,0 +1,6 @@
+{
+  "productName": "Cursor Relay Local",
+  "appId": "com.cursorrelay.local",
+  "logoPath": "./assets/icon.ico",
+  "electronMirror": "https://npmmirror.com/mirrors/electron/"
+}

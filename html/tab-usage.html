@@ -1,0 +1,121 @@
+<div id="usage" class="panel usage-page hidden">
+  <div class="record-filter-card usage-filter-card">
+    <span class="record-filter-title">筛选</span>
+    <div class="usage-filter-date-range">
+      <input type="date" id="usageDateFrom" class="input record-date no-drag" title="开始日期" />
+      <span class="record-date-arrow"><i class="fa fa-long-arrow-right"></i></span>
+      <input type="date" id="usageDateTo" class="input record-date no-drag" title="结束日期" />
+    </div>
+    <input type="text" id="usageModelFilter" class="input no-drag usage-filter-input" placeholder="模型" />
+    <input type="text" id="usageRequestFilter" class="input no-drag usage-filter-input" placeholder="Request ID" />
+    <div class="usage-filter-actions">
+      <button type="button" id="usageRefreshBtn" class="ghost-btn">刷新</button>
+      <button type="button" id="usageClearBtn" class="record-btn-danger">清空记录</button>
+    </div>
+  </div>
+
+  <div class="usage-summary-grid" aria-label="调用汇总">
+    <div class="usage-summary-card usage-cache-card">
+      <div class="usage-cache-header">
+        <span class="usage-summary-label">缓存命中率</span>
+        <button type="button" class="usage-info-btn usage-cache-info-btn" aria-label="缓存命中率说明" data-popover="cache-help">
+          <i class="fa fa-info-circle" aria-hidden="true"></i>
+        </button>
+      </div>
+      <div class="usage-cache-body">
+        <div class="usage-cache-gauge-wrap" aria-hidden="true">
+          <svg class="usage-cache-gauge-svg" viewBox="0 0 120 68" focusable="false">
+            <path class="usage-cache-gauge-track" d="M 10 58 A 50 50 0 0 1 110 58" pathLength="157.08" />
+            <path id="usageCacheGaugeFill" class="usage-cache-gauge-fill" d="M 10 58 A 50 50 0 0 1 110 58" pathLength="157.08" stroke-dasharray="157.08" stroke-dashoffset="157.08" />
+          </svg>
+          <strong id="usageCacheHitRate" class="usage-cache-rate">-</strong>
+        </div>
+        <div class="usage-cache-stats">
+          <div class="usage-cache-stat">
+            <span class="usage-cache-stat-label">Token 消耗</span>
+            <span id="usageCacheTokenTotal" class="usage-cache-stat-value mono">0</span>
+          </div>
+          <div class="usage-cache-stat">
+            <span class="usage-cache-stat-label">Prompt 消耗</span>
+            <span id="usageCachePromptTotal" class="usage-cache-stat-value mono">0</span>
+          </div>
+          <div class="usage-cache-stat usage-cache-stat-sub">
+            <span class="usage-cache-stat-label">缓存读取</span>
+            <span id="usageCachePromptCached" class="usage-cache-stat-value mono">0</span>
+          </div>
+          <div class="usage-cache-stat usage-cache-stat-sub">
+            <span class="usage-cache-stat-label">非缓存 Prompt</span>
+            <span id="usageCachePromptBillable" class="usage-cache-stat-value mono">0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="usage-summary-stats-grid">
+      <div class="usage-summary-card usage-stat-card">
+        <span class="usage-stat-icon" aria-hidden="true"><i class="fa fa-list-alt"></i></span>
+        <div class="usage-stat-body">
+          <span class="usage-summary-label">请求</span>
+          <strong id="usageSummaryCount">0</strong>
+        </div>
+      </div>
+      <div class="usage-summary-card usage-stat-card">
+        <span class="usage-stat-icon" aria-hidden="true"><i class="fa fa-code"></i></span>
+        <div class="usage-stat-body">
+          <span class="usage-summary-label">Token</span>
+          <strong id="usageSummaryTokens">0</strong>
+        </div>
+      </div>
+      <div class="usage-summary-card usage-stat-card">
+        <span class="usage-stat-icon usage-stat-icon-cost" aria-hidden="true"><i class="fa fa-dollar"></i></span>
+        <div class="usage-stat-body">
+          <span class="usage-summary-label">费用</span>
+          <strong id="usageSummaryCost" class="usage-stat-cost">$0.000000</strong>
+        </div>
+      </div>
+      <div class="usage-summary-card usage-stat-card">
+        <span class="usage-stat-icon usage-stat-icon-status" aria-hidden="true"><i class="fa fa-check-circle"></i></span>
+        <div class="usage-stat-body">
+          <span class="usage-summary-label">状态</span>
+          <strong id="usageSummaryStatus">0 / 0 / 0</strong>
+          <span class="usage-stat-hint">成功 / 待确认 / 失败</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="usage-source-row">
+    <div class="usage-source-meta">
+      <span id="usageCurrentAccount" class="usage-account-chip" title="当前 Cursor Agent 账户">
+        <i class="fa fa-user-circle-o" aria-hidden="true"></i>
+        <span id="usageCurrentAccountText">-</span>
+      </span>
+      <span id="usageDbPath" class="usage-muted mono usage-db-path" title="本地记录库路径">-</span>
+    </div>
+    <span id="usagePriceSource" class="usage-muted usage-price-note">价格按官方 API Pricing 估算</span>
+  </div>
+
+  <div class="record-list-body usage-list-body">
+    <div class="usage-table-shell">
+      <div class="record-table-wrap table-wrap usage-table-wrap">
+        <div class="usage-table-scroll">
+          <table class="record-table record-table-paged usage-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>模型</th>
+                <th>推理强度</th>
+                <th>阶段</th>
+                <th>Token <button type="button" class="usage-th-help usage-info-btn" aria-label="Token 说明" data-popover="token-help"><i class="fa fa-question-circle" aria-hidden="true"></i></button></th>
+                <th>费用</th>
+                <th>状态</th>
+                <th>Request</th>
+              </tr>
+            </thead>
+            <tbody id="usageTableBody"></tbody>
+          </table>
+        </div>
+        <div id="usagePagination" class="record-pagination usage-pagination hidden" aria-label="调用记录分页"></div>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cursor Relay Local</title>
+  <link rel="stylesheet" href="./css/tailwind.min.css" />
+  <link rel="stylesheet" href="./css/font-awesome.min.css" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body class="theme-dark glass-off no-wallpaper">
+  <div id="appDialogRoot"></div>
+  <div id="appGlobalLoading" class="app-global-loading hidden" aria-live="polite" role="status" aria-busy="false">
+    <div class="app-global-loading-inner">
+      <div class="app-global-loading-spinner" aria-hidden="true"></div>
+      <span id="appGlobalLoadingText" class="app-global-loading-text">处理中…</span>
+    </div>
+  </div>
+  <div class="window-titlebar" id="windowTitlebar">
+    <div class="window-drag-region">
+      <div class="window-title" id="windowTitleText">Cursor Relay</div>
+    </div>
+    <div class="window-controls">
+      <button type="button" class="win-btn" id="winMinBtn" aria-label="最小化" title="最小化">—</button>
+      <button type="button" class="win-btn" id="winMaxBtn" aria-label="最大化" title="最大化">▢</button>
+      <button type="button" class="win-btn win-close" id="winCloseBtn" aria-label="关闭" title="关闭">✕</button>
+    </div>
+  </div>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <img id="brandLogoImg" class="brand-logo-img hidden" alt="" width="40" height="40" />
+        <div id="brandTitle" class="brand-title">Cursor Relay</div>
+        <div id="brandSub" class="brand-sub">Local Agent Proxy</div>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item active" data-page="advanced"><i class="fa fa-plug"></i><span>本地代理</span></button>
+        <button class="nav-item" data-page="usage"><i class="fa fa-line-chart"></i><span>调用记录</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <button id="themeToggle" class="ghost-btn"><i class="fa fa-adjust"></i> 主题切换</button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <section id="panelSection"></section>
+    </main>
+  </div>
+
+  <script src="./js/anime.umd.min.js"></script>
+  <script type="module" src="./renderer.js"></script>
+</body>
+</html>

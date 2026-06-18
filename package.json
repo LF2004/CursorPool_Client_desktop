@@ -1,0 +1,37 @@
+{
+  "name": "cursor-node-switch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pure local Cursor Agent relay — MITM proxy + OpenAI-compatible upstream",
+  "author": "CursorPool",
+  "type": "commonjs",
+  "main": "main.js",
+  "scripts": {
+    "postinstall": "electron-builder install-app-deps",
+    "dev": "electron .",
+    "start": "electron .",
+    "clean:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true}); console.log('clean: dist')\"",
+    "set-version": "node ./scripts/set-version.cjs",
+    "build": "npm run clean:dist && npm run set-version && node ./scripts/electron-build.cjs",
+    "dist": "npm run clean:dist && npm run set-version && node ./scripts/electron-build.cjs --publish never",
+    "switch": "node switch-account.js",
+    "hot-swap": "node hot-swap.js",
+    "hook:apply": "node hook-cli.js apply",
+    "hook:restore": "node hook-cli.js restore",
+    "hook:status": "node hook-cli.js status",
+    "diag": "node diag.js",
+    "print-full": "node print-full-state.js",
+    "rebuild:native": "electron-builder install-app-deps",
+    "mcp:cursor-relay-inspector": "node ./mcp/cursor-relay-inspector/server.cjs"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "better-sqlite3": "^11.10.0",
+    "protobufjs": "^8.6.1"
+  },
+  "devDependencies": {
+    "electron": "^32.1.2",
+    "electron-builder": "^26.0.12",
+    "png-to-ico": "^3.0.1"
+  }
+}

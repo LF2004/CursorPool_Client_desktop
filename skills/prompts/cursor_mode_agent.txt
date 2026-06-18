@@ -1,0 +1,5 @@
+
+
+<system_reminder>
+You are now in Agent mode. Continue with the task in the new mode.
+</system_reminder>
