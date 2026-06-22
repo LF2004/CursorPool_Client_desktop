@@ -1,0 +1,384 @@
+<div id="advanced" class="panel advanced-panel">
+  <div class="adv-subtab-bar">
+    <button type="button" class="adv-subtab active" data-adv-tab="proxy"><i class="fa fa-plug"></i> 本地代理</button>
+    <button type="button" class="adv-subtab" data-adv-tab="prefs"><i class="fa fa-wrench"></i> 偏好设置</button>
+    <button type="button" class="adv-subtab" data-adv-tab="about"><i class="fa fa-info-circle"></i> 关于</button>
+  </div>
+
+  <div id="advPanelPrefs" class="adv-subpanel hidden">
+    <div class="adv-pref-block hidden">
+      <h3 class="adv-section-title">main.js 路径（可选）</h3>
+      <p class="adv-hint">留空则使用环境变量 CURSOR_MAIN_JS 或自动探测安装目录。</p>
+      <div class="toolbar-row adv-toolbar">
+        <input id="advMainJsPath" class="input flex-1" placeholder="例如 D:\cursor\resources\app\out\main.js" />
+        <button type="button" id="advSaveMainJsPath" class="ghost-btn">保存路径</button>
+      </div>
+    </div>
+
+    <div class="adv-pref-block">
+      <h3 class="adv-section-title">偏好设置</h3>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefAnimation">开启动画</label>
+        <select id="advPrefAnimation" class="input adv-select">
+          <option value="off" selected>关闭</option>
+          <option value="on">启用</option>
+        </select>
+      </div>
+      <p class="adv-hint">关闭界面过渡动画可提升流畅度（默认关闭）。</p>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefWallpaper">全局背景</label>
+        <div class="adv-input-with-btn adv-wallpaper-picker">
+          <select id="advPrefWallpaper" class="input adv-select flex-1"></select>
+          <label class="ghost-btn adv-upload-btn" for="advWallpaperUpload">上传背景</label>
+          <input type="file" id="advWallpaperUpload" accept="image/*" class="adv-hidden-upload" />
+        </div>
+      </div>
+      <p class="adv-hint">当前背景：<span id="advWallpaperCurrent">无</span></p>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefGlass">毛玻璃效果</label>
+        <select id="advPrefGlass" class="input adv-select">
+          <option value="on">启用</option>
+          <option value="off" selected>关闭</option>
+        </select>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefAccentMode">主题色模式</label>
+        <select id="advPrefAccentMode" class="input adv-select">
+          <option value="auto">自动</option>
+          <option value="custom" selected>自定义</option>
+        </select>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefAccentColor">主题色</label>
+        <div class="adv-input-with-btn">
+          <input type="color" id="advPrefAccentColor" class="adv-theme-color-input" value="#3b82f6" />
+          <button type="button" id="advResetAccentColor" class="ghost-btn">默认</button>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefFontScale">全局字号</label>
+        <select id="advPrefFontScale" class="input adv-select">
+          <option value="0.9">小</option>
+          <option value="1" selected>默认</option>
+          <option value="1.1">大</option>
+          <option value="1.2">特大</option>
+        </select>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefLang">语言</label>
+        <select id="advPrefLang" class="input adv-select">
+          <option value="zh-CN">简体中文</option>
+          <option value="en">English</option>
+        </select>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefClose">关闭方式</label>
+        <select id="advPrefClose" class="input adv-select">
+          <option value="tray">最小化到托盘</option>
+          <option value="exit">退出程序</option>
+        </select>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advPrefMode">操作模式</label>
+        <select id="advPrefMode" class="input adv-select">
+          <option value="advanced">高级模式</option>
+          <option value="simple">简易模式</option>
+        </select>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="advCursorExePath">Cursor 安装位置</label>
+        <div class="adv-input-with-btn">
+          <input id="advCursorExePath" class="input flex-1" placeholder="选择 Cursor.exe 路径" readonly />
+          <button type="button" id="advPickCursorExe" class="primary-btn">选择文件</button>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <span class="adv-label-inline">Cursor 自动更新</span>
+        <div class="adv-input-with-btn">
+          <button type="button" id="advCheckUpdateBtn" class="ghost-btn">检查更新</button>
+          <button type="button" id="advInstallUpdateBtn" class="primary-btn hidden">下载并安装</button>
+        </div>
+      </div>
+      <p id="advUpdateStatus" class="adv-hint">可检查客户端新版本并自动下载、安装。</p>
+    </div>
+  </div>
+
+  <div id="advPanelProxy" class="adv-subpanel proxy-panel">
+    <div class="adv-pref-block relay-config-block">
+      <div class="relay-config-head">
+        <div>
+          <h3 class="adv-section-title relay-config-title"><i class="fa fa-random"></i> 模型配置</h3>
+          <p class="adv-hint relay-config-subtitle">
+            在 Cursor Auto 聊天中走您配置的第三方 API，不消耗官方额度。
+          </p>
+          <p class="adv-hint relay-privacy-hint">
+            <i class="fa fa-lock" aria-hidden="true"></i>
+            API Key 仅保存在本机，不会上传至服务器。
+          </p>
+        </div>
+        <div class="relay-config-head-actions">
+          <button type="button" id="relayTestAllBtn" class="ghost-btn relay-text-btn">测试全部</button>
+          <button type="button" id="relayAddConfigBtn" class="primary-btn relay-add-btn">
+            <i class="fa fa-plus"></i> 新增模型
+          </button>
+        </div>
+      </div>
+
+      <div class="relay-provider-tabs" role="tablist" aria-label="上游厂商">
+        <button type="button" class="relay-provider-tab active" data-relay-provider="openai" role="tab" aria-selected="true">
+          <img class="relay-provider-icon" src="./assets/icons/providers/openai.svg" alt="" width="16" height="16" />
+          OpenAI
+        </button>
+        <button type="button" class="relay-provider-tab" data-relay-provider="anthropic" role="tab" aria-selected="false">
+          <img class="relay-provider-icon" src="./assets/icons/providers/anthropic.svg" alt="" width="16" height="16" />
+          Anthropic
+        </button>
+        <button type="button" class="relay-provider-tab" data-relay-provider="deepseek" role="tab" aria-selected="false">
+          <img class="relay-provider-icon" src="./assets/icons/providers/deepseek.svg" alt="" width="16" height="16" />
+          DeepSeek
+        </button>
+        <button type="button" class="relay-provider-tab" data-relay-provider="gemini" role="tab" aria-selected="false">
+          <img class="relay-provider-icon" src="./assets/icons/providers/gemini.svg" alt="" width="16" height="16" />
+          Gemini
+        </button>
+        <button type="button" class="relay-provider-tab" data-relay-provider="mimo" role="tab" aria-selected="false">
+          <img class="relay-provider-icon" src="./assets/icons/providers/mimo.svg" alt="" width="16" height="16" />
+          MiMo
+        </button>
+        <button type="button" class="relay-provider-tab" data-relay-provider="custom" role="tab" aria-selected="false">
+          <img class="relay-provider-icon" src="./assets/icons/providers/custom.svg" alt="" width="16" height="16" />
+          自定义
+        </button>
+      </div>
+
+      <div class="relay-config-list-body">
+        <div class="relay-config-grid-scroll">
+          <div id="relayConfigGrid" class="relay-config-grid" aria-live="polite"></div>
+        </div>
+        <div id="relayConfigPagination" class="record-pagination usage-pagination hidden" aria-label="模型配置分页"></div>
+      </div>
+      <p id="relayConfigEmptyHint" class="adv-hint relay-config-empty hidden">当前厂商暂无配置，点击「新增模型」添加。</p>
+    </div>
+
+    <div class="adv-pref-block relay-runtime-block">
+      <h3 class="adv-section-title">运行状态</h3>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">当前配置:</span>
+        <span id="relayActiveConfigBadge" class="adv-kv-value relay-active-name">未选择</span>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">连接:</span>
+        <span id="relayUpstreamBadge" class="adv-inject-badge adv-inject-badge-muted">未测试</span>
+        <span id="relayLatencyBadge" class="adv-kv-value relay-latency-hint">-</span>
+        <button type="button" id="relayProbeBtn" class="ghost-btn adv-inline-btn">
+          <i class="fa fa-plug"></i> 测试连接
+        </button>
+      </div>
+      <p id="relayUpstreamHint" class="adv-hint">支持 OpenAI 兼容接口；接口地址请填写到 `.../v1`，不要带 `/chat/completions` 或 `/responses`。</p>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">MITM 证书:</span>
+        <span id="relayCertBadge" class="adv-inject-badge adv-inject-badge-muted">检测中...</span>
+        <button type="button" id="relayCertCheckBtn" class="ghost-btn adv-inline-btn">
+          <i class="fa fa-shield"></i> 检查证书
+        </button>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">Cursor 登录:</span>
+        <span id="relayCursorLoginBadge" class="adv-inject-badge adv-inject-badge-muted">检测中...</span>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">Relay:</span>
+        <span id="relayLocalBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
+        <span id="relayInterceptBadge" class="adv-inject-badge adv-inject-badge-muted">-</span>
+      </div>
+      <p id="relayStatusHint" class="adv-hint">填写配置后启用 Relay。</p>
+
+      <div class="adv-actions-row">
+        <button type="button" id="relayAgentTestBtn" class="ghost-btn">
+          <i class="fa fa-comments"></i> Relay 对话测试
+        </button>
+        <button type="button" id="relayToggleBtn" class="primary-btn">
+          <i class="fa fa-play"></i> 启用 Relay
+        </button>
+      </div>
+
+      <p id="relayBusyHint" class="adv-hint relay-busy-hint hidden" aria-live="polite">处理中，请稍候…</p>
+    </div>
+
+    <div id="relayAdminSection" class="adv-pref-block hidden">
+      <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 管理员诊断</h3>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">Runner 进程:</span>
+        <span id="relayRunnerBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">Cursor 补丁:</span>
+        <span id="relayPatchBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">argv.json:</span>
+        <span id="relayArgvHint" class="adv-kv-value">-</span>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">CA 证书路径:</span>
+        <span id="relayCertPathHint" class="adv-kv-value">-</span>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">Runner 日志:</span>
+        <span id="relayLogPathHint" class="adv-kv-value">-</span>
+        <button type="button" id="relayOpenLogBtn" class="ghost-btn adv-inline-btn">
+          <i class="fa fa-file-text-o"></i> 打开日志
+        </button>
+        <button type="button" id="relayOpenLogDirBtn" class="ghost-btn adv-inline-btn">
+          <i class="fa fa-folder-open"></i> 打开目录
+        </button>
+        <button type="button" id="relayViewLogBtn" class="ghost-btn adv-inline-btn">
+          <i class="fa fa-list"></i> 查看摘要
+        </button>
+        <button type="button" id="relayDiagnoseBtn" class="ghost-btn adv-inline-btn">
+          <i class="fa fa-stethoscope"></i> 一键诊断
+        </button>
+      </div>
+      <div class="adv-inject-row">
+        <span class="adv-label-inline">Cursor 设置:</span>
+        <span id="relayCursorSettingsHint" class="adv-kv-value">-</span>
+        <button type="button" id="relayDisableByokBtn" class="ghost-btn adv-inline-btn adv-btn-warn">
+          <i class="fa fa-eraser"></i> 清除本地覆写
+        </button>
+      </div>
+      <p id="relayServerHint" class="adv-hint">正在检查本地 Relay 状态...</p>
+      <div class="adv-actions-row">
+        <button type="button" id="relayRefreshBtn" class="ghost-btn">
+          <i class="fa fa-refresh"></i> 刷新状态
+        </button>
+        <button type="button" id="relayOfficialCaptureBtn" class="ghost-btn">
+          <i class="fa fa-exchange"></i> 记录官方 Agent 流量
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="advPanelAbout" class="adv-subpanel hidden">
+    <h3 id="advAboutTitle" class="adv-section-title">Cursor Relay Local</h3>
+    <p id="advAboutBody" class="adv-about-text">纯本地版 Cursor Agent 中继工具。通过 MITM 代理拦截 Cursor 与官方后端的 gRPC 流量，将 Agent 对话转发到您自配置的 OpenAI 兼容 API，并在本机执行工具调用。</p>
+    <p id="advAboutMuted" class="adv-about-muted">API Key 与调用记录均保存在本机，不依赖任何远程服务端。详见项目根目录 LOCAL_RELAY.md。</p>
+  </div>
+
+  <div id="relayConfigModal" class="relay-modal hidden" aria-hidden="true">
+    <div class="relay-modal-backdrop" data-relay-modal-close></div>
+    <div class="relay-modal-card" role="dialog" aria-modal="true" aria-labelledby="relayModalTitle">
+      <div class="relay-modal-head">
+        <h3 id="relayModalTitle" class="relay-modal-title">模型编辑</h3>
+        <div class="relay-modal-head-actions">
+          <button type="button" class="ghost-btn" data-relay-modal-close>取消</button>
+          <button type="button" id="relayModalSaveTestBtn" class="ghost-btn">保存并测试</button>
+          <button type="button" id="relayModalSaveBtn" class="primary-btn">保存</button>
+        </div>
+      </div>
+
+      <div class="relay-modal-provider-tabs" role="tablist">
+        <button type="button" class="relay-provider-tab" data-modal-provider="openai" role="tab">
+          <img class="relay-provider-icon" src="./assets/icons/providers/openai.svg" alt="" width="16" height="16" /> OpenAI
+        </button>
+        <button type="button" class="relay-provider-tab" data-modal-provider="anthropic" role="tab">
+          <img class="relay-provider-icon" src="./assets/icons/providers/anthropic.svg" alt="" width="16" height="16" /> Anthropic
+        </button>
+        <button type="button" class="relay-provider-tab" data-modal-provider="deepseek" role="tab">
+          <img class="relay-provider-icon" src="./assets/icons/providers/deepseek.svg" alt="" width="16" height="16" /> DeepSeek
+        </button>
+        <button type="button" class="relay-provider-tab" data-modal-provider="gemini" role="tab">
+          <img class="relay-provider-icon" src="./assets/icons/providers/gemini.svg" alt="" width="16" height="16" /> Gemini
+        </button>
+        <button type="button" class="relay-provider-tab" data-modal-provider="mimo" role="tab">
+          <img class="relay-provider-icon" src="./assets/icons/providers/mimo.svg" alt="" width="16" height="16" /> MiMo
+        </button>
+        <button type="button" class="relay-provider-tab" data-modal-provider="custom" role="tab">
+          <img class="relay-provider-icon" src="./assets/icons/providers/custom.svg" alt="" width="16" height="16" /> 自定义
+        </button>
+      </div>
+      <p id="relayModalProviderHint" class="adv-hint relay-modal-provider-hint"></p>
+
+      <div class="relay-modal-form">
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalName">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="name" aria-label="显示名称说明"><i class="fa fa-info-circle"></i></button>
+            显示名称
+          </label>
+          <input id="relayModalName" class="input" placeholder="如：主力 GPT" />
+        </div>
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalModel">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="modelName" aria-label="模型标识说明"><i class="fa fa-info-circle"></i></button>
+            模型标识
+          </label>
+          <input id="relayModalModel" class="input mono" placeholder="如 gpt-4o-mini" />
+        </div>
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalApiKey">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="apiKey" aria-label="访问密钥说明"><i class="fa fa-info-circle"></i></button>
+            访问密钥
+          </label>
+          <div class="adv-pass-wrap">
+            <input type="password" id="relayModalApiKey" class="input adv-pass-input" placeholder="sk-..." autocomplete="off" />
+            <button type="button" class="adv-pass-toggle" data-toggle-pass="relayModalApiKey" aria-label="显示/隐藏 Key">
+              <i class="fa fa-eye" aria-hidden="true"></i>
+            </button>
+          </div>
+        </div>
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalBaseUrl">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="baseUrl" aria-label="接口地址说明"><i class="fa fa-info-circle"></i></button>
+            接口地址（Base URL）
+          </label>
+          <input id="relayModalBaseUrl" class="input mono" placeholder="https://api.openai.com/v1" />
+        </div>
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalContext">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="contextWindow" aria-label="上下文窗口说明"><i class="fa fa-info-circle"></i></button>
+            上下文窗口
+          </label>
+          <input id="relayModalContext" class="input" inputmode="numeric" placeholder="250000" />
+        </div>
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalReasoning">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="reasoningEffort" aria-label="推理强度说明"><i class="fa fa-info-circle"></i></button>
+            <span id="relayModalReasoningLabel">推理强度</span>
+          </label>
+          <select id="relayModalReasoning" class="input adv-select"></select>
+        </div>
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalThinking">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="thinkingMode" aria-label="DeepSeek 思考说明"><i class="fa fa-lightbulb-o"></i></button>
+            DeepSeek 思考
+          </label>
+          <select id="relayModalThinking" class="input adv-select">
+            <option value="disabled" selected>关闭</option>
+            <option value="enabled">开启</option>
+          </select>
+        </div>
+        <div class="relay-modal-field relay-modal-field-full" id="relayModalEndpointField">
+          <label class="relay-modal-label" for="relayModalEndpoint">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="endpointMode" aria-label="接口端点说明"><i class="fa fa-info-circle"></i></button>
+            接口端点
+          </label>
+          <select id="relayModalEndpoint" class="input adv-select">
+            <option value="responses">/v1/responses</option>
+            <option value="chat">/v1/chat/completions</option>
+          </select>
+        </div>
+        <div class="relay-modal-field relay-modal-field-full">
+          <label class="relay-modal-label" for="relayModalNotes">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="notes" aria-label="备注说明"><i class="fa fa-info-circle"></i></button>
+            备注
+          </label>
+          <textarea id="relayModalNotes" class="input relay-modal-notes" rows="3" placeholder="可选备注"></textarea>
+        </div>
+      </div>
+
+      <div class="relay-modal-test">
+        <span class="relay-modal-label">模型测试</span>
+        <span id="relayModalTestStatus" class="relay-card-test-status">尚未测试</span>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,166 @@
+<div id="proxy" class="panel proxy-panel hidden">
+  <div class="adv-pref-block">
+    <h3 class="adv-section-title"><i class="fa fa-random"></i> Cursor Auto 代理</h3>
+    <p class="adv-hint">
+      在 Cursor 中使用 Auto 聊天时，通过您配置的第三方 API 生成回复，不消耗 Cursor 官方聊天额度。
+    </p>
+    <p class="adv-hint relay-privacy-hint">
+      <i class="fa fa-lock" aria-hidden="true"></i>
+      API Key 仅保存在本机，不会上传至服务器。
+    </p>
+
+    <div class="adv-form-row">
+      <label class="adv-label-inline" for="relayProvider">上游厂商</label>
+      <select id="relayProvider" class="input adv-select flex-1">
+        <option value="openai">OpenAI</option>
+        <option value="anthropic">Anthropic</option>
+        <option value="deepseek">DeepSeek</option>
+        <option value="rightcodes">Right Code</option>
+        <option value="rightcodes_codex">Right Code Codex</option>
+        <option value="custom">自定义</option>
+      </select>
+    </div>
+    <p id="relayProviderHint" class="adv-hint proxy-provider-hint">任意 OpenAI 兼容上游网关。</p>
+
+    <div class="adv-form-row">
+      <label class="adv-label-inline" for="relayBaseUrl">API 地址</label>
+      <input id="relayBaseUrl" class="input flex-1" placeholder="https://api.openai.com/v1" />
+    </div>
+
+    <div class="adv-form-row">
+      <label class="adv-label-inline" for="relayApiKey">API Key</label>
+      <div class="adv-pass-wrap">
+        <input type="password" id="relayApiKey" class="input adv-pass-input flex-1" placeholder="sk-..." autocomplete="off" />
+        <button type="button" class="adv-pass-toggle" data-toggle-pass="relayApiKey" aria-label="显示/隐藏 Key">
+          <i class="fa fa-eye" aria-hidden="true"></i>
+        </button>
+      </div>
+    </div>
+
+    <div class="adv-form-row">
+      <label class="adv-label-inline" for="relayModelName">模型名</label>
+      <input id="relayModelName" class="input flex-1" placeholder="如 gpt-4o-mini、deepseek-chat" />
+    </div>
+
+    <div class="adv-form-row">
+      <label class="adv-label-inline" for="relayEndpointMode">接口端点</label>
+      <select id="relayEndpointMode" class="input adv-select flex-1">
+        <option value="responses">/v1/responses</option>
+        <option value="chat">/v1/chat/completions</option>
+      </select>
+    </div>
+
+    <div class="adv-form-row">
+      <label class="adv-label-inline" for="relayReasoningEffort">推理强度</label>
+      <select id="relayReasoningEffort" class="input adv-select flex-1">
+        <option value="low">低</option>
+        <option value="medium">中</option>
+        <option value="high">高</option>
+        <option value="xhigh">极高</option>
+      </select>
+    </div>
+
+    <div class="adv-form-row">
+      <label class="adv-label-inline" for="relayContextWindow">上下文窗口</label>
+      <input id="relayContextWindow" class="input flex-1" inputmode="numeric" placeholder="250000" />
+    </div>
+    <p class="adv-hint">Relay 会按上下文窗口预算自动压缩较早对话，优先保留最近消息、关键摘要和工作区上下文。</p>
+
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">连接:</span>
+      <span id="relayUpstreamBadge" class="adv-inject-badge adv-inject-badge-muted">未测试</span>
+      <span id="relayLatencyBadge" class="adv-kv-value relay-latency-hint">-</span>
+      <button type="button" id="relayProbeBtn" class="ghost-btn adv-inline-btn">
+        <i class="fa fa-plug"></i> 测试连接
+      </button>
+    </div>
+    <p id="relayUpstreamHint" class="adv-hint">支持 OpenAI 兼容接口；部分上游需要 `Responses API` 路径。</p>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">MITM 证书:</span>
+      <span id="relayCertBadge" class="adv-inject-badge adv-inject-badge-muted">检测中...</span>
+      <button type="button" id="relayCertCheckBtn" class="ghost-btn adv-inline-btn">
+        <i class="fa fa-shield"></i> 检查证书
+      </button>
+      <button type="button" id="relayCertRepairBtn" class="ghost-btn adv-inline-btn">
+        <i class="fa fa-refresh"></i> 恢复证书
+      </button>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">Relay:</span>
+      <span id="relayLocalBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
+      <span id="relayInterceptBadge" class="adv-inject-badge adv-inject-badge-muted">-</span>
+    </div>
+    <p id="relayStatusHint" class="adv-hint">填写配置后启用 Relay。</p>
+
+    <div class="adv-actions-row">
+      <button type="button" id="relayAgentTestBtn" class="ghost-btn">
+        <i class="fa fa-comments"></i> Relay 对话测试
+      </button>
+      <button type="button" id="relayToggleBtn" class="primary-btn">
+        <i class="fa fa-play"></i> 启用 Relay
+      </button>
+    </div>
+
+    <p id="relayBusyHint" class="adv-hint relay-busy-hint hidden" aria-live="polite">处理中，请稍候…</p>
+  </div>
+
+  <div id="relayAdminSection" class="adv-pref-block hidden">
+    <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 管理员诊断</h3>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">Runner 进程:</span>
+      <span id="relayRunnerBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">Cursor 补丁:</span>
+      <span id="relayPatchBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">服务端会话:</span>
+      <span id="relaySessionBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">客户端 IP:</span>
+      <span id="relayIpHint" class="adv-kv-value">-</span>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">argv.json:</span>
+      <span id="relayArgvHint" class="adv-kv-value">-</span>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">CA 证书路径:</span>
+      <span id="relayCertPathHint" class="adv-kv-value">-</span>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">Runner 日志:</span>
+      <span id="relayLogPathHint" class="adv-kv-value">-</span>
+      <button type="button" id="relayOpenLogBtn" class="ghost-btn adv-inline-btn">
+        <i class="fa fa-file-text-o"></i> 打开日志
+      </button>
+      <button type="button" id="relayOpenLogDirBtn" class="ghost-btn adv-inline-btn">
+        <i class="fa fa-folder-open"></i> 打开目录
+      </button>
+      <button type="button" id="relayViewLogBtn" class="ghost-btn adv-inline-btn">
+        <i class="fa fa-list"></i> 查看摘要
+      </button>
+      <button type="button" id="relayDiagnoseBtn" class="ghost-btn adv-inline-btn">
+        <i class="fa fa-stethoscope"></i> 一键诊断
+      </button>
+    </div>
+    <div class="adv-inject-row">
+      <span class="adv-label-inline">Cursor 设置:</span>
+      <span id="relayCursorSettingsHint" class="adv-kv-value">-</span>
+      <button type="button" id="relayDisableByokBtn" class="ghost-btn adv-inline-btn adv-btn-warn">
+        <i class="fa fa-eraser"></i> 清除本地覆写
+      </button>
+    </div>
+    <p id="relayServerHint" class="adv-hint">正在检查本地与服务端 Relay 状态...</p>
+    <div class="adv-actions-row">
+      <button type="button" id="relayRefreshBtn" class="ghost-btn">
+        <i class="fa fa-refresh"></i> 刷新状态
+      </button>
+      <button type="button" id="relayOfficialCaptureBtn" class="ghost-btn">
+        <i class="fa fa-exchange"></i> 记录官方 Agent 流量
+      </button>
+    </div>
+  </div>
+</div>
