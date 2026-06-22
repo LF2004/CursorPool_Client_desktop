@@ -1655,26 +1655,26 @@ export async function bindProxyEvents() {
         if (relayDisableInFlight) return;
         relayDisableInFlight = true;
         updateRelayToggleButton(false, false);
-        void Promise.resolve()
-          .then(async () => {
+        await withRelayBusy('正在停用 Relay 并重置当前 Agent 对话...', async () => {
+          try {
             await bridge?.cursorRelayDisable?.({
               restartCursor: false,
               reloadCursor: false,
               clearSystemProxy: false,
               stopRunner: true,
-              fast: true,
+              fast: false,
+              resetActiveAgentConversation: true,
             });
-          })
-          .catch(async (error) => {
+          } catch (error) {
             await showAlert(error.message || String(error), {
               title: '停用 Relay 失败',
               tone: 'danger',
             });
-          })
-          .finally(async () => {
+          } finally {
             relayDisableInFlight = false;
             await refreshRelayStatus().catch(() => null);
-          });
+          }
+        });
         return;
       }
 

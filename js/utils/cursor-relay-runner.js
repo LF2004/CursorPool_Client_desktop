@@ -11,6 +11,7 @@ const {
   decodeCursorChatRequest,
   decodeRunSseRequestId,
   decodeBidiAppendRequest,
+  extractAgentModeFromPayload,
   summarizeConnectFrames,
   summarizeAgentServerStream,
   buildAgentKvSetBlobFrame,
@@ -27,6 +28,8 @@ const {
   buildAgentToolCallCompletedFrame,
   buildAgentEditToolCallDeltaFrame,
   buildAgentConversationCheckpointFrame,
+  buildAgentAskQuestionQueryFrame,
+  buildAgentCreatePlanQueryFrame,
   buildAgentExecReadFrame,
   buildAgentExecWriteFrame,
   buildAgentExecDeleteFrame,
@@ -52,6 +55,21 @@ const {
   buildRelayConversationMemory,
   compactRelayMessagesForContext,
 } = require('./cursor-relay-context-manager');
+const {
+  normalizeAgentModeName,
+  getCursorModeDirectory,
+  getSessionAgentMode,
+} = require('../mode/registry');
+const {
+  getModeHandler,
+  buildToolDefinitionsForChatByMode,
+  buildToolDefinitionsForResponsesByMode,
+  buildLocalRelayMessagesForMode,
+  shouldUseNativeExecForModeTool,
+} = require('../mode');
+const {
+  isTodoToolName,
+} = require('../mode/common/policy');
 const {
   recordRelayUsage,
   updateRelayUsageBilledPoints,
@@ -96,8 +114,6 @@ const EDIT_STREAM_FRAME_CHARS = 2048;
 const MAX_EDIT_STREAM_CONTENT_CHARS = 1400;
 const EXEC_CLIENT_WAIT_TIMEOUT_MS = 8000;
 const RECENT_EXECUTION_WORKSPACE_PATH = path.join(process.env.USERPROFILE || process.cwd(), '.cursorpool', 'relay', 'recent-execution-workspace.json');
-const AGENT_MODE_SYSTEM_PROMPT_PATH = path.join(process.cwd(), 'skills', 'cursor_modes', 'agent', 'system_prompt.txt');
-const AGENT_MODE_TOOLS_PATH = path.join(process.cwd(), 'skills', 'cursor_modes', 'agent', 'tools.json');
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
@@ -456,62 +472,6 @@ function readOptionalTextFile(filePath, maxChars = 24000) {
   }
 }
 
-function loadAgentModeToolDefinitionsForChat() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(AGENT_MODE_TOOLS_PATH, 'utf8').replace(/^\uFEFF/, ''));
-    const supported = new Set(['Read', 'Grep', 'Write', 'StrReplace', 'Delete', 'Glob', 'Shell', 'ReadLints', 'TodoWrite', 'WebSearch', 'WebFetch']);
-    return (Array.isArray(parsed) ? parsed : [])
-      .filter((tool) => tool?.type === 'function' && supported.has(String(tool.function?.name || '')))
-      .map((tool) => ({
-        type: 'function',
-        function: {
-          name: String(tool.function.name),
-          description: String(tool.function.description || ''),
-          parameters: tool.function.parameters && typeof tool.function.parameters === 'object'
-            ? tool.function.parameters
-            : { type: 'object', properties: {} },
-        },
-      }));
-  } catch {
-    return [];
-  }
-}
-
-function enhanceRelayToolDefinition(tool) {
-  const name = String(tool?.function?.name || '');
-  const clone = {
-    type: 'function',
-    function: {
-      name,
-      description: String(tool?.function?.description || ''),
-      parameters: tool?.function?.parameters && typeof tool.function.parameters === 'object'
-        ? tool.function.parameters
-        : { type: 'object', properties: {} },
-    },
-  };
-  if (name === 'Write') {
-    clone.function.description = `${clone.function.description}\n\nUse mainly for new files or true full-file rewrites. For modifying existing files, prefer PatchEdit or StrReplace with exact old_string/new_string.`;
-  } else if (name === 'StrReplace') {
-    clone.function.description = `${clone.function.description}\n\nPrefer this over full-file Write when an exact old_string can be identified. Set new_string to an empty string to delete the exact old_string.`;
-  } else if (name === 'PatchEdit') {
-    clone.function.description = `${clone.function.description}\n\nSet new_string to an empty string to delete the exact old_string.`;
-  }
-  return clone;
-}
-
-function mergeAgentModeToolDefinitions(fallbackTools = []) {
-  const merged = new Map();
-  fallbackTools.forEach((tool) => {
-    const name = String(tool?.function?.name || '');
-    if (name) merged.set(name, enhanceRelayToolDefinition(tool));
-  });
-  loadAgentModeToolDefinitionsForChat().forEach((tool) => {
-    const name = String(tool?.function?.name || '');
-    if (name && merged.has(name)) merged.set(name, enhanceRelayToolDefinition(tool));
-  });
-  return Array.from(merged.values());
-}
-
 function normalizeToolNameSet(names = null) {
   if (!Array.isArray(names) || !names.length) return null;
   const out = new Set();
@@ -541,248 +501,16 @@ function filterRelayTools(tools = [], allowedNames = null) {
 }
 
 function buildRelayToolDefinitionsForChat(options = {}) {
-  const fallbackTools = [
-    {
-      type: 'function',
-      function: {
-        name: 'Read',
-        description: 'Read a local file.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            limit: { type: 'integer' },
-          },
-          required: ['path'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Grep',
-        description: 'Search file contents under a path using ripgrep.',
-        parameters: {
-          type: 'object',
-          properties: {
-            pattern: { type: 'string' },
-            path: { type: 'string' },
-            glob: { type: 'string' },
-            output_mode: { type: 'string', enum: ['content', 'files_with_matches'] },
-            head_limit: { type: 'integer' },
-          },
-          required: ['pattern'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Write',
-        description: 'Write the full contents of a local file. Use this mainly for new files or full-file rewrites. For modifying an existing file, prefer PatchEdit or StrReplace with exact old_string/new_string.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            contents: { type: 'string' },
-          },
-          required: ['path', 'contents'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'PatchEdit',
-        description: 'Edit an existing local file by replacing exact old_string with new_string. Set new_string to an empty string to delete the exact old_string. Prefer this for page beautification and normal edits because it is faster and produces smaller native review diffs than full-file Write.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            old_string: { type: 'string' },
-            new_string: { type: 'string' },
-            replace_all: { type: 'boolean' },
-          },
-          required: ['path', 'old_string', 'new_string'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Edit',
-        description: 'Replace a local file with the full updated contents. Prefer PatchEdit when you can identify an exact old_string.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            contents: { type: 'string' },
-          },
-          required: ['path', 'contents'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'StrReplace',
-        description: 'Replace exact text in an existing local file. Set new_string to an empty string to delete the exact old_string. Prefer this over full-file Write when an exact old_string can be identified.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            old_string: { type: 'string' },
-            new_string: { type: 'string' },
-          },
-          required: ['path', 'old_string', 'new_string'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Delete',
-        description: 'Delete a local file.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-          },
-          required: ['path'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Glob',
-        description: 'Find files by glob pattern.',
-        parameters: {
-          type: 'object',
-          properties: {
-            target_directory: { type: 'string' },
-            glob_pattern: { type: 'string' },
-            path: { type: 'string' },
-            pattern: { type: 'string' },
-          },
-          required: ['glob_pattern'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'LS',
-        description: 'List files and directories under a local path.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            ignore: { type: 'array', items: { type: 'string' } },
-          },
-          required: ['path'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'ReadLints',
-        description: 'Read diagnostics or lint results for one or more local files after edits.',
-        parameters: {
-          type: 'object',
-          properties: {
-            paths: { type: 'array', items: { type: 'string' } },
-          },
-          required: ['paths'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Shell',
-        description: 'Run a PowerShell command for verification, package scripts, git, dev servers, and other terminal operations. Use block_until_ms: 0 for background processes and read the returned terminal log path to monitor output.',
-        parameters: {
-          type: 'object',
-          properties: {
-            command: { type: 'string' },
-            working_directory: { type: 'string' },
-            timeout_ms: { type: 'integer' },
-            block_until_ms: { type: 'integer' },
-            description: { type: 'string' },
-          },
-          required: ['command'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'TodoWrite',
-        description: 'Create or update a structured todo list for complex multi-step coding tasks. Use one in_progress item at a time and mark items completed as soon as they are finished.',
-        parameters: {
-          type: 'object',
-          properties: {
-            merge: { type: 'boolean' },
-            todos: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  id: { type: 'string' },
-                  content: { type: 'string' },
-                  status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'cancelled'] },
-                },
-                required: ['id', 'content', 'status'],
-              },
-              minItems: 1,
-            },
-          },
-          required: ['todos', 'merge'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'WebFetch',
-        description: 'Fetch content from a specified URL and return its contents in a readable markdown format. Use this for public webpages, not binary files or private/local URLs.',
-        parameters: {
-          type: 'object',
-          properties: {
-            url: { type: 'string', description: 'The fully-qualified URL to fetch.' },
-          },
-          required: ['url'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'WebSearch',
-        description: 'Search the web for real-time information. Returns summarized search results and relevant URLs.',
-        parameters: {
-          type: 'object',
-          properties: {
-            search_term: { type: 'string', description: 'The search query.' },
-            explanation: { type: 'string', description: 'Why this search is useful.' },
-          },
-          required: ['search_term'],
-        },
-      },
-    },
-  ];
-  return filterRelayTools(mergeAgentModeToolDefinitions(fallbackTools), options.allowedToolNames || null);
+  const modeName = normalizeAgentModeName(options.mode || 'AGENT_MODE_AGENT');
+  return filterRelayTools(
+    buildToolDefinitionsForChatByMode({ ...options, mode: modeName }),
+    options.allowedToolNames || null,
+  );
 }
 
 function buildRelayToolDefinitionsForResponses(options = {}) {
-  return buildRelayToolDefinitionsForChat(options).map((tool) => ({
-    type: 'function',
-    name: tool.function.name,
-    description: tool.function.description,
-    parameters: tool.function.parameters,
-  }));
+  const modeName = normalizeAgentModeName(options.mode || 'AGENT_MODE_AGENT');
+  return buildToolDefinitionsForResponsesByMode({ ...options, mode: modeName });
 }
 
 function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
@@ -815,6 +543,7 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
         model: modelName,
         messages: toChatMessages(messages, contentOptions),
         stream: true,
+        ...(options.mode ? { metadata: { agent_mode: options.mode } } : {}),
         ...streamUsageOptions,
         ...(openAiReasoning ? { reasoning: openAiReasoning } : {}),
         ...(deepSeekThinking ? { thinking: deepSeekThinking } : {}),
@@ -835,6 +564,7 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
         ...(responseInput.instructions ? { instructions: responseInput.instructions } : {}),
         input: responseInput.input.length ? responseInput.input : 'ping',
         stream: true,
+        ...(options.mode ? { metadata: { agent_mode: options.mode } } : {}),
         ...(openAiReasoning ? { reasoning: openAiReasoning } : {}),
         ...(deepSeekThinking ? { thinking: deepSeekThinking } : {}),
         ...(mimoThinking ? { thinking: mimoThinking } : {}),
@@ -978,6 +708,7 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
     const recorded = recordRelayUsage(getConfigCustomRoot(config), {
       requestId,
       conversationId: session.conversationId || '',
+      mode: getSessionAgentMode(session),
       phase: details.phase || '',
       endpointMode: details.endpointMode || config.upstream?.endpointMode || '',
       model: details.model || config.upstream?.modelName || '',
@@ -1364,9 +1095,9 @@ function buildLocalRelayMessages(userText, session = {}) {
   const requestId = String(session.requestId || '');
   const workspaceRoot = String(session.workspaceRoot || '').trim();
   const user = String(userText || '');
+  const agentMode = getSessionAgentMode(session);
   const recentEditedFile = getRecentEditedFilePath(session);
   const unfinishedContinuation = getUnfinishedAgentContinuation(session, user);
-  const cursorAgentPrompt = readOptionalTextFile(AGENT_MODE_SYSTEM_PROMPT_PATH);
   const deepSeekGuidance = isDeepSeekModel(session.config)
     ? 'For this DeepSeek upstream, keep hidden reasoning brief. Start the answer or call the required tool quickly; do not loop in Thought/reasoning text.'
     : '';
@@ -1376,35 +1107,16 @@ function buildLocalRelayMessages(userText, session = {}) {
     recentEditedFile,
   });
   const imageParts = buildUpstreamImageParts(session);
-  const userContent = imageParts.length
-    ? [{ type: 'input_text', text: user }, ...imageParts]
-    : user;
-  return [
-    {
-      role: 'system',
-      content: [
-        cursorAgentPrompt,
-        'You are powering a Cursor-style coding agent relay.',
-        'Respond naturally and directly to the user.',
-        'Do not claim local file edits or command execution unless a tool result was provided.',
-        'For complex coding tasks with several dependent steps, use TodoWrite early to create a concise checklist, keep exactly one item in_progress, and update items as soon as they are completed.',
-        'Prefer Grep, Glob, Read, LS, and Shell tools to inspect and verify the workspace instead of guessing from memory.',
-        deepSeekGuidance,
-        conversationMemory ? `<conversation_memory>\n${conversationMemory}\n</conversation_memory>` : '',
-        recentEditedFile ? `Continuation context: the most recent successfully edited file in this conversation is "${recentEditedFile}". If the user's request omits a file path but asks to continue changing styling, colors, layout, copy, or the prior page, treat this as the target file.` : '',
-        unfinishedContinuation ? [
-          'Unfinished agent continuation context:',
-          `Original user request: ${unfinishedContinuation.userText || ''}`,
-          unfinishedContinuation.latestAssistantText ? `Latest assistant text before interruption: ${unfinishedContinuation.latestAssistantText}` : '',
-          Array.isArray(unfinishedContinuation.toolResults) && unfinishedContinuation.toolResults.length ? `Recent tool results:\n${unfinishedContinuation.toolResults.map((line) => `- ${line}`).join('\n')}` : '',
-          'Continue that unfinished task now. Do not ask the user to send another continue message.',
-        ].filter(Boolean).join('\n') : '',
-        workspaceRoot ? `Current workspace root: ${workspaceRoot}. Resolve relative file paths inside this directory.` : '',
-        requestId ? `Relay request id: ${requestId}.` : '',
-      ].filter(Boolean).join('\n'),
-    },
-    { role: 'user', content: userContent },
-  ];
+  return buildLocalRelayMessagesForMode(agentMode, {
+    userText: user,
+    requestId,
+    workspaceRoot,
+    recentEditedFile,
+    unfinishedContinuation,
+    deepSeekGuidance,
+    conversationMemory,
+    imageParts,
+  });
 }
 
 function normalizeWorkspacePath(value) {
@@ -1672,6 +1384,23 @@ function hashRelayText(value) {
   return crypto.createHash('sha1').update(String(value || '')).digest('hex');
 }
 
+function getSessionStableConversationId(session = {}) {
+  return extractStableConversationId(session.lastUserMessageCapture?.debug || null)
+    || String(session.lastUserMessageCapture?.stableConversationId || '').trim()
+    || String(session.requestId || '').trim();
+}
+
+function findWaitingSessionByStableConversationId(agentSessions, stableConversationId = '', excludeRequestId = '') {
+  const target = String(stableConversationId || '').trim();
+  if (!target || !agentSessions?.size) return null;
+  for (const session of agentSessions.values()) {
+    if (!session || session.aborted || !session.waitingForInteraction) continue;
+    if (excludeRequestId && String(session.requestId || '').trim() === String(excludeRequestId || '').trim()) continue;
+    if (getSessionStableConversationId(session) === target) return session;
+  }
+  return null;
+}
+
 function getAgentTurnScopeKey(requestId, userText, workspaceRoot = '', debug = null) {
   const textHash = hashRelayText(userText);
   const normalizedWorkspace = normalizeWorkspaceRoot(workspaceRoot || '') || '';
@@ -1885,6 +1614,14 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
 
 function abortAgentSession(session, logger, reason = 'aborted') {
   if (!session || session.aborted) return;
+  if (session.waitingForInteraction && (reason === 'runsse_closed' || reason === 'conversation_action_abort')) {
+    detachWaitingInteractionSession(session, logger, reason);
+    return;
+  }
+  if (!session.turnEnded && session.lastUserMessageCapture?.userText) {
+    const latestAssistantText = String(session.agentTextFrameText || '').trim();
+    rememberUnfinishedAgentTask(session, session.lastUserMessageCapture.userText, latestAssistantText || reason);
+  }
   session.aborted = true;
   session.active = false;
   session.relaying = false;
@@ -1931,6 +1668,36 @@ function finalizeInterceptedAgentSession(session) {
   if (session.agentHistory && !session.historyCompleted) {
     completeSessionHistory(session, session.hadError ? 'failed' : 'completed', `finalize-${session.requestId || ''}`);
   }
+}
+
+function detachWaitingInteractionSession(session, logger, reason = 'runsse_closed') {
+  if (!session || session.aborted || session.completed) return false;
+  clearInterval(session.heartbeat);
+  session.heartbeat = null;
+  session.streamDetached = true;
+  session.intercepted = false;
+  session.relaying = false;
+  session.req = null;
+  session.res = null;
+  logger?.info?.(`agent local relay waiting session detached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} reason=${reason}`);
+  return true;
+}
+
+function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
+  if (!session) return null;
+  session.req = req;
+  session.res = res;
+  session.rawBody = rawBody;
+  session.generatedChunks = [];
+  session.turnEnded = false;
+  session.connectEnded = false;
+  session.completed = false;
+  session.intercepted = false;
+  session.streamDetached = false;
+  session.relaying = false;
+  beginInterceptedAgentSession(session, logger);
+  logger?.info?.(`agent local relay waiting session reattached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} deferred=${session.deferredInteractionResponse?.interactionResponse ? '1' : '0'}`);
+  return session;
 }
 
 function failAgentRelaySession(session, logger, error, label = 'async') {
@@ -2653,11 +2420,6 @@ function isEditLikeToolName(name) {
   return ['write', 'edit', 'strreplace', 'patchedit'].includes(String(name || '').trim().toLowerCase());
 }
 
-function isTodoToolName(name) {
-  const lower = String(name || '').trim().toLowerCase();
-  return lower === 'todowrite' || lower === 'todo_write' || lower === 'updatetodo' || lower === 'updatetodos';
-}
-
 function buildLeanEditToolCompletionExecution(execution = {}) {
   const beforeContent = typeof execution.beforeContent === 'string' ? execution.beforeContent : '';
   const afterContent = typeof execution.afterContent === 'string' ? execution.afterContent : '';
@@ -2825,23 +2587,7 @@ function canUseNativePatchEditForTool(toolCall, session) {
 }
 
 function shouldUseNativeExecForTool(session, toolCall) {
-  const lower = String(toolCall?.name || '').trim().toLowerCase();
-  if (isTodoToolName(lower)) return false;
-  if (lower === 'shell') return false;
-  if (lower === 'patchedit' || lower === 'strreplace') return canUseNativePatchEditForTool(toolCall, session);
-  if (session?.config?.emitAgentExecServerFrames === true) return true;
-  if (session?.config?.nativeMutationTools === false) return false;
-  return [
-    'write',
-    'edit',
-    'delete',
-    'read',
-    'grep',
-    'ls',
-    'shell',
-    'readlints',
-    'diagnostics',
-  ].includes(lower);
+  return shouldUseNativeExecForModeTool(session, toolCall, { canUseNativePatchEditForTool });
 }
 
 function normalizeToolCallPathsForWorkspace(toolCall, session) {
@@ -3101,6 +2847,245 @@ function buildExecServerFrameForTool(toolName, args = {}, toolCallId = '', numer
   return null;
 }
 
+function isInteractionQueryToolName(toolName = '') {
+  const lower = String(toolName || '').trim().toLowerCase();
+  return lower === 'createplan' || lower === 'askquestion';
+}
+
+function nextInteractionQueryId(session = {}) {
+  session.nextInteractionQueryId = (Number(session.nextInteractionQueryId) || 0) + 1;
+  return session.nextInteractionQueryId;
+}
+
+function shouldDispatchInteractionQueryForTool(session = {}, toolCall = {}, execution = null) {
+  if (!execution?.ok) return false;
+  if (getSessionAgentMode(session) !== 'AGENT_MODE_PLAN') return false;
+  return isInteractionQueryToolName(toolCall?.name || '');
+}
+
+function buildInteractionQueryFrameForTool(session = {}, toolCall = {}, toolCallId = '') {
+  const toolName = String(toolCall?.name || '').trim().toLowerCase();
+  const queryId = nextInteractionQueryId(session);
+  if (toolName === 'createplan') {
+    return {
+      queryId,
+      kind: 'create_plan',
+      frame: buildAgentCreatePlanQueryFrame(toolCall.arguments || {}, toolCallId, queryId),
+    };
+  }
+  if (toolName === 'askquestion') {
+    return {
+      queryId,
+      kind: 'ask_question',
+      frame: buildAgentAskQuestionQueryFrame(toolCall.arguments || {}, toolCallId, queryId),
+    };
+  }
+  return null;
+}
+
+function registerPendingInteractionQuery(session = {}, payload = {}) {
+  const requestId = String(session.requestId || '').trim();
+  const queryId = Number(payload.queryId) || 0;
+  const kind = String(payload.kind || '').trim();
+  if (!requestId || !queryId || !kind) return;
+  session.pendingAgentInteractions = session.pendingAgentInteractions || new Map();
+  const key = `${requestId}:${queryId}:${kind}`;
+  session.pendingAgentInteractions.set(key, {
+    key,
+    requestId,
+    queryId,
+    kind,
+    toolCallId: String(payload.toolCallId || '').trim(),
+    toolName: String(payload.toolName || '').trim(),
+    arguments: payload.arguments || {},
+    execution: payload.execution || null,
+    stableConversationId: String(payload.stableConversationId || '').trim(),
+    workspaceRoot: String(payload.workspaceRoot || '').trim(),
+    resumeState: payload.resumeState || null,
+    createdAt: payload.createdAt || new Date().toISOString(),
+  });
+}
+
+function findPendingInteractionQuery(pendingAgentInteractions, requestId = '', interactionResponse = {}) {
+  if (!pendingAgentInteractions?.size || !requestId) return null;
+  const responseId = Number(interactionResponse?.id) || 0;
+  const responseKind = interactionResponse?.kind === 'create_plan_request_response'
+    ? 'create_plan'
+    : interactionResponse?.kind === 'ask_question_interaction_response'
+      ? 'ask_question'
+      : interactionResponse?.kind === 'web_search_request_response'
+        ? 'web_search'
+      : '';
+  const stableConversationId = String(
+    interactionResponse?.stableConversationId
+    || interactionResponse?.conversationId
+    || ''
+  ).trim();
+  const candidates = Array.from(pendingAgentInteractions.values())
+    .filter((entry) => entry?.requestId === requestId || (stableConversationId && entry?.stableConversationId === stableConversationId))
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  if (!candidates.length) return null;
+  if (responseId > 0) {
+    const exact = candidates.find((entry) => Number(entry.queryId) === responseId && (!responseKind || entry.kind === responseKind));
+    if (exact) return exact;
+  }
+  if (responseKind) {
+    const sameKind = candidates.find((entry) => entry.kind === responseKind);
+    if (sameKind) return sameKind;
+  }
+  return candidates[0];
+}
+
+function findPendingInteractionQueryByExecution(session = {}, executionEntry = {}) {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  const interactionQueryId = Number(executionEntry?.execution?.interactionQueryId) || 0;
+  const interactionQueryKind = String(executionEntry?.execution?.interactionQueryKind || '').trim();
+  const toolCallId = String(executionEntry?.toolCall?.id || '').trim();
+  if (!pendingAgentInteractions?.size) return null;
+  const candidates = Array.from(pendingAgentInteractions.values())
+    .filter((entry) => entry?.requestId === String(session.requestId || '').trim());
+  if (!candidates.length) return null;
+  if (interactionQueryId > 0) {
+    const exact = candidates.find((entry) => Number(entry.queryId) === interactionQueryId && (!interactionQueryKind || entry.kind === interactionQueryKind));
+    if (exact) return exact;
+  }
+  if (toolCallId) {
+    const byToolCall = candidates.find((entry) => String(entry.toolCallId || '').trim() === toolCallId && (!interactionQueryKind || entry.kind === interactionQueryKind));
+    if (byToolCall) return byToolCall;
+  }
+  if (interactionQueryKind) {
+    const byKind = candidates.find((entry) => entry.kind === interactionQueryKind);
+    if (byKind) return byKind;
+  }
+  return candidates[0];
+}
+
+function formatAskQuestionAnswersForContinuation(answers = []) {
+  const lines = (Array.isArray(answers) ? answers : [])
+    .map((answer) => {
+      const questionId = String(answer?.questionId || '').trim() || 'question';
+      const selected = Array.isArray(answer?.selectedOptionIds) && answer.selectedOptionIds.length
+        ? `selected=${answer.selectedOptionIds.join(', ')}`
+        : '';
+      const freeform = String(answer?.freeformText || '').trim()
+        ? `freeform=${String(answer.freeformText).trim()}`
+        : '';
+      const detail = [selected, freeform].filter(Boolean).join('; ');
+      return `- ${questionId}${detail ? `: ${detail}` : ''}`;
+    })
+    .filter(Boolean);
+  return lines.join('\n');
+}
+
+function buildInteractionContinuationPrompt(pendingInteraction = {}, interactionResponse = {}) {
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  if (responseKind === 'ask_question_interaction_response' || pendingKind === 'ask_question') {
+    const askQuestion = interactionResponse?.askQuestion || {};
+    const status = String(askQuestion.kind || 'success').trim() || 'success';
+    const answersSummary = formatAskQuestionAnswersForContinuation(askQuestion.answers || []);
+    return [
+      'The pending AskQuestion interaction has completed. Continue the same plan turn from this clarification.',
+      `Interaction status: ${status}.`,
+      answersSummary ? `Answers:\n${answersSummary}` : 'Answers: none provided.',
+      'Do not ask the same clarification again. Use these answers to continue the plan immediately.',
+    ].join('\n');
+  }
+  if (responseKind === 'create_plan_request_response' || pendingKind === 'create_plan') {
+    const createPlan = interactionResponse?.createPlan || {};
+    const status = String(createPlan.kind || 'success').trim() || 'success';
+    const planUri = String(createPlan.planUri || '').trim();
+    const error = String(createPlan.error || '').trim();
+    return [
+      'The pending CreatePlan interaction has completed. Continue the same plan workflow from that plan state.',
+      `Interaction status: ${status}.`,
+      planUri ? `Plan URI: ${planUri}` : '',
+      error ? `Error: ${error}` : '',
+      'If the plan is approved, mirror the plan into TodoWrite and continue the workflow instead of recreating the same plan.',
+    ].filter(Boolean).join('\n');
+  }
+  if (responseKind === 'web_search_request_response' || pendingKind === 'web_search') {
+    return [
+      'The pending WebSearch interaction has completed.',
+      `Approval: ${interactionResponse?.webSearchApproved ? 'approved' : 'not approved'}.`,
+      'Continue the same turn and use the approved web search path if it is still needed.',
+    ].join('\n');
+  }
+  return [
+    'A pending plan interaction has completed.',
+    `Interaction payload: ${JSON.stringify(interactionResponse || {})}`,
+    'Continue the same turn from this interaction result without restarting from scratch.',
+  ].join('\n');
+}
+
+function buildPendingInteractionResumeMessages(session = {}, pendingInteraction = {}, interactionResponse = {}) {
+  const resumeState = pendingInteraction?.resumeState || {};
+  const baseMessages = Array.isArray(resumeState.upstreamMessages)
+    ? resumeState.upstreamMessages.map((message) => ({ ...message }))
+    : buildLocalRelayMessages(resumeState.userText || session.lastUserMessageCapture?.userText || '', session);
+  return [
+    ...baseMessages,
+    {
+      role: 'user',
+      content: buildInteractionContinuationPrompt(pendingInteraction, interactionResponse),
+    },
+  ];
+}
+
+function appendInteractionResponseToHistory(session = {}, pendingInteraction = {}, interactionResponse = {}) {
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'metadata',
+    payload: {
+      type: 'interaction_response',
+      value: {
+        tool_name: String(pendingInteraction?.toolName || '').trim(),
+        interaction_kind: String(pendingInteraction?.kind || interactionResponse?.kind || '').trim(),
+        query_id: Number(pendingInteraction?.queryId) || 0,
+        response: interactionResponse || {},
+      },
+    },
+  });
+}
+
+function updatePendingInteractionResumeState(session = {}, executions = [], upstreamMessages = [], toolResultMessages = [], streamedText = '', userText = '') {
+  const waitingExecutions = (Array.isArray(executions) ? executions : [])
+    .filter((entry) => entry?.execution?.awaitingInteractionResponse);
+  if (!waitingExecutions.length) return 0;
+  const resumeMessages = [
+    ...(Array.isArray(upstreamMessages) ? upstreamMessages.map((message) => ({ ...message })) : []),
+    { role: 'assistant', content: String(streamedText || '').trim() || `Called ${waitingExecutions.length} tool(s).` },
+    ...(Array.isArray(toolResultMessages) ? toolResultMessages.map((message) => ({ ...message })) : []),
+  ];
+  let updated = 0;
+  for (const executionEntry of waitingExecutions) {
+    const pendingInteraction = findPendingInteractionQueryByExecution(session, executionEntry);
+    if (!pendingInteraction) continue;
+    pendingInteraction.resumeState = {
+      userText: String(userText || '').trim(),
+      upstreamMessages: resumeMessages,
+      capturedAt: new Date().toISOString(),
+      stableConversationId: getSessionStableConversationId(session),
+      requestId: String(session.requestId || '').trim(),
+    };
+    updated += 1;
+  }
+  return updated;
+}
+
+function triggerDeferredInteractionResume(session, config, logger, stats, source = 'deferred') {
+  if (!session?.active || session.aborted || session.relaying) return false;
+  const deferred = session.deferredInteractionResponse || null;
+  if (!deferred?.interactionResponse) return false;
+  session.deferredInteractionResponse = null;
+  logger?.info?.(
+    `agent local relay deferred interaction resume requestId=${session.requestId || '-'} source=${source} interactionKind=${deferred.interactionResponse?.kind || '-'} pendingKind=${deferred.pendingInteraction?.kind || '-'} pendingTool=${deferred.pendingInteraction?.toolName || '-'}`
+  );
+  resumeAgentAfterInteractionResponse(session, deferred.interactionResponse, config, logger, stats, deferred.pendingInteraction || null)
+    .catch((error) => failAgentRelaySession(session, logger, error, `deferred_interaction_resume:${source}`));
+  return true;
+}
+
 function parseJsonObject(value) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
   if (typeof value !== 'string') return {};
@@ -3273,6 +3258,15 @@ function hasRequiredToolArguments(toolCall) {
   }
   if (name === 'readlints' || name === 'diagnostics') {
     return Boolean((Array.isArray(args.paths) && args.paths.length) || args.path);
+  }
+  if (name === 'semanticsearch') {
+    return Boolean(String(args.query || '').trim());
+  }
+  if (name === 'askquestion') {
+    return Array.isArray(args.questions) && args.questions.length > 0;
+  }
+  if (name === 'createplan') {
+    return Boolean(String(args.plan || '').trim() || String(args.overview || '').trim());
   }
   return true;
 }
@@ -3490,6 +3484,7 @@ async function collectPostMutationSummary({
   if (!session?.active || session.aborted) return fallback;
   const changedPaths = getSuccessfulMutationPaths(session);
   const activeUpstream = resolveUpstreamForModel(config, configuredModel);
+  const agentMode = getSessionAgentMode(session);
   const summaryPrompt = [
     'The file mutation has already succeeded through Cursor native tools.',
     changedPaths.length ? `Changed file(s): ${changedPaths.join(', ')}` : '',
@@ -3513,6 +3508,7 @@ async function collectPostMutationSummary({
         timeoutMs: POST_MUTATION_SUMMARY_TIMEOUT_MS,
         requestId,
         phase: 'post_mutation_summary',
+        mode: agentMode,
         outboundProxy: config.outboundProxy || null,
         localProxyPort: config.port,
       },
@@ -3789,7 +3785,7 @@ function buildReadOutput(filePath, args = {}) {
 }
 
 function isLocalContextToolName(toolName = '') {
-  return ['read', 'grep', 'ls', 'glob'].includes(String(toolName || '').trim().toLowerCase());
+  return ['read', 'grep', 'ls', 'glob', 'semanticsearch'].includes(String(toolName || '').trim().toLowerCase());
 }
 
 function isReadOnlyContextToolName(toolName = '') {
@@ -4067,6 +4063,99 @@ function buildIncompleteContinuationMessage(session = {}, finalText = '', contin
 
 function formatContinuationLimitForLog(limit) {
   return Number(limit) > 0 ? String(Math.floor(Number(limit))) : 'unlimited';
+}
+
+function buildModeRuntimeHelpers(session = {}) {
+  return {
+    getIncompleteTodos,
+    looksLikeIncompleteContinuationText,
+    looksLikeReadOnlyExplorationStillInProgress,
+    getMaxReadOnlyExplorationContinuationCount,
+    getMaxIncompleteContinuationCount,
+    getReadOnlyContinuationTargetPath,
+    toWorkspaceRelativePath,
+    getSessionWorkspaceRoot,
+    getRecentToolResultContext,
+    formatContinuationLimitForLog,
+    textLooksLikeSubstantiveFinalAnswer,
+    isMutationToolName,
+    isReadOnlyContextToolName,
+    canonicalToolName,
+    session,
+  };
+}
+
+function getModeHandlerForSession(session = {}) {
+  return getModeHandler(getSessionAgentMode(session));
+}
+
+function interceptToolExecutionByMode(session = {}, toolCall = {}, context = {}) {
+  const handler = getModeHandlerForSession(session);
+  if (typeof handler.interceptToolExecution !== 'function') return null;
+  return handler.interceptToolExecution(session, toolCall, context, buildModeRuntimeHelpers(session));
+}
+
+function getMaxContinuationCountByMode(session = {}, options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.getMaxContinuationCount === 'function') {
+    return handler.getMaxContinuationCount(session, options, helpers);
+  }
+  return options.sawReadOnlyTool && !options.sawMutationTool
+    ? getMaxReadOnlyExplorationContinuationCount(session)
+    : getMaxIncompleteContinuationCount(session);
+}
+
+function shouldContinueIncompleteWorkByMode(session = {}, finalText = '', toolCalls = [], upstreamError = '', continuationCount = 0, options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldContinueIncompleteWork === 'function') {
+    return handler.shouldContinueIncompleteWork(session, finalText, toolCalls, upstreamError, continuationCount, options, helpers);
+  }
+  return shouldContinueIncompleteWork(session, finalText, toolCalls, upstreamError, continuationCount, options);
+}
+
+function shouldForceContinuationToolChoiceByMode(session = {}, finalText = '', options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldForceContinuationToolChoice === 'function') {
+    return handler.shouldForceContinuationToolChoice(session, finalText, options, helpers);
+  }
+  return shouldForceReadOnlyContinuationToolCall(session, finalText, options)
+    || !options.sawReadOnlyTool
+    || options.sawMutationTool
+    || getIncompleteTodos(session).length > 0;
+}
+
+function buildIncompleteContinuationMessageByMode(session = {}, finalText = '', continuationCount = 0, options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildIncompleteContinuationMessage === 'function') {
+    return handler.buildIncompleteContinuationMessage(session, finalText, continuationCount, options, helpers);
+  }
+  return buildIncompleteContinuationMessage(session, finalText, continuationCount);
+}
+
+function getPostToolTurnActionByMode(session = {}, executions = [], context = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.getPostToolTurnAction !== 'function') return null;
+  return handler.getPostToolTurnAction(session, executions, context, helpers);
+}
+
+function hasIncompleteWorkAtEndByMode(session = {}, finalText = '', toolCalls = [], upstreamError = '', options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.hasIncompleteWorkAtEnd === 'function') {
+    return handler.hasIncompleteWorkAtEnd(session, finalText, toolCalls, upstreamError, options, helpers);
+  }
+  return !upstreamError
+    && !toolCalls.length
+    && (
+      getIncompleteTodos(session).length > 0
+      || looksLikeIncompleteContinuationText(finalText)
+      || looksLikeReadOnlyExplorationStillInProgress(session, finalText, options)
+    );
 }
 
 function decodeHtmlEntities(text = '') {
@@ -4490,6 +4579,13 @@ async function executeRelayTool(toolCall, session, logger) {
         durationMs: Date.now() - startedAt,
       };
     }
+    if (lower === 'semanticsearch') {
+      const execution = await executeSemanticSearchTool(args, session);
+      return {
+        ...execution,
+        durationMs: Date.now() - startedAt,
+      };
+    }
     if (lower === 'readlints' || lower === 'diagnostics') {
       const paths = (Array.isArray(args.paths) ? args.paths : [args.path].filter(Boolean))
         .map((item) => resolveWorkspacePath(item, session))
@@ -4522,6 +4618,49 @@ async function executeRelayTool(toolCall, session, logger) {
         tool: 'TodoWrite',
         args: { merge, todos },
         resultText,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (lower === 'askquestion') {
+      const questions = Array.isArray(args.questions) ? args.questions : [];
+      const title = String(args.title || '').trim();
+      const resultText = JSON.stringify({ title, questions }, null, 2);
+      return {
+        ok: true,
+        tool: 'AskQuestion',
+        args: { title, questions },
+        resultText: trimToolOutput(resultText),
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (lower === 'createplan') {
+      const markdown = formatPlanMarkdown(args);
+      const conversationId = String(getSessionStableConversationId(session) || 'plan').trim();
+      const planRoot = getRelayPlanRoot(session.config || {});
+      const planDir = path.join(planRoot, conversationId);
+      fs.mkdirSync(planDir, { recursive: true });
+      const fileName = `${sanitizePlanFilename(args.name || 'plan')}.md`;
+      const planPath = path.join(planDir, fileName);
+      fs.writeFileSync(planPath, markdown, 'utf8');
+      return {
+        ok: true,
+        tool: 'CreatePlan',
+        args: {
+          name: String(args.name || '').trim(),
+          overview: String(args.overview || '').trim(),
+          plan: String(args.plan || '').trim(),
+          todos: Array.isArray(args.todos) ? args.todos : [],
+        },
+        resultText: `Plan created at ${planPath}`,
+        planPath,
+        markdown,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (lower === 'task') {
+      const execution = await executeTaskTool(args, session);
+      return {
+        ...execution,
         durationMs: Date.now() - startedAt,
       };
     }
@@ -4575,6 +4714,133 @@ function toToolResultMessage(toolCall, execution) {
         durationMs: execution.durationMs,
       }, null, 2),
     ].join('\n'),
+  };
+}
+
+function sanitizePlanFilename(value = '') {
+  const text = String(value || '').trim().replace(/[\\/:*?"<>|]+/g, '-');
+  return text ? text.slice(0, 80) : `plan-${Date.now().toString(36)}`;
+}
+
+function getRelayPlanRoot(config = {}) {
+  return path.join(String(config.historyRoot || process.env.CURSOR_RELAY_HISTORY_ROOT || path.join(process.env.USERPROFILE || process.cwd(), '.cursorpool', 'relay', 'history')), 'plans');
+}
+
+function formatPlanMarkdown(args = {}) {
+  const title = String(args.name || 'Plan').trim() || 'Plan';
+  const overview = String(args.overview || '').trim();
+  const planBody = String(args.plan || '').trim();
+  const todos = Array.isArray(args.todos) ? args.todos : [];
+  const lines = [`# ${title}`];
+  if (overview) {
+    lines.push('', overview);
+  }
+  if (planBody) {
+    lines.push('', planBody);
+  }
+  if (todos.length) {
+    lines.push('', '## Todos');
+    todos.forEach((todo) => {
+      const id = String(todo?.id || '').trim();
+      const content = String(todo?.content || '').trim();
+      if (id && content) lines.push(`- [ ] ${id}: ${content}`);
+    });
+  }
+  return `${lines.join('\n').trim()}\n`;
+}
+
+async function executeSemanticSearchTool(args = {}, session = {}) {
+  const query = String(args.query || '').trim();
+  const requestedTargets = Array.isArray(args.target_directories) ? args.target_directories : [];
+  const workspaceRoot = getSessionWorkspaceRoot(session);
+  const roots = requestedTargets.length
+    ? requestedTargets.map((item) => resolveWorkspacePath(item, session)).filter(Boolean)
+    : [workspaceRoot];
+  const words = query.split(/\s+/).map((item) => item.trim()).filter((item) => item.length >= 2).slice(0, 6);
+  const files = [];
+  roots.forEach((root) => {
+    walkFiles(root, { max: 300 }).forEach((file) => {
+      if (!files.includes(file)) files.push(file);
+    });
+  });
+  const matches = [];
+  for (const file of files) {
+    let text = '';
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    const haystack = text.toLowerCase();
+    const score = words.reduce((count, word) => count + (haystack.includes(word.toLowerCase()) ? 1 : 0), 0);
+    if (!score) continue;
+    const lines = text.split(/\r?\n/);
+    const previewLine = lines.find((line) => words.some((word) => line.toLowerCase().includes(word.toLowerCase()))) || lines[0] || '';
+    matches.push({ file, score, previewLine: previewLine.trim() });
+  }
+  matches.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
+  const topMatches = matches.slice(0, 8);
+  const resultText = topMatches.length
+    ? topMatches.map((item) => `${item.file}\n  score=${item.score} preview=${item.previewLine}`).join('\n')
+    : `No semantic matches found for ${JSON.stringify(query)}.`;
+  return {
+    ok: true,
+    tool: 'SemanticSearch',
+    args: { query, target_directories: requestedTargets, workspaceRoot },
+    resultText: trimToolOutput(resultText),
+    matches: topMatches.map((item) => ({
+      score: item.score,
+      codeBlock: {
+        relativeWorkspacePath: path.relative(workspaceRoot, item.file).replace(/\\/g, '/'),
+        contents: item.previewLine,
+        range: {
+          startLine: 1,
+          startColumn: 1,
+          endLine: 1,
+          endColumn: Math.max(1, item.previewLine.length),
+        },
+      },
+    })),
+    durationMs: 0,
+  };
+}
+
+async function executeTaskTool(args = {}, session = {}) {
+  const description = String(args.description || '').trim();
+  const prompt = String(args.prompt || '').trim();
+  const subagentType = args.subagent_type || args.subagentType || {};
+  const isExplore = typeof subagentType === 'object'
+    ? Object.prototype.hasOwnProperty.call(subagentType, 'explore')
+    : /explore/i.test(String(subagentType || ''));
+  if (isExplore) {
+    const query = prompt || description || 'Explore the workspace';
+    const search = await executeSemanticSearchTool({ query, target_directories: [] }, session);
+    return {
+      ok: true,
+      tool: 'Task',
+      args,
+      resultText: trimToolOutput([
+        `Explore task completed${description ? `: ${description}` : ''}.`,
+        search.resultText,
+      ].join('\n')),
+      conversationSteps: [
+        {
+          assistant_message: {
+            text: search.resultText,
+          },
+        },
+      ],
+      agentId: `explore-${Date.now().toString(36)}`,
+      isBackground: false,
+      durationMs: 0,
+    };
+  }
+  return {
+    ok: false,
+    tool: 'Task',
+    args,
+    resultText: 'Only explore-style Task calls are currently supported in local relay mode.',
+    durationMs: 0,
   };
 }
 
@@ -4827,7 +5093,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
     const emitStepFrames = shouldEmitLocalStepFrames(session?.config || {});
     const stepId = (session.nextStepId = (Number(session.nextStepId) || 0) + 1);
     const stepStartedAt = Date.now();
-    let execution = null;
+    let execution = interceptToolExecutionByMode(session, toolCall, { startedAt: stepStartedAt });
     if (emitToolInteraction) {
       if (emitStepFrames) writeAgentFrame(session, buildAgentStepStartedFrame(stepId));
       const streamedEditState = editLikeTool ? session.upstreamToolArgumentStreams?.get(toolCallId) : null;
@@ -4853,7 +5119,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
         if (streamedEditState) streamedEditState.completedStarted = true;
       }
     }
-    if (useNativeExec) {
+    if (!execution && useNativeExec) {
       const numericExecId = (session.nextExecNumericId = (Number(session.nextExecNumericId) || 0) + 1);
       session.execIdByNumericId = session.execIdByNumericId || new Map();
       session.execIdByNumericId.set(numericExecId, toolCallId);
@@ -4915,6 +5181,33 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       // eslint-disable-next-line no-await-in-loop
       execution = await executeRelayTool(toolCall, session, logger);
     }
+    let interactionQueryDispatch = null;
+    if (!execution?.pendingNativeMutation && shouldDispatchInteractionQueryForTool(session, toolCall, execution)) {
+      interactionQueryDispatch = buildInteractionQueryFrameForTool(session, toolCall, toolCallId);
+      if (interactionQueryDispatch?.frame) {
+        writeAgentFrame(session, interactionQueryDispatch.frame);
+        registerPendingInteractionQuery(session, {
+          queryId: interactionQueryDispatch.queryId,
+          kind: interactionQueryDispatch.kind,
+          toolCallId,
+          toolName: historyToolName,
+          arguments: toolCall.arguments || {},
+          execution,
+          stableConversationId: getSessionStableConversationId(session),
+          workspaceRoot: getSessionWorkspaceRoot(session),
+          createdAt: new Date().toISOString(),
+        });
+        logger.info(
+          `agent local relay interaction_query sent requestId=${requestId} tool=${toolCall.name} queryId=${interactionQueryDispatch.queryId} kind=${interactionQueryDispatch.kind}`,
+        );
+      }
+      execution = {
+        ...execution,
+        awaitingInteractionResponse: true,
+        interactionQueryId: interactionQueryDispatch?.queryId || 0,
+        interactionQueryKind: interactionQueryDispatch?.kind || '',
+      };
+    }
     if (!execution?.pendingNativeMutation) {
       if (emitToolInteraction) {
         const completionArgs = editLikeTool
@@ -4928,7 +5221,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
           buildAgentToolCallCompletedFrame(toolCall.name, completionArgs, toolCallId, modelCallId, { execution: completionExecution }),
         );
       }
-      emitVisibleToolResultSummary(session, toolCall, execution);
+      if (!interactionQueryDispatch) emitVisibleToolResultSummary(session, toolCall, execution);
       if (isMutation && execution?.ok) {
         emitAgentMutationCheckpointFrames(session, { ...toolCall, id: toolCallId }, execution, logger);
         appendLatestEditReminder(session, execution.args?.path || toolCall.arguments?.path || '');
@@ -4974,193 +5267,38 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
   return { toolResultMessages, executions };
 }
 
-async function relayAgentUserMessage(session, userText, config, logger, stats) {
-  if (!session?.active || session.aborted || session.relaying) return;
-  session.relaying = true;
-  try {
-  if (!session.agentHistory) {
-    const { conversation, turnSeq } = beginAgentHistoryTurn(
-      config,
-      session.requestId || '',
-      getSessionWorkspaceRoot(session),
-      session.lastUserMessageCapture || null,
-    );
-    session.agentHistory = conversation;
-    session.agentTurnSeq = turnSeq;
-    appendSessionHistory(session, {
-      role: 'user',
-      kind: 'request_context',
-      payload: {
-        env: {
-          osVersion: `${process.platform} ${process.getSystemVersion ? process.getSystemVersion() : ''}`.trim(),
-          workspacePaths: [getSessionWorkspaceRoot(session)],
-          shell: 'powershell',
-          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-        },
-        fileContents: {},
-        readLintsEnabled: true,
-        mcpInfoComplete: true,
-        envInfoComplete: true,
-      },
-    });
-    appendSessionHistory(session, {
-      role: 'user',
-      kind: 'user_message',
-      payload: {
-        text: String(userText || ''),
-        mode: 'AGENT_MODE_AGENT',
-      },
-    });
-    appendSessionHistory(session, {
-      role: 'system',
-      kind: 'prompt_context',
-      payload: {
-        source: 'current_user_request',
-        role: 'user',
-        content: `<current_user_request>\n${String(userText || '')}\n</current_user_request>`,
-      },
-    });
-    updateAgentHistoryUsage(config, { requests: 1 });
-  }
-  const configuredModel = resolveRequestedUpstreamModel(config, {
-    requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
-  });
-  const activeUpstream = resolveUpstreamForModel(config, configuredModel);
-  const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
-    ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
-    : 0;
-  const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
-  const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
-  loadUnfinishedAgentTask(session);
-  const requestId = session.requestId || '-';
-  const runPostEditLints = shouldRunPostEditLints(config);
-  let upstreamMessages = buildLocalRelayMessages(userText, session);
-  let compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'initial' });
-  upstreamMessages = compacted.messages;
-  let usageMeta = compacted.usage;
-  const promptChars = usageMeta.messageChars;
+async function continueAgentStreamLoop(session, options = {}) {
+  const {
+    userText = '',
+    config = {},
+    logger = null,
+    streamed: initialStreamed = {},
+    upstreamMessages: initialUpstreamMessages = [],
+    usageMeta: initialUsageMeta = {},
+    configuredModel = '',
+    activeUpstream = {},
+    upstreamMode: initialUpstreamMode = '',
+    requestId = '',
+    agentMode = 'AGENT_MODE_AGENT',
+    runPostEditLints = false,
+    emitThinking = false,
+    filterInlineThinking = false,
+    reasoningOnlyMaxMs = 0,
+  } = options;
 
-  stats.chatTotal = (stats.chatTotal || 0) + 1;
-  stats.localRelayTurns = (stats.localRelayTurns || 0) + 1;
-  logger.info(
-    `agent local relay request requestId=${requestId} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))} upstreamModel=${configuredModel} endpointMode=${String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses')} textLen=${String(userText || '').length} promptChars=${promptChars}`,
-  );
-
-  let upstream;
-  let upstreamMode = '';
-  const initialVisibleProgressTimer = startInitialVisibleProgressTimer(session, logger, requestId);
-  try {
-    ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-      activeUpstream,
-      configuredModel,
-      upstreamMessages,
-      logger,
-      {
-        signal: session.abortController?.signal || null,
-        requestId,
-        phase: 'initial',
-        outboundProxy: config.outboundProxy || null,
-        localProxyPort: config.port,
-      },
-    ));
-  } catch (error) {
-    clearTimer(initialVisibleProgressTimer);
-    if (session.aborted) return;
-    const summarized = summarizeFetchError(error);
-    recordUpstreamUsagePhase(session, config, {
-      phase: 'initial',
-      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-      model: configuredModel,
-      status: 'fetch_error',
-      error: error.message || String(error),
-      promptChars,
-      meta: usageMeta,
-    });
-    logger.error(`agent local relay upstream fetch failed requestId=${requestId}: ${error.message}`);
-    appendSessionHistory(session, {
-      role: 'assistant',
-      kind: 'assistant_text',
-      payload: { text: summarized, error: true },
-    });
-    writeAgentTextFrame(session, summarized);
-    writeAgentFrame(session, buildAgentTurnEndedFrame());
-    session.turnEnded = true;
-    rememberCompletedAgentTurn(session.completedAgentTurns, session.requestId, userText, getSessionWorkspaceRoot(session), session.lastUserMessageCapture?.debug || null, session.generatedChunks, { hadError: true });
-    completeSessionHistory(session, 'failed', `fetch-${requestId}`);
-    finalizeInterceptedAgentSession(session);
-    return;
-  }
-
-  if (!upstream.ok) {
-    clearTimer(initialVisibleProgressTimer);
-    if (session.aborted) return;
-    const errorText = await upstream.text().catch(() => '');
-    const summarized = summarizeUpstreamFailure(upstream.status, errorText);
-    recordUpstreamUsagePhase(session, config, {
-      phase: 'initial',
-      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-      model: configuredModel,
-      status: 'http_error',
-      httpStatus: upstream.status,
-      error: errorText,
-      promptChars,
-      meta: usageMeta,
-    });
-    logger.error(`agent local relay upstream HTTP ${upstream.status} requestId=${requestId} bodyPreview=${JSON.stringify(errorText.slice(0, 300))}`);
-    appendSessionHistory(session, {
-      role: 'assistant',
-      kind: 'assistant_text',
-      payload: { text: summarized, error: true },
-    });
-    writeAgentTextFrame(session, summarized);
-    writeAgentFrame(session, buildAgentTurnEndedFrame());
-    session.turnEnded = true;
-    rememberCompletedAgentTurn(session.completedAgentTurns, session.requestId, userText, getSessionWorkspaceRoot(session), session.lastUserMessageCapture?.debug || null, session.generatedChunks, { hadError: true });
-    completeSessionHistory(session, 'failed', `http-${requestId}`);
-    finalizeInterceptedAgentSession(session);
-    return;
-  }
-
-  const recentEditedFile = getRecentEditedFilePath(session);
-  logger.info(
-    `agent local relay context requestId=${requestId} recentEditedFile=${JSON.stringify(recentEditedFile)}`,
-  );
-  let streamed;
-  try {
-    streamed = await streamAgentUpstreamResponse(upstream, session, {
-      collectTools: true,
-      emit: true,
-      emitThinking,
-      phase: 'initial',
-      idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
-      maxDurationMs: 0,
-      reasoningOnlyMaxMs,
-      filterInlineThinking,
-    });
-  } finally {
-    clearTimer(initialVisibleProgressTimer);
-  }
-  recordUpstreamUsagePhase(session, config, {
-    phase: 'initial',
-    endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-    model: configuredModel,
-    status: streamed.upstreamError ? 'stream_error' : 'success',
-    error: streamed.upstreamError,
-    usage: streamed.usage,
-    durationMs: streamed.durationMs,
-    promptChars,
-    responseTextChars: streamed.text.length,
-    reasoningChars: streamed.reasoning.length,
-    toolCalls: streamed.toolCalls.length,
-    meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
-  });
-  if (!session.active || session.aborted) return;
-  let finalText = streamed.text;
-  let finalReasoning = streamed.reasoning;
-  let upstreamError = streamed.upstreamError;
+  let streamed = initialStreamed;
+  let upstreamMode = initialUpstreamMode;
+  let finalText = streamed.text || '';
+  let finalReasoning = streamed.reasoning || '';
+  let upstreamError = streamed.upstreamError || '';
+  let usageMeta = initialUsageMeta;
+  let compacted = { messages: initialUpstreamMessages, usage: initialUsageMeta };
+  let upstreamMessages = Array.isArray(initialUpstreamMessages)
+    ? initialUpstreamMessages.map((message) => ({ ...message }))
+    : [];
   const maxToolCallsPerRound = getMaxLocalToolCallsPerRound(config);
   let toolCalls = attachDefaultMutationTarget(
-    streamed.toolCalls.slice(0, maxToolCallsPerRound),
+    Array.isArray(streamed.toolCalls) ? streamed.toolCalls.slice(0, maxToolCallsPerRound) : [],
     session,
     userText,
   );
@@ -5173,309 +5311,355 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
   let completionVerificationCount = 0;
   let incompletePostMutationContinuationCount = 0;
   const maxToolRounds = getMaxLocalToolRounds(config);
-  while (session.active && !session.aborted && toolCalls.length && (maxToolRounds <= 0 || toolStep < maxToolRounds)) {
-    toolStep += 1;
-    logger.info(
-      `agent local relay tool plan requestId=${requestId} step=${toolStep} count=${toolCalls.length} tools=${toolCalls.map((call) => call.name).join(',')}`,
-    );
-    const { toolResultMessages, executions } = await executeRelayToolCalls(session, toolCalls, requestId, logger);
-    if (executions.length && executions.every((entry) => entry.execution?.duplicateToolSkipped)) {
-      upstreamError = '';
-      logger.info(`agent local relay duplicate tool result forwarded requestId=${requestId}; asking upstream to continue`);
-    }
-    nativeMutationAckMissing = executions.some((entry) => entry.execution?.missingNativeAck);
-    pendingNativeMutation = executions.some((entry) => entry.execution?.pendingNativeMutation);
-    const sawMutationAttempt = executions.some((entry) => isMutationToolName(entry.toolCall?.name));
-    if (sawMutationAttempt) sawMutationTool = true;
-    if (executions.some((entry) => isReadOnlyContextToolName(entry.toolCall?.name))) {
-      sawReadOnlyTool = true;
-    }
-    const sawMutationExecution = executions.some((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok);
-    if (sawMutationExecution) {
-      sawWriteTool = true;
-      const lintPaths = executions
-        .filter((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok)
-        .map((entry) => entry.execution?.args?.path)
-        .filter(Boolean);
-      if (runPostEditLints && lintPaths.length && !executions.some((entry) => canonicalToolName(entry.toolCall?.name) === 'ReadLints')) {
-        await executeRelayToolCalls(session, [{
-          id: `tool_read_lints_${Date.now().toString(36)}`,
-          name: 'ReadLints',
-          arguments: { paths: Array.from(new Set(lintPaths)) },
-          provider: 'relay_post_edit',
-        }], requestId, logger);
+
+  while (session.active && !session.aborted) {
+    if (toolCalls.length) {
+      if (maxToolRounds > 0 && toolStep >= maxToolRounds) break;
+      toolStep += 1;
+      logger?.info?.(
+        `agent local relay tool plan requestId=${requestId} step=${toolStep} count=${toolCalls.length} tools=${toolCalls.map((call) => call.name).join(',')}`,
+      );
+      const { toolResultMessages, executions } = await executeRelayToolCalls(session, toolCalls, requestId, logger);
+      if (executions.length && executions.every((entry) => entry.execution?.duplicateToolSkipped)) {
+        upstreamError = '';
+        logger?.info?.(`agent local relay duplicate tool result forwarded requestId=${requestId}; asking upstream to continue`);
       }
-      upstreamError = '';
-    }
-    if (pendingNativeMutation) {
-      toolCalls = [];
-      finalText = '已发送 Cursor 原生工具调用，正在等待客户端处理。';
-      writeAgentTextFrame(session, finalText);
-      logger.info(`agent local relay native mutation pending requestId=${requestId}; ending turn without local write or retry`);
-      break;
-    }
-    if (nativeMutationAckMissing) {
-      toolCalls = [];
-      finalText = 'Cursor 客户端没有返回原生编辑工具执行回执，本轮已停止，避免重复修改。';
-      writeAgentTextFrame(session, finalText);
-      logger.info(`agent local relay native mutation ack missing requestId=${requestId}; stopping tool loop without local write`);
-      break;
-    }
-    let postToolRecoveryCount = 0;
-    upstreamMessages = [
-      ...upstreamMessages,
-      { role: 'assistant', content: streamed.text.trim() || `Called ${toolCalls.length} tool(s).` },
-      ...toolResultMessages,
-      {
-        role: 'user',
-        content: 'Continue working from these tool results. If another tool is required, call it; otherwise give the final answer.',
-      },
-    ];
-    while (session.active && !session.aborted) {
-      const postToolPhase = postToolRecoveryCount > 0
-        ? `post_tool_${toolStep}_recover_${postToolRecoveryCount}`
-        : `post_tool_${toolStep}`;
-      compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: postToolPhase });
-      upstreamMessages = compacted.messages;
-      usageMeta = compacted.usage;
-      try {
-        ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-          activeUpstream,
-          configuredModel,
+      const postToolTurnAction = getPostToolTurnActionByMode(session, executions, {
+        requestId,
+        toolStep,
+        finalText,
+        sawWriteTool,
+        sawMutationTool,
+        sawReadOnlyTool,
+      });
+      if (postToolTurnAction?.stopTurn) {
+        session.planTurnHandoff = postToolTurnAction.handoff || 'mode_handoff';
+        const updatedInteractions = updatePendingInteractionResumeState(
+          session,
+          executions,
           upstreamMessages,
-          logger,
-          {
-            enableTools: true,
-            signal: session.abortController?.signal || null,
-            timeoutMs: sawWriteTool
-              ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
-              : POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            requestId,
-            phase: postToolPhase,
-            outboundProxy: config.outboundProxy || null,
-            localProxyPort: config.port,
-          },
-        ));
-        if (!upstream.ok) {
-          const errorText = await upstream.text().catch(() => '');
-          upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+          toolResultMessages,
+          streamed.text || '',
+          userText,
+        );
+        if (updatedInteractions > 0) {
+          session.waitingForInteraction = true;
+          session.waitingInteractionSince = Date.now();
+          session.unfinishedWorkAtEnd = false;
+          logger?.info?.(
+            `agent local relay waiting for interaction_response requestId=${requestId} step=${toolStep} handoff=${session.planTurnHandoff} pendingInteractions=${updatedInteractions}`,
+          );
+          return { waitingForInteraction: true, handoff: session.planTurnHandoff };
+        }
+        finalText = '';
+        toolCalls = [];
+        upstreamError = '';
+        logger?.info?.(
+          `agent local relay post-tool handoff requestId=${requestId} step=${toolStep} handoff=${session.planTurnHandoff} reason=${JSON.stringify(String(postToolTurnAction.reason || ''))}`,
+        );
+        break;
+      }
+      nativeMutationAckMissing = executions.some((entry) => entry.execution?.missingNativeAck);
+      pendingNativeMutation = executions.some((entry) => entry.execution?.pendingNativeMutation);
+      const sawMutationAttempt = executions.some((entry) => isMutationToolName(entry.toolCall?.name));
+      if (sawMutationAttempt) sawMutationTool = true;
+      if (executions.some((entry) => isReadOnlyContextToolName(entry.toolCall?.name))) {
+        sawReadOnlyTool = true;
+      }
+      const sawMutationExecution = executions.some((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok);
+      if (sawMutationExecution) {
+        sawWriteTool = true;
+        const lintPaths = executions
+          .filter((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok)
+          .map((entry) => entry.execution?.args?.path)
+          .filter(Boolean);
+        if (runPostEditLints && lintPaths.length && !executions.some((entry) => canonicalToolName(entry.toolCall?.name) === 'ReadLints')) {
+          await executeRelayToolCalls(session, [{
+            id: `tool_read_lints_${Date.now().toString(36)}`,
+            name: 'ReadLints',
+            arguments: { paths: Array.from(new Set(lintPaths)) },
+            provider: 'relay_post_edit',
+          }], requestId, logger);
+        }
+        upstreamError = '';
+      }
+      if (pendingNativeMutation) {
+        toolCalls = [];
+        finalText = '宸插彂閫?Cursor 鍘熺敓宸ュ叿璋冪敤锛屾鍦ㄧ瓑寰呭鎴风澶勭悊銆?';
+        writeAgentTextFrame(session, finalText);
+        logger?.info?.(`agent local relay native mutation pending requestId=${requestId}; ending turn without local write or retry`);
+        break;
+      }
+      if (nativeMutationAckMissing) {
+        toolCalls = [];
+        finalText = 'Cursor 瀹㈡埛绔病鏈夎繑鍥炲師鐢熺紪杈戝伐鍏锋墽琛屽洖鎵э紝鏈疆宸插仠姝紝閬垮厤閲嶅淇敼銆?';
+        writeAgentTextFrame(session, finalText);
+        logger?.info?.(`agent local relay native mutation ack missing requestId=${requestId}; stopping tool loop without local write`);
+        break;
+      }
+      let postToolRecoveryCount = 0;
+      upstreamMessages = [
+        ...upstreamMessages,
+        { role: 'assistant', content: streamed.text?.trim() || `Called ${toolCalls.length} tool(s).` },
+        ...toolResultMessages,
+        {
+          role: 'user',
+          content: 'Continue working from these tool results. If another tool is required, call it; otherwise give the final answer.',
+        },
+      ];
+      while (session.active && !session.aborted) {
+        const postToolPhase = postToolRecoveryCount > 0
+          ? `post_tool_${toolStep}_recover_${postToolRecoveryCount}`
+          : `post_tool_${toolStep}`;
+        compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: postToolPhase });
+        upstreamMessages = compacted.messages;
+        usageMeta = compacted.usage;
+        let upstream;
+        let resumedMode = upstreamMode;
+        try {
+          ({ response: upstream, mode: resumedMode } = await fetchUpstreamCompletion(
+            activeUpstream,
+            configuredModel,
+            upstreamMessages,
+            logger,
+            {
+              enableTools: true,
+              signal: session.abortController?.signal || null,
+              timeoutMs: sawWriteTool
+                ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
+                : POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              requestId,
+              phase: postToolPhase,
+              mode: agentMode,
+              outboundProxy: config.outboundProxy || null,
+              localProxyPort: config.port,
+            },
+          ));
+          upstreamMode = resumedMode || upstreamMode;
+          if (!upstream.ok) {
+            const errorText = await upstream.text().catch(() => '');
+            upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+            recordUpstreamUsagePhase(session, config, {
+              phase: postToolPhase,
+              endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: 'http_error',
+              httpStatus: upstream.status,
+              error: errorText,
+              promptChars: usageMeta.messageChars,
+              meta: usageMeta,
+            });
+            toolCalls = [];
+          } else {
+            streamed = await streamAgentUpstreamResponse(upstream, session, {
+              collectTools: true,
+              emit: !sawWriteTool,
+              emitThinking,
+              phase: postToolPhase,
+              idleTimeoutMs: sawWriteTool
+                ? POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS
+                : POST_TOOL_STREAM_IDLE_TIMEOUT_MS,
+              maxDurationMs: sawWriteTool
+                ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
+                : POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              extendMaxDurationOnActivity: sawWriteTool,
+              stopOnToolCall: true,
+              stopAfterTextMs: sawWriteTool ? POST_MUTATION_STOP_AFTER_TEXT_MS : 0,
+              reasoningOnlyMaxMs,
+              filterInlineThinking,
+            });
+            finalText = streamed.text;
+            finalReasoning = streamed.reasoning;
+            upstreamError = streamed.upstreamError;
+            toolCalls = attachDefaultMutationTarget(
+              streamed.toolCalls.slice(0, maxToolCallsPerRound),
+              session,
+              userText,
+            );
+            recordUpstreamUsagePhase(session, config, {
+              phase: postToolPhase,
+              endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: streamed.upstreamError ? 'stream_error' : 'success',
+              error: streamed.upstreamError,
+              usage: streamed.usage,
+              durationMs: streamed.durationMs,
+              promptChars: usageMeta.messageChars,
+              responseTextChars: streamed.text.length,
+              reasoningChars: streamed.reasoning.length,
+              toolCalls: streamed.toolCalls.length,
+              meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+            });
+          }
+        } catch (error) {
+          if (session.aborted) return null;
+          upstreamError = summarizeFetchError(error);
+          toolCalls = [];
           recordUpstreamUsagePhase(session, config, {
             phase: postToolPhase,
             endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
             model: configuredModel,
-            status: 'http_error',
-            httpStatus: upstream.status,
-            error: errorText,
+            status: 'fetch_error',
+            error: error.message || String(error),
             promptChars: usageMeta.messageChars,
             meta: usageMeta,
           });
-          toolCalls = [];
-        } else {
-          streamed = await streamAgentUpstreamResponse(upstream, session, {
-            collectTools: true,
-            emit: !sawWriteTool,
-            emitThinking,
-            phase: postToolPhase,
-            idleTimeoutMs: sawWriteTool
-              ? POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS
-              : POST_TOOL_STREAM_IDLE_TIMEOUT_MS,
-            maxDurationMs: sawWriteTool
-              ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
-              : POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            extendMaxDurationOnActivity: sawWriteTool,
-            stopOnToolCall: true,
-            stopAfterTextMs: sawWriteTool ? POST_MUTATION_STOP_AFTER_TEXT_MS : 0,
-            reasoningOnlyMaxMs,
-            filterInlineThinking,
-          });
-          finalText = streamed.text;
-          finalReasoning = streamed.reasoning;
-          upstreamError = streamed.upstreamError;
-          toolCalls = attachDefaultMutationTarget(
-            streamed.toolCalls.slice(0, maxToolCallsPerRound),
-            session,
-            userText,
-          );
-          recordUpstreamUsagePhase(session, config, {
-            phase: postToolPhase,
-            endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
-            model: configuredModel,
-            status: streamed.upstreamError ? 'stream_error' : 'success',
-            error: streamed.upstreamError,
-            usage: streamed.usage,
-            durationMs: streamed.durationMs,
-            promptChars: usageMeta.messageChars,
-            responseTextChars: streamed.text.length,
-            reasoningChars: streamed.reasoning.length,
-            toolCalls: streamed.toolCalls.length,
-            meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
-          });
+          logger?.error?.(`agent local relay post-tool upstream failed requestId=${requestId} phase=${postToolPhase}: ${error.message}`);
         }
-      } catch (error) {
-        if (session.aborted) return;
-        upstreamError = summarizeFetchError(error);
-        toolCalls = [];
-        recordUpstreamUsagePhase(session, config, {
-          phase: postToolPhase,
-          endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
-          model: configuredModel,
-          status: 'fetch_error',
-          error: error.message || String(error),
-          promptChars: usageMeta.messageChars,
-          meta: usageMeta,
-        });
-        logger.error(`agent local relay post-tool upstream failed requestId=${requestId} phase=${postToolPhase}: ${error.message}`);
+        if (!shouldRecoverPostToolStream(upstreamError, finalText, toolCalls, postToolRecoveryCount)) break;
+        logger?.info?.(`agent local relay post-tool stream stalled; recovering requestId=${requestId} step=${toolStep} attempt=${postToolRecoveryCount + 1} error=${JSON.stringify(upstreamError)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
+        const trimmedRecoveryText = String(finalText || '').trim();
+        upstreamMessages = trimmedRecoveryText
+          ? [
+            ...upstreamMessages,
+            { role: 'assistant', content: trimmedRecoveryText },
+            buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
+          ]
+          : [
+            ...upstreamMessages,
+            buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
+          ];
+        finalText = '';
+        upstreamError = '';
+        postToolRecoveryCount += 1;
       }
-      if (!shouldRecoverPostToolStream(upstreamError, finalText, toolCalls, postToolRecoveryCount)) break;
-      logger.info(`agent local relay post-tool stream stalled; recovering requestId=${requestId} step=${toolStep} attempt=${postToolRecoveryCount + 1} error=${JSON.stringify(upstreamError)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
-      const trimmedRecoveryText = String(finalText || '').trim();
-      upstreamMessages = trimmedRecoveryText
-        ? [
-          ...upstreamMessages,
-          { role: 'assistant', content: trimmedRecoveryText },
-          buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
-        ]
-        : [
-          ...upstreamMessages,
-          buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
-        ];
-      finalText = '';
-      upstreamError = '';
-      postToolRecoveryCount += 1;
-    }
-    while (session.active
-      && !session.aborted
-      && (sawWriteTool || postToolRecoveryCount > 0)
-      && !upstreamError
-      && !toolCalls.length
-      && completionVerificationCount < MAX_COMPLETION_VERIFICATION_ROUNDS) {
-      const completionPhase = `completion_verify_${completionVerificationCount + 1}`;
-      logger.info(`agent local relay completion verification requestId=${requestId} step=${toolStep} attempt=${completionVerificationCount + 1} postToolRecoveries=${postToolRecoveryCount} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
-      const trimmedCandidate = String(finalText || '').trim();
-      upstreamMessages = trimmedCandidate
-        ? [
-          ...upstreamMessages,
-          { role: 'assistant', content: trimmedCandidate },
-          buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
-        ]
-        : [
-          ...upstreamMessages,
-          buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
-        ];
-      finalText = '';
-      upstreamError = '';
-      completionVerificationCount += 1;
-      compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: completionPhase });
-      upstreamMessages = compacted.messages;
-      usageMeta = compacted.usage;
-      try {
-        ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-          config.upstream,
-          configuredModel,
-          upstreamMessages,
-          logger,
-          {
-            enableTools: true,
-            signal: session.abortController?.signal || null,
-            timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            requestId,
-            phase: completionPhase,
-            outboundProxy: config.outboundProxy || null,
-            localProxyPort: config.port,
-          },
-        ));
-        if (!upstream.ok) {
-          const errorText = await upstream.text().catch(() => '');
-          upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+      while (session.active
+        && !session.aborted
+        && (sawWriteTool || postToolRecoveryCount > 0)
+        && !upstreamError
+        && !toolCalls.length
+        && completionVerificationCount < MAX_COMPLETION_VERIFICATION_ROUNDS) {
+        const completionPhase = `completion_verify_${completionVerificationCount + 1}`;
+        logger?.info?.(`agent local relay completion verification requestId=${requestId} step=${toolStep} attempt=${completionVerificationCount + 1} postToolRecoveries=${postToolRecoveryCount} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
+        const trimmedCandidate = String(finalText || '').trim();
+        upstreamMessages = trimmedCandidate
+          ? [
+            ...upstreamMessages,
+            { role: 'assistant', content: trimmedCandidate },
+            buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
+          ]
+          : [
+            ...upstreamMessages,
+            buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
+          ];
+        finalText = '';
+        upstreamError = '';
+        completionVerificationCount += 1;
+        compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: completionPhase });
+        upstreamMessages = compacted.messages;
+        usageMeta = compacted.usage;
+        let upstream;
+        let resumedMode = upstreamMode;
+        try {
+          ({ response: upstream, mode: resumedMode } = await fetchUpstreamCompletion(
+            config.upstream,
+            configuredModel,
+            upstreamMessages,
+            logger,
+            {
+              enableTools: true,
+              signal: session.abortController?.signal || null,
+              timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              requestId,
+              phase: completionPhase,
+              mode: agentMode,
+              outboundProxy: config.outboundProxy || null,
+              localProxyPort: config.port,
+            },
+          ));
+          upstreamMode = resumedMode || upstreamMode;
+          if (!upstream.ok) {
+            const errorText = await upstream.text().catch(() => '');
+            upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+            recordUpstreamUsagePhase(session, config, {
+              phase: completionPhase,
+              endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: 'http_error',
+              httpStatus: upstream.status,
+              error: errorText,
+              promptChars: usageMeta.messageChars,
+              meta: usageMeta,
+            });
+            toolCalls = [];
+          } else {
+              streamed = await streamAgentUpstreamResponse(upstream, session, {
+              collectTools: true,
+              emit: false,
+              emitThinking,
+              phase: completionPhase,
+              idleTimeoutMs: POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS,
+              maxDurationMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              extendMaxDurationOnActivity: true,
+              stopOnToolCall: true,
+              stopAfterTextMs: POST_MUTATION_STOP_AFTER_TEXT_MS,
+              reasoningOnlyMaxMs,
+              filterInlineThinking,
+            });
+            finalText = streamed.text;
+            finalReasoning = streamed.reasoning;
+            upstreamError = streamed.upstreamError;
+            toolCalls = attachDefaultMutationTarget(
+              streamed.toolCalls.slice(0, maxToolCallsPerRound),
+              session,
+              userText,
+            );
+            recordUpstreamUsagePhase(session, config, {
+              phase: completionPhase,
+              endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: streamed.upstreamError ? 'stream_error' : 'success',
+              error: streamed.upstreamError,
+              usage: streamed.usage,
+              durationMs: streamed.durationMs,
+              promptChars: usageMeta.messageChars,
+              responseTextChars: streamed.text.length,
+              reasoningChars: streamed.reasoning.length,
+              toolCalls: streamed.toolCalls.length,
+              meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+            });
+          }
+        } catch (error) {
+          if (session.aborted) return null;
+          upstreamError = summarizeFetchError(error);
+          toolCalls = [];
           recordUpstreamUsagePhase(session, config, {
             phase: completionPhase,
             endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
             model: configuredModel,
-            status: 'http_error',
-            httpStatus: upstream.status,
-            error: errorText,
+            status: 'fetch_error',
+            error: error.message || String(error),
             promptChars: usageMeta.messageChars,
             meta: usageMeta,
           });
-          toolCalls = [];
-        } else {
-          streamed = await streamAgentUpstreamResponse(upstream, session, {
-            collectTools: true,
-            emit: false,
-            emitThinking,
-            phase: completionPhase,
-            idleTimeoutMs: POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS,
-            maxDurationMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            extendMaxDurationOnActivity: true,
-            stopOnToolCall: true,
-            stopAfterTextMs: POST_MUTATION_STOP_AFTER_TEXT_MS,
-            reasoningOnlyMaxMs,
-            filterInlineThinking,
-          });
-          finalText = streamed.text;
-          finalReasoning = streamed.reasoning;
-          upstreamError = streamed.upstreamError;
-          toolCalls = attachDefaultMutationTarget(
-            streamed.toolCalls.slice(0, maxToolCallsPerRound),
-            session,
-            userText,
-          );
-          recordUpstreamUsagePhase(session, config, {
-            phase: completionPhase,
-            endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-            model: configuredModel,
-            status: streamed.upstreamError ? 'stream_error' : 'success',
-            error: streamed.upstreamError,
-            usage: streamed.usage,
-            durationMs: streamed.durationMs,
-            promptChars: usageMeta.messageChars,
-            responseTextChars: streamed.text.length,
-            reasoningChars: streamed.reasoning.length,
-            toolCalls: streamed.toolCalls.length,
-            meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
-          });
+          logger?.error?.(`agent local relay completion verification upstream failed requestId=${requestId}: ${error.message}`);
         }
-      } catch (error) {
-        if (session.aborted) return;
-        upstreamError = summarizeFetchError(error);
-        toolCalls = [];
-        recordUpstreamUsagePhase(session, config, {
-          phase: completionPhase,
-          endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-          model: configuredModel,
-          status: 'fetch_error',
-          error: error.message || String(error),
-          promptChars: usageMeta.messageChars,
-          meta: usageMeta,
-        });
-        logger.error(`agent local relay completion verification upstream failed requestId=${requestId}: ${error.message}`);
       }
+      if (toolCalls.length) continue;
     }
-    if (toolCalls.length) continue;
+
     while (session.active
       && !session.aborted
-      && shouldContinueIncompleteWork(session, finalText, toolCalls, upstreamError, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool })) {
+      && shouldContinueIncompleteWorkByMode(session, finalText, toolCalls, upstreamError, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool })) {
       const continuationPhase = `incomplete_continuation_${incompletePostMutationContinuationCount + 1}`;
-      const maxIncompleteContinuations = sawReadOnlyTool && !sawMutationTool
-        ? getMaxReadOnlyExplorationContinuationCount(session)
-        : getMaxIncompleteContinuationCount(session);
+      const maxIncompleteContinuations = getMaxContinuationCountByMode(session, { sawMutationTool, sawReadOnlyTool });
       const incompleteTodosForContinuation = getIncompleteTodos(session);
       const forceReadOnlyContinuationTool = shouldForceReadOnlyContinuationToolCall(session, finalText, { sawMutationTool, sawReadOnlyTool });
-      const forceToolForContinuation = forceReadOnlyContinuationTool || !sawReadOnlyTool || sawMutationTool || incompleteTodosForContinuation.length > 0;
+      const forceToolForContinuation = shouldForceContinuationToolChoiceByMode(session, finalText, { sawMutationTool, sawReadOnlyTool });
       const readOnlyContinuationTarget = forceReadOnlyContinuationTool
         ? (toWorkspaceRelativePath(getReadOnlyContinuationTargetPath(session), getSessionWorkspaceRoot(session)) || getReadOnlyContinuationTargetPath(session))
         : '';
-      logger.info(`agent local relay incomplete continuation requestId=${requestId} step=${toolStep} attempt=${incompletePostMutationContinuationCount + 1}/${formatContinuationLimitForLog(maxIncompleteContinuations)} sawMutationTool=${sawMutationTool ? 1 : 0} sawReadOnlyTool=${sawReadOnlyTool ? 1 : 0} toolChoice=${forceToolForContinuation ? 'required' : 'auto'} readOnlyTarget=${JSON.stringify(readOnlyContinuationTarget)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))} incompleteTodos=${incompleteTodosForContinuation.length}`);
+      logger?.info?.(`agent local relay incomplete continuation requestId=${requestId} step=${toolStep} attempt=${incompletePostMutationContinuationCount + 1}/${formatContinuationLimitForLog(maxIncompleteContinuations)} sawMutationTool=${sawMutationTool ? 1 : 0} sawReadOnlyTool=${sawReadOnlyTool ? 1 : 0} toolChoice=${forceToolForContinuation ? 'required' : 'auto'} readOnlyTarget=${JSON.stringify(readOnlyContinuationTarget)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))} incompleteTodos=${incompleteTodosForContinuation.length}`);
       const trimmedContinuationText = String(finalText || '').trim();
       upstreamMessages = trimmedContinuationText
         ? [
           ...upstreamMessages,
           { role: 'assistant', content: trimmedContinuationText },
-          buildIncompleteContinuationMessage(session, finalText, incompletePostMutationContinuationCount),
+          buildIncompleteContinuationMessageByMode(session, finalText, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool }),
         ]
         : [
           ...upstreamMessages,
-          buildIncompleteContinuationMessage(session, finalText, incompletePostMutationContinuationCount),
+          buildIncompleteContinuationMessageByMode(session, finalText, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool }),
         ];
       finalText = '';
       upstreamError = '';
@@ -5483,8 +5667,10 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
       compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: continuationPhase });
       upstreamMessages = compacted.messages;
       usageMeta = compacted.usage;
+      let upstream;
+      let resumedMode = upstreamMode;
       try {
-        ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+        ({ response: upstream, mode: resumedMode } = await fetchUpstreamCompletion(
           activeUpstream,
           configuredModel,
           upstreamMessages,
@@ -5496,10 +5682,12 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
             timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
             requestId,
             phase: continuationPhase,
+            mode: agentMode,
             outboundProxy: config.outboundProxy || null,
             localProxyPort: config.port,
           },
         ));
+        upstreamMode = resumedMode || upstreamMode;
         if (!upstream.ok) {
           const errorText = await upstream.text().catch(() => '');
           upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
@@ -5552,7 +5740,7 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
           });
         }
       } catch (error) {
-        if (session.aborted) return;
+        if (session.aborted) return null;
         upstreamError = summarizeFetchError(error);
         toolCalls = [];
         recordUpstreamUsagePhase(session, config, {
@@ -5564,49 +5752,50 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
           promptChars: usageMeta.messageChars,
           meta: usageMeta,
         });
-        logger.error(`agent local relay incomplete continuation failed requestId=${requestId} phase=${continuationPhase}: ${error.message}`);
+        logger?.error?.(`agent local relay incomplete continuation failed requestId=${requestId} phase=${continuationPhase}: ${error.message}`);
       }
     }
     if (toolCalls.length) continue;
+    break;
   }
 
   const incompleteTodosAtEnd = getIncompleteTodos(session);
-  const incompleteWorkAtEnd = !upstreamError
-    && !toolCalls.length
-    && (
-      incompleteTodosAtEnd.length > 0
-      || looksLikeIncompleteContinuationText(finalText)
-      || looksLikeReadOnlyExplorationStillInProgress(session, finalText, { sawMutationTool, sawReadOnlyTool })
-    );
+  const incompleteWorkAtEnd = hasIncompleteWorkAtEndByMode(
+    session,
+    finalText,
+    toolCalls,
+    upstreamError,
+    { sawMutationTool, sawReadOnlyTool },
+  );
   if (incompleteWorkAtEnd) {
     session.unfinishedWorkAtEnd = true;
     const latestText = String(finalText || '').trim();
-    const maxIncompleteContinuations = getMaxIncompleteContinuationCount(session);
+    const maxIncompleteContinuations = getMaxContinuationCountByMode(session, { sawMutationTool, sawReadOnlyTool });
     const note = [
-      `本地 Relay 已尝试自动续跑 ${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} 次，但不会把未完成 To-dos 强制改成完成。`,
-      incompleteTodosAtEnd.length ? `仍未完成的 To-dos：${incompleteTodosAtEnd.map((todo) => todo.content).slice(0, 6).join('；')}` : '',
-      latestText ? `最后一段上游文本：${latestText}` : '',
+      `鏈湴 Relay 宸插皾璇曡嚜鍔ㄧ画璺?${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} 娆★紝浣嗕笉浼氭妸鏈畬鎴?To-dos 寮哄埗鏀规垚瀹屾垚銆俙`,
+      incompleteTodosAtEnd.length ? `浠嶆湭瀹屾垚鐨?To-dos锛?${incompleteTodosAtEnd.map((todo) => todo.content).slice(0, 6).join('锛?)')}` : '',
+      latestText ? `鏈€鍚庝竴娈典笂娓告枃鏈細${latestText}` : '',
     ].filter(Boolean).join('\n');
     rememberUnfinishedAgentTask(session, userText, note);
     finalText = '';
-    logger.warn(`agent local relay incomplete work left to upstream requestId=${requestId} toolStep=${toolStep} continuations=${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} incompleteTodos=${incompleteTodosAtEnd.length} textPreview=${JSON.stringify(latestText.slice(0, 200))}`);
+    logger?.warn?.(`agent local relay incomplete work left to upstream requestId=${requestId} toolStep=${toolStep} continuations=${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} incompleteTodos=${incompleteTodosAtEnd.length} textPreview=${JSON.stringify(latestText.slice(0, 200))}`);
   } else if (maxToolRounds > 0 && toolCalls.length && toolStep >= maxToolRounds) {
-    upstreamError = `本地 Relay 工具轮数保护已触发（${maxToolRounds} 轮），任务尚未确认完成。已保留当前工具结果上下文，避免伪造完成总结。`;
+    upstreamError = `鏈湴 Relay 宸ュ叿杞暟淇濇姢宸茶Е鍙戯紙${maxToolRounds} 杞級锛屼换鍔″皻鏈‘璁ゅ畬鎴愩€傚凡淇濈暀褰撳墠宸ュ叿缁撴灉涓婁笅鏂囷紝閬垮厤浼€犲畬鎴愭€荤粨銆俙`;
     rememberUnfinishedAgentTask(session, userText, upstreamError);
-    logger.warn(`agent local relay tool round guard reached requestId=${requestId} toolStep=${toolStep} pendingTools=${toolCalls.length}`);
+    logger?.warn?.(`agent local relay tool round guard reached requestId=${requestId} toolStep=${toolStep} pendingTools=${toolCalls.length}`);
   } else if (upstreamError && isRecoverableStreamError(upstreamError)) {
     rememberUnfinishedAgentTask(session, userText, upstreamError);
-    logger.warn(`agent local relay recoverable upstream interruption requestId=${requestId} toolStep=${toolStep} error=${JSON.stringify(upstreamError)}`);
+    logger?.warn?.(`agent local relay recoverable upstream interruption requestId=${requestId} toolStep=${toolStep} error=${JSON.stringify(upstreamError)}`);
   } else if (!upstreamError) {
     session.unfinishedWorkAtEnd = false;
     clearUnfinishedAgentTask(session);
   }
 
   if (shouldTreatStreamErrorAsComplete(upstreamError, finalText)) {
-    logger.info(`agent local relay treating recoverable stream error as completed requestId=${requestId} error=${JSON.stringify(upstreamError)} textLen=${String(finalText || '').length} toolStep=${toolStep}`);
+    logger?.info?.(`agent local relay treating recoverable stream error as completed requestId=${requestId} error=${JSON.stringify(upstreamError)} textLen=${String(finalText || '').length} toolStep=${toolStep}`);
     upstreamError = '';
   }
-  if (!session.active || session.aborted) return;
+  if (!session.active || session.aborted) return null;
   finalText = sanitizeFinalAgentText(finalText, session);
   session.hadError = Boolean(upstreamError);
   const finalStatus = session.unfinishedWorkAtEnd
@@ -5641,14 +5830,14 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     if (sawWriteTool || String(session.agentTextFrameText || '').trim()) {
       finalText = '';
     } else {
-      logger.info(`agent local relay completed without final text requestId=${requestId} toolStep=${toolStep}`);
+      logger?.info?.(`agent local relay completed without final text requestId=${requestId} toolStep=${toolStep}`);
     }
   } else if (String(finalText || '').trim() && !placeholderFinalText) {
     session.historyTextCursor = String(session.agentTextFrameText || '').length;
   } else if (placeholderFinalText) {
-    logger.info(`agent local relay suppressed placeholder final text requestId=${requestId} text=${JSON.stringify(String(finalText || '').trim())}`);
+    logger?.info?.(`agent local relay suppressed placeholder final text requestId=${requestId} text=${JSON.stringify(String(finalText || '').trim())}`);
   }
-  logger.info(
+  logger?.info?.(
     `agent local relay final text frame requestId=${requestId} finalTextLen=${String(finalText || '').length} sentTextDelta=${session.sentTextDelta ? '1' : '0'} finalAlreadySent=${finalTextAlreadySent ? '1' : '0'} sentTextLen=${String(session.agentTextFrameText || '').length}`,
   );
   writeAgentFrame(session, buildAgentTurnEndedFrame());
@@ -5656,16 +5845,303 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
   markUpstreamUsageCompleted(session, config, finalStatus, upstreamError);
   rememberCompletedAgentTurn(session.completedAgentTurns, session.requestId, userText, getSessionWorkspaceRoot(session), session.lastUserMessageCapture?.debug || null, session.generatedChunks, { upstreamError, hadError: session.unfinishedWorkAtEnd });
   completeSessionHistory(session, historyStatus, `model-${requestId}`);
-  logger.info(
+  logger?.info?.(
     `agent local relay upstream response requestId=${requestId} mode=${upstreamMode || '-'} textLen=${finalText.length} reasoningLen=${finalReasoning.length} errorLen=${upstreamError.length} textPreview=${JSON.stringify(finalText.slice(0, 300))}`,
   );
   logGeneratedAgentRunSseSummary(session.generatedChunks || [], session.requestId, logger);
   finalizeInterceptedAgentSession(session);
+  return { waitingForInteraction: false, finalStatus, historyStatus };
+}
+
+async function resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction = null) {
+  if (!session?.active || session.aborted || session.relaying) return;
+  session.relaying = true;
+  try {
+  const requestId = session.requestId || '-';
+  const userText = String(pendingInteraction?.resumeState?.userText || session.lastUserMessageCapture?.userText || '').trim();
+  if (!userText) {
+    logger?.warn?.(`agent local relay interaction resume skipped requestId=${requestId} reason=missing_user_text`);
+    return;
+  }
+  const configuredModel = resolveRequestedUpstreamModel(config, {
+    requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
+  });
+  const activeUpstream = resolveUpstreamForModel(config, configuredModel);
+  const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
+    ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
+    : 0;
+  const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
+  const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
+  const agentMode = getSessionAgentMode(session);
+  const runPostEditLints = shouldRunPostEditLints(config);
+  const upstreamMessages = buildPendingInteractionResumeMessages(session, pendingInteraction, interactionResponse);
+  const compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'interaction_resume' });
+  const usageMeta = compacted.usage;
+  const promptChars = usageMeta.messageChars;
+
+  stats.chatTotal = (stats.chatTotal || 0) + 1;
+  stats.localRelayTurns = (stats.localRelayTurns || 0) + 1;
+  logger?.info?.(
+    `agent local relay interaction resume requestId=${requestId} interactionKind=${interactionResponse?.kind || '-'} promptChars=${promptChars}`,
+  );
+
+  let upstream;
+  let upstreamMode = '';
+  try {
+    ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+      activeUpstream,
+      configuredModel,
+      compacted.messages,
+      logger,
+      {
+        signal: session.abortController?.signal || null,
+        requestId,
+        phase: 'interaction_resume',
+        mode: agentMode,
+        outboundProxy: config.outboundProxy || null,
+        localProxyPort: config.port,
+      },
+    ));
+  } catch (error) {
+    if (session.aborted) return;
+    const summarized = summarizeFetchError(error);
+    recordUpstreamUsagePhase(session, config, {
+      phase: 'interaction_resume',
+      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+      model: configuredModel,
+      status: 'fetch_error',
+      error: error.message || String(error),
+      promptChars,
+      meta: usageMeta,
+    });
+    logger?.error?.(`agent local relay interaction resume fetch failed requestId=${requestId}: ${error.message}`);
+    appendSessionHistory(session, {
+      role: 'assistant',
+      kind: 'assistant_text',
+      payload: { text: summarized, error: true },
+    });
+    writeAgentTextFrame(session, summarized);
+    writeAgentFrame(session, buildAgentTurnEndedFrame());
+    session.turnEnded = true;
+    completeSessionHistory(session, 'failed', `interaction-resume-fetch-${requestId}`);
+    finalizeInterceptedAgentSession(session);
+    return;
+  }
+
+  if (!upstream.ok) {
+    if (session.aborted) return;
+    const errorText = await upstream.text().catch(() => '');
+    const summarized = summarizeUpstreamFailure(upstream.status, errorText);
+    recordUpstreamUsagePhase(session, config, {
+      phase: 'interaction_resume',
+      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+      model: configuredModel,
+      status: 'http_error',
+      httpStatus: upstream.status,
+      error: errorText,
+      promptChars,
+      meta: usageMeta,
+    });
+    logger?.error?.(`agent local relay interaction resume HTTP ${upstream.status} requestId=${requestId} bodyPreview=${JSON.stringify(errorText.slice(0, 300))}`);
+    appendSessionHistory(session, {
+      role: 'assistant',
+      kind: 'assistant_text',
+      payload: { text: summarized, error: true },
+    });
+    writeAgentTextFrame(session, summarized);
+    writeAgentFrame(session, buildAgentTurnEndedFrame());
+    session.turnEnded = true;
+    completeSessionHistory(session, 'failed', `interaction-resume-http-${requestId}`);
+    finalizeInterceptedAgentSession(session);
+    return;
+  }
+
+  const streamed = await streamAgentUpstreamResponse(upstream, session, {
+    collectTools: true,
+    emit: true,
+    emitThinking,
+    phase: 'interaction_resume',
+    idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+    maxDurationMs: 0,
+    reasoningOnlyMaxMs,
+    filterInlineThinking,
+  });
+  recordUpstreamUsagePhase(session, config, {
+    phase: 'interaction_resume',
+    endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+    model: configuredModel,
+    status: streamed.upstreamError ? 'stream_error' : 'success',
+    error: streamed.upstreamError,
+    usage: streamed.usage,
+    durationMs: streamed.durationMs,
+    promptChars,
+    responseTextChars: streamed.text.length,
+    reasoningChars: streamed.reasoning.length,
+    toolCalls: streamed.toolCalls.length,
+    meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+  });
+  if (!session.active || session.aborted) return;
+  session.waitingForInteraction = false;
+  session.planTurnHandoff = '';
+  await continueAgentStreamLoop(session, {
+    userText,
+    config,
+    logger,
+    streamed,
+    upstreamMessages: compacted.messages,
+    usageMeta,
+    configuredModel,
+    activeUpstream,
+    upstreamMode,
+    requestId,
+    agentMode,
+    runPostEditLints,
+    emitThinking,
+    filterInlineThinking,
+    reasoningOnlyMaxMs,
+  });
   } finally {
     if (session) session.relaying = false;
+    triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
   }
 }
 
+async function relayAgentUserMessage(session, userText, config, logger, stats) {
+  if (!session?.active || session.aborted || session.relaying) return;
+  session.relaying = true;
+  try {
+    if (!session.agentHistory) {
+      const { conversation, turnSeq } = beginAgentHistoryTurn(
+        config,
+        session.requestId || '',
+        getSessionWorkspaceRoot(session),
+        session.lastUserMessageCapture || null,
+      );
+      session.agentHistory = conversation;
+      session.agentTurnSeq = turnSeq;
+      const agentModeForHistory = getSessionAgentMode(session);
+      if (session.agentHistory?.state) session.agentHistory.state.mode = getCursorModeDirectory(agentModeForHistory);
+      appendSessionHistory(session, {
+        role: 'user',
+        kind: 'request_context',
+        payload: {
+          env: {
+            osVersion: `${process.platform} ${process.getSystemVersion ? process.getSystemVersion() : ''}`.trim(),
+            workspacePaths: [getSessionWorkspaceRoot(session)],
+            shell: 'powershell',
+            timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+          },
+          fileContents: {},
+          readLintsEnabled: true,
+          mcpInfoComplete: true,
+          envInfoComplete: true,
+        },
+      });
+      appendSessionHistory(session, {
+        role: 'user',
+        kind: 'user_message',
+        payload: {
+          text: String(userText || ''),
+          mode: agentModeForHistory,
+        },
+      });
+      appendSessionHistory(session, {
+        role: 'system',
+        kind: 'prompt_context',
+        payload: {
+          source: 'current_user_request',
+          role: 'user',
+          content: `<current_user_request>
+${String(userText || '')}
+</current_user_request>`,
+        },
+      });
+      updateAgentHistoryUsage(config, { requests: 1 });
+    }
+
+    const configuredModel = resolveRequestedUpstreamModel(config, {
+      requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
+    });
+    const activeUpstream = resolveUpstreamForModel(config, configuredModel);
+    const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
+      ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
+      : 0;
+    const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
+    const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
+    const requestId = session.requestId || '-';
+    const agentMode = getSessionAgentMode(session);
+
+    let upstreamMessages = buildLocalRelayMessages(userText, session);
+    const compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'initial' });
+    upstreamMessages = compacted.messages;
+    const usageMeta = compacted.usage;
+    const promptChars = usageMeta.messageChars;
+
+    stats.chatTotal = (stats.chatTotal || 0) + 1;
+    stats.localRelayTurns = (stats.localRelayTurns || 0) + 1;
+
+    const { response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+      activeUpstream,
+      configuredModel,
+      upstreamMessages,
+      logger,
+      {
+        signal: session.abortController?.signal || null,
+        requestId,
+        phase: 'initial',
+        mode: agentMode,
+        outboundProxy: config.outboundProxy || null,
+        localProxyPort: config.port,
+      },
+    );
+
+    const streamed = await streamAgentUpstreamResponse(upstream, session, {
+      collectTools: true,
+      emit: true,
+      emitThinking,
+      phase: 'initial',
+      idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+      maxDurationMs: 0,
+      reasoningOnlyMaxMs,
+      filterInlineThinking,
+    });
+
+    recordUpstreamUsagePhase(session, config, {
+      phase: 'initial',
+      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+      model: configuredModel,
+      status: streamed.upstreamError ? 'stream_error' : 'success',
+      error: streamed.upstreamError,
+      usage: streamed.usage,
+      durationMs: streamed.durationMs,
+      promptChars,
+      responseTextChars: streamed.text.length,
+      reasoningChars: streamed.reasoning.length,
+      toolCalls: streamed.toolCalls.length,
+      meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+    });
+
+    await continueAgentStreamLoop(session, {
+      userText,
+      config,
+      logger,
+      streamed,
+      upstreamMessages,
+      usageMeta,
+      configuredModel,
+      activeUpstream,
+      upstreamMode,
+      requestId,
+      agentMode,
+      emitThinking,
+      filterInlineThinking,
+      reasoningOnlyMaxMs,
+    });
+  } finally {
+    if (session) session.relaying = false;
+    triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
+  }
+}
 function forwardMitmH2Request(req, res, host, reqPath, method, body, logger, options = {}) {
   return new Promise((resolve, reject) => {
     const client = http2.connect(`https://${host}:443`);
@@ -5788,10 +6264,16 @@ async function forwardMitmHttpsRequest(req, res, logger, body, options = {}) {
   });
 }
 
-async function handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns) {
+async function handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const rawBody = await readRequestBody(req);
   const requestId = decodeRunSseRequestId(rawBody);
   const frameSummary = summarizeConnectFrames(rawBody);
+  let pendingCapture = null;
+  if (requestId && pendingAgentMessages?.get?.(requestId)?.capture) {
+    pendingCapture = pendingAgentMessages.get(requestId).capture;
+  }
+  const stableConversationId = extractStableConversationId(pendingCapture?.debug || null)
+    || String(pendingCapture?.stableConversationId || '').trim();
 
   stats.seenAgentRunSse = (stats.seenAgentRunSse || 0) + 1;
   logger.info(
@@ -5807,6 +6289,38 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
   }
 
   if (isLocalRelayMode(config)) {
+    const existingWaitingSession = requestId ? agentSessions.get(requestId) : null;
+    if (existingWaitingSession?.waitingForInteraction && !existingWaitingSession.aborted) {
+      const session = reattachWaitingInteractionSession(existingWaitingSession, req, res, rawBody, logger);
+      res.on('close', () => {
+        if (session?.completed) return;
+        abortAgentSession(session, logger, 'runsse_closed');
+      });
+      if (session?.deferredInteractionResponse?.interactionResponse && !session.relaying) {
+        triggerDeferredInteractionResume(session, config, logger, stats, 'runsse_reattach');
+      }
+      return;
+    }
+    const crossRequestWaitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, requestId);
+    if (crossRequestWaitingSession && !crossRequestWaitingSession.aborted) {
+      if (requestId && requestId !== crossRequestWaitingSession.requestId) {
+        agentSessions.set(requestId, crossRequestWaitingSession);
+      }
+      const session = reattachWaitingInteractionSession(crossRequestWaitingSession, req, res, rawBody, logger);
+      if (pendingCapture) {
+        session.lastUserMessageCapture = pendingCapture;
+        session.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || session.workspaceRoot || '');
+      }
+      res.on('close', () => {
+        if (session?.completed) return;
+        abortAgentSession(session, logger, 'runsse_closed');
+      });
+      if (session?.deferredInteractionResponse?.interactionResponse && !session.relaying) {
+        triggerDeferredInteractionResume(session, config, logger, stats, 'runsse_cross_request_reattach');
+      }
+      return;
+    }
+
     const session = {
       req,
       res,
@@ -5830,6 +6344,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       lastUserMessageCapture: null,
       workspaceRoot: '',
       completedAgentTurns,
+      pendingAgentInteractions,
     };
     logger.info(`agent local relay RunSSE open requestId=${requestId || '-'} mode=${getRunnerMode(config)}`);
     try {
@@ -5849,6 +6364,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       if (pending?.userText) {
         pendingAgentMessages.delete(requestId);
         session.lastUserMessageCapture = pending.capture || null;
+        session.agentMode = normalizeAgentModeName(pending.capture?.mode || session.agentMode || 'AGENT_MODE_AGENT');
         session.workspaceRoot = normalizeWorkspacePath(pending.workspaceRoot || pending.capture?.workspaceRoot || session.workspaceRoot || '');
         if (pending.completedTurn) {
           completeDuplicateAgentSession(session, logger, 'completed_scope_replay_pending', pending.completedTurn);
@@ -5872,7 +6388,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
   logAgentRunSseResponseSummary(captureResponsePath, requestId, logger);
 }
 
-async function handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns) {
+async function handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const rawBody = await readRequestBody(req);
   const decoded = decodeBidiAppendRequest(rawBody);
   const protocolOneof = decoded.debug?.agentClientMessage?.oneof || '-';
@@ -5890,6 +6406,19 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
   logger.info(
     `protocol BidiAppend kind=${decoded.kind || '-'} requestId=${decoded.requestId || '-'} rawLen=${rawBody.length} agentOneof=${protocolOneof} workspaceRoot=${JSON.stringify(decoded.debug?.workspaceRoot || '')} userTextPreview=${JSON.stringify(userTextPreview)}`,
   );
+
+  if (decoded.kind === 'conversation_action') {
+    logger.info(
+      `protocol BidiAppend conversation_action debug requestId=${decoded.requestId || '-'} rawTextPreview=${JSON.stringify(decoded.debug?.rawTextPreview || '')} dataTextPreview=${JSON.stringify(decoded.debug?.dataTextPreview || '')} agentShape=${JSON.stringify(decoded.debug?.agentShape || '')} agentClientMessage=${JSON.stringify(decoded.debug?.agentClientMessage || {})}`,
+    );
+  } else if (decoded.kind !== 'client_heartbeat' && decoded.kind !== 'user_message') {
+    const stopCandidateText = `${userTextPreview}\n${decoded.debug?.rawTextPreview || ''}\n${decoded.debug?.dataTextPreview || ''}`;
+    if (/abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(stopCandidateText)) {
+      logger.info(
+        `protocol BidiAppend stop-candidate requestId=${decoded.requestId || '-'} kind=${decoded.kind || '-'} protocolOneof=${protocolOneof} rawTextPreview=${JSON.stringify(decoded.debug?.rawTextPreview || '')} dataTextPreview=${JSON.stringify(decoded.debug?.dataTextPreview || '')} agentClientMessage=${JSON.stringify(decoded.debug?.agentClientMessage || {})}`,
+      );
+    }
+  }
 
   const samplePath = persistProtocolSample(config, 'bidi', rawBody, {
     requestId: decoded.requestId || '',
@@ -5943,10 +6472,47 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       return;
     }
 
+    if (decoded.kind === 'interaction_response' && decoded.requestId) {
+      const interactionResponse = decoded.debug?.agentClientMessage?.interactionResponse || null;
+      const matchedPendingByStableConversation = findPendingInteractionQuery(pendingAgentInteractions, decoded.requestId, interactionResponse);
+      const session = agentSessions.get(decoded.requestId)
+        || findWaitingSessionByStableConversationId(
+          agentSessions,
+          matchedPendingByStableConversation?.stableConversationId || '',
+          decoded.requestId,
+        );
+      const pendingInteraction = matchedPendingByStableConversation;
+      logger.info(
+        `agent local relay received interaction_response requestId=${decoded.requestId} interactionKind=${interactionResponse?.kind || '-'} interactionId=${Number(interactionResponse?.id) || 0} matchedPending=${pendingInteraction ? '1' : '0'} pendingKind=${pendingInteraction?.kind || '-'} pendingTool=${pendingInteraction?.toolName || '-'} payload=${JSON.stringify(interactionResponse || {})}`,
+      );
+      if (session && pendingInteraction) {
+        appendInteractionResponseToHistory(session, pendingInteraction, interactionResponse);
+      }
+      if (pendingInteraction?.key) {
+        pendingAgentInteractions.delete(pendingInteraction.key);
+      }
+      ack();
+      if (session?.active && !session.aborted && !session.relaying) {
+        resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+          .catch((error) => failAgentRelaySession(session, logger, error, 'interaction_resume'));
+      } else if (session?.active && session.relaying) {
+        session.deferredInteractionResponse = {
+          interactionResponse,
+          pendingInteraction,
+          capturedAt: new Date().toISOString(),
+        };
+        logger.info(`agent local relay deferred interaction resume requestId=${decoded.requestId} reason=session_relaying`);
+      }
+      return;
+    }
+
     if (decoded.kind === 'conversation_action' && decoded.requestId) {
       const session = agentSessions.get(decoded.requestId);
       const actionText = `${userTextPreview}\n${decoded.debug?.rawTextPreview || ''}\n${decoded.debug?.dataTextPreview || ''}`;
-      if (/abort|aborted|cancel|stop/i.test(actionText)) {
+      logger.info(
+        `agent local relay conversation_action requestId=${decoded.requestId} sessionActive=${session?.active ? '1' : '0'} sessionAborted=${session?.aborted ? '1' : '0'} matchedAbort=${/abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(actionText) ? '1' : '0'} actionText=${JSON.stringify(actionText.slice(0, 800))} agentClientMessage=${JSON.stringify(decoded.debug?.agentClientMessage || {})}`,
+      );
+      if (/abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(actionText)) {
         abortAgentSession(session, logger, 'conversation_action_abort');
         logger.info(`agent local relay conversation abort requestId=${decoded.requestId}`);
       }
@@ -5957,16 +6523,18 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
     if (decoded.kind === 'user_message' && decoded.requestId && decoded.userText) {
       const normalizedUserText = trimRelayText(decoded.userText, 12000);
       const workspaceRoot = selectWorkspaceRootForUserMessage(decoded.debug?.workspaceRoot || '', logger, decoded.requestId);
+      const stableConversationId = extractStableConversationId(decoded.debug || null);
       const capture = {
         capturedAt: new Date().toISOString(),
         requestId: decoded.requestId,
         kind: decoded.kind,
+        mode: normalizeAgentModeName(decoded.mode || extractAgentModeFromPayload(Buffer.alloc(0))),
         userText: normalizedUserText,
         userTextPreview,
         selectedImages: Array.isArray(decoded.selectedImages) ? decoded.selectedImages : [],
         rawLen: rawBody.length,
         workspaceRoot,
-        stableConversationId: extractStableConversationId(decoded.debug || null),
+        stableConversationId,
         debug: decoded.debug || null,
       };
       const completedTurn = getCompletedAgentTurn(completedAgentTurns, decoded.requestId, normalizedUserText, workspaceRoot, decoded.debug || null);
@@ -5988,12 +6556,25 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         return;
       }
       const session = agentSessions.get(decoded.requestId);
+      const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      if (!session?.active && waitingSession && !waitingSession.relaying) {
+        if (decoded.requestId && decoded.requestId !== waitingSession.requestId) {
+          agentSessions.set(decoded.requestId, waitingSession);
+        }
+        waitingSession.agentMode = capture.mode;
+        waitingSession.lastUserMessageCapture = capture;
+        waitingSession.workspaceRoot = workspaceRoot || waitingSession.workspaceRoot || '';
+        logger.info(`agent local relay mapped new request to waiting session requestId=${decoded.requestId} previousRequestId=${waitingSession.requestId || '-'} stableConversationId=${JSON.stringify(stableConversationId)} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(waitingSession))}`);
+        ack();
+        return;
+      }
       if (session?.active && session.relaying) {
         logger.info(`agent local relay in-flight user_message acked requestId=${decoded.requestId} workspaceRoot=${JSON.stringify(workspaceRoot)} textLen=${normalizedUserText.length}`);
         ack();
         return;
       }
       if (session?.active) {
+        session.agentMode = capture.mode;
         session.lastUserMessageCapture = capture;
         session.workspaceRoot = workspaceRoot || session.workspaceRoot || '';
         logger.info(`agent local relay workspace requestId=${decoded.requestId} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))}`);
@@ -6048,7 +6629,7 @@ async function handleCursorChat(req, res, config, logger, stats) {
   await forwardMitmHttpsRequest(req, res, logger, rawBody);
 }
 
-async function handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns) {
+async function handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const { pathname, method, protocol } = getMitmRequestMeta(req);
   if (protocol === 'h2') stats.connectH2 = (stats.connectH2 || 0) + 1;
   trackRecentPath(stats, method, pathname);
@@ -6062,12 +6643,12 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
   }
 
   if (isAgentRunSsePath(pathname) && method === 'POST') {
-    await handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns);
+    await handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions);
     return;
   }
 
   if (isBidiAppendPath(pathname) && method === 'POST') {
-    await handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns);
+    await handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions);
     return;
   }
 
@@ -6116,6 +6697,7 @@ function startProxy(config) {
   const agentSessions = new Map();
   const pendingAgentMessages = new Map();
   const completedAgentTurns = new Map();
+  const pendingAgentInteractions = new Map();
   const stats = {
     connectTotal: 0,
     connectMitm: 0,
@@ -6184,7 +6766,7 @@ function startProxy(config) {
     if (protocol === 'h2') stats.connectH2 = (stats.connectH2 || 0) + 1;
     trackRecentPath(stats, method, pathname);
     logger.info(`mitm request ${method} ${pathname} proto=${protocol} entry=${entry}`);
-    handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns).catch((error) => {
+    handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions).catch((error) => {
       logger.error(`mitm request failed (${entry}): ${error.stack || error.message}`);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });

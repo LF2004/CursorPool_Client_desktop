@@ -335,10 +335,16 @@ function summarizeAgentClientMessagePayload(payload) {
     } else if (out.oneof === 'run_request') {
       const requestedModelField = getFieldBytes(innerFields, 9);
       const requestedModelFields = parseFields(requestedModelField || Buffer.alloc(0));
+      const conversationStateFields = parseFields(getFieldBytes(innerFields, 8) || Buffer.alloc(0));
+      const runMode = getFieldVarint(innerFields, 10);
+      const conversationMode = getFieldVarint(conversationStateFields, 10);
       out.runRequest = {
         stableConversationId: decodeUtf8(getFieldBytes(innerFields, 5) || Buffer.alloc(0)).trim(),
         requestedModelId: decodeUtf8(getFieldBytes(requestedModelFields, 1) || Buffer.alloc(0)).trim(),
+        mode: mapAgentModeNumberToName(runMode || conversationMode || 0),
       };
+    } else if (out.oneof === 'interaction_response') {
+      out.interactionResponse = summarizeInteractionResponse(innerFields);
     }
   }
   return out;
@@ -374,11 +380,150 @@ function summarizeAgentServerMessagePayload(payload) {
       shape: summarizeFieldShape(interactionFields),
     };
   }
+  if (oneof === 'interaction_query' && oneofField?.bytes?.length) {
+    out.interactionQuery = summarizeInteractionQuery(oneofField.bytes);
+  }
   return out;
 }
 
 function getFieldVarint(fields, fieldNumber) {
   return fields.find((field) => field.field === fieldNumber && field.wireType === 0)?.varint;
+}
+
+function summarizeAskQuestionArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const questions = argsFields
+    .filter((field) => field.field === 2 && field.wireType === 2)
+    .map((field) => {
+      const questionFields = parseFields(field.bytes);
+      return {
+        id: decodeUtf8(getFieldBytes(questionFields, 1) || Buffer.alloc(0)).trim(),
+        prompt: decodeUtf8(getFieldBytes(questionFields, 2) || Buffer.alloc(0)).trim(),
+        allowMultiple: Boolean(getFieldVarint(questionFields, 4)),
+        options: questionFields
+          .filter((optionField) => optionField.field === 3 && optionField.wireType === 2)
+          .map((optionField) => {
+            const optionFields = parseFields(optionField.bytes);
+            return {
+              id: decodeUtf8(getFieldBytes(optionFields, 1) || Buffer.alloc(0)).trim(),
+              label: decodeUtf8(getFieldBytes(optionFields, 2) || Buffer.alloc(0)).trim(),
+            };
+          }),
+      };
+    });
+  return {
+    title: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    questions,
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeCreatePlanArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const todos = argsFields
+    .filter((field) => field.field === 2 && field.wireType === 2)
+    .map((field) => {
+      const todoFields = parseFields(field.bytes);
+      return {
+        id: decodeUtf8(getFieldBytes(todoFields, 1) || Buffer.alloc(0)).trim(),
+        content: decodeUtf8(getFieldBytes(todoFields, 2) || Buffer.alloc(0)).trim(),
+        status: decodeUtf8(getFieldBytes(todoFields, 3) || Buffer.alloc(0)).trim(),
+      };
+    });
+  return {
+    plan: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    todos,
+    overview: decodeUtf8(getFieldBytes(argsFields, 3) || Buffer.alloc(0)).trim(),
+    name: decodeUtf8(getFieldBytes(argsFields, 4) || Buffer.alloc(0)).trim(),
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeAskQuestionInteractionResponsePayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const resultFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const answers = parseFields(getFieldBytes(resultFields, 1) || Buffer.alloc(0))
+    .filter((field) => field.field === 1 && field.wireType === 2)
+    .map((field) => {
+      const answerFields = parseFields(field.bytes);
+      return {
+        questionId: decodeUtf8(getFieldBytes(answerFields, 1) || Buffer.alloc(0)).trim(),
+        selectedOptionIds: answerFields
+          .filter((answerField) => answerField.field === 2 && answerField.wireType === 2)
+          .map((answerField) => decodeUtf8(answerField.bytes || Buffer.alloc(0)).trim())
+          .filter(Boolean),
+        freeformText: decodeUtf8(getFieldBytes(answerFields, 3) || Buffer.alloc(0)).trim(),
+      };
+    });
+  return {
+    kind: getFieldBytes(resultFields, 1)
+      ? 'success'
+      : getFieldBytes(resultFields, 2)
+        ? 'error'
+        : getFieldBytes(resultFields, 3)
+          ? 'rejected'
+          : getFieldBytes(resultFields, 4)
+            ? 'async'
+            : '',
+    error: decodeUtf8(getFieldBytes(parseFields(getFieldBytes(resultFields, 2) || Buffer.alloc(0)), 1) || Buffer.alloc(0)).trim(),
+    rejectedReason: decodeUtf8(getFieldBytes(parseFields(getFieldBytes(resultFields, 3) || Buffer.alloc(0)), 1) || Buffer.alloc(0)).trim(),
+    answers,
+  };
+}
+
+function summarizeCreatePlanInteractionResponsePayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const resultFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  return {
+    kind: getFieldBytes(resultFields, 1) ? 'success' : getFieldBytes(resultFields, 2) ? 'error' : '',
+    planUri: decodeUtf8(getFieldBytes(resultFields, 3) || Buffer.alloc(0)).trim(),
+    error: decodeUtf8(getFieldBytes(parseFields(getFieldBytes(resultFields, 2) || Buffer.alloc(0)), 1) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeInteractionResponse(fields = []) {
+  const askPayload = getFieldBytes(fields, 3);
+  const createPlanPayload = getFieldBytes(fields, 7);
+  const webSearchPayload = getFieldBytes(fields, 2);
+  return {
+    id: getFieldVarint(fields, 1) ?? null,
+    kind: askPayload
+      ? 'ask_question_interaction_response'
+      : createPlanPayload
+        ? 'create_plan_request_response'
+        : webSearchPayload
+          ? 'web_search_request_response'
+          : '',
+    askQuestion: askPayload ? summarizeAskQuestionInteractionResponsePayload(askPayload) : null,
+    createPlan: createPlanPayload ? summarizeCreatePlanInteractionResponsePayload(createPlanPayload) : null,
+    webSearchApproved: Boolean(webSearchPayload && getFieldBytes(parseFields(webSearchPayload), 1)),
+  };
+}
+
+function summarizeInteractionQuery(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const askPayload = getFieldBytes(fields, 3);
+  const createPlanPayload = getFieldBytes(fields, 7);
+  const webSearchPayload = getFieldBytes(fields, 2);
+  return {
+    id: getFieldVarint(fields, 1) ?? null,
+    kind: askPayload
+      ? 'ask_question_interaction_query'
+      : createPlanPayload
+        ? 'create_plan_request_query'
+        : webSearchPayload
+          ? 'web_search_request_query'
+          : '',
+    askQuestion: askPayload ? summarizeAskQuestionArgsPayload(askPayload) : null,
+    createPlan: createPlanPayload ? summarizeCreatePlanArgsPayload(createPlanPayload) : null,
+    webSearch: webSearchPayload
+      ? {
+          searchTerm: decodeUtf8(getFieldBytes(parseFields(webSearchPayload), 1) || Buffer.alloc(0)).trim(),
+        }
+      : null,
+  };
 }
 
 function summarizeExecServerToolArgs(tool, payload) {
@@ -676,6 +821,68 @@ function extractUserTextFromAgentPayload(payload) {
     if (text) return text;
   }
   return collectTextParts(fields);
+}
+
+function mapAgentModeNumberToName(value) {
+  switch (Number(value) || 0) {
+    case 1:
+      return 'AGENT_MODE_AGENT';
+    case 2:
+      return 'AGENT_MODE_ASK';
+    case 3:
+      return 'AGENT_MODE_PLAN';
+    case 4:
+      return 'AGENT_MODE_DEBUG';
+    case 5:
+      return 'AGENT_MODE_TRIAGE';
+    case 6:
+      return 'AGENT_MODE_PROJECT';
+    default:
+      return 'AGENT_MODE_UNSPECIFIED';
+  }
+}
+
+function extractAgentModeFromPayload(payload) {
+  if (!payload?.length) return 'AGENT_MODE_UNSPECIFIED';
+  const fields = parseFields(payload);
+  const runRequest = getFieldBytes(fields, 1);
+  if (runRequest?.length) {
+    const runFields = parseFields(runRequest);
+    const directMode = mapAgentModeNumberToName(getFieldVarint(runFields, 10));
+    if (directMode !== 'AGENT_MODE_UNSPECIFIED') return directMode;
+    const convAction = getFieldBytes(runFields, 2);
+    if (convAction?.length) {
+      const convFields = parseFields(convAction);
+      const userAction = getFieldBytes(convFields, 1);
+      if (userAction?.length) {
+        const userActionFields = parseFields(userAction);
+        const userMessage = getFieldBytes(userActionFields, 1);
+        if (userMessage?.length) {
+          const userFields = parseFields(userMessage);
+          const userMode = mapAgentModeNumberToName(getFieldVarint(userFields, 4));
+          if (userMode !== 'AGENT_MODE_UNSPECIFIED') return userMode;
+        }
+      }
+    }
+    const conversationStateFields = parseFields(getFieldBytes(runFields, 8) || Buffer.alloc(0));
+    const stateMode = mapAgentModeNumberToName(getFieldVarint(conversationStateFields, 10));
+    if (stateMode !== 'AGENT_MODE_UNSPECIFIED') return stateMode;
+  }
+  const convAction = getFieldBytes(fields, 4);
+  if (convAction?.length) {
+    const convFields = parseFields(convAction);
+    const userAction = getFieldBytes(convFields, 1);
+    if (userAction?.length) {
+      const userActionFields = parseFields(userAction);
+      const userMessage = getFieldBytes(userActionFields, 1);
+      if (userMessage?.length) {
+        const userFields = parseFields(userMessage);
+        const userMode = mapAgentModeNumberToName(getFieldVarint(userFields, 4));
+        if (userMode !== 'AGENT_MODE_UNSPECIFIED') return userMode;
+      }
+    }
+  }
+  return 'AGENT_MODE_UNSPECIFIED';
 }
 
 function unwrapBidiDataField(dataBytes) {
@@ -1153,6 +1360,7 @@ function decodeBidiAppendRequest(bodyBuffer) {
     debug.dataLength = data.length;
     debug.agentPayloadLength = agentPayload.length;
     debug.agentClientMessage = summarizeAgentClientMessagePayload(agentPayload);
+    debug.agentMode = extractAgentModeFromPayload(agentPayload);
     debug.agentShape = summarizeFieldShape(agentFields);
     debug.dataTextPreview = decodeUtf8Safe(data);
     debug.uuidCandidates = collectUuidCandidatesFromBuffers([raw, payload, chosen.bytes, data, agentPayload]);
@@ -1181,11 +1389,25 @@ function decodeBidiAppendRequest(bodyBuffer) {
     }
     const userText = extractUserTextFromAgentPayload(agentPayload);
     if (userText) {
-      return { requestId, userText, selectedImages, kind: agentOneof === 'run_request' || firstField === 1 ? 'user_message' : agentOneof || 'user_message', debug };
+      return {
+        requestId,
+        userText,
+        selectedImages,
+        mode: debug.agentMode || debug.agentClientMessage?.runRequest?.mode || 'AGENT_MODE_UNSPECIFIED',
+        kind: agentOneof === 'run_request' || firstField === 1 ? 'user_message' : agentOneof || 'user_message',
+        debug,
+      };
     }
     const fallbackText = collectTextParts(agentFields).trim();
     if ((agentOneof === 'run_request' || firstField === 1) && fallbackText.length >= 2) {
-      return { requestId, userText: fallbackText, selectedImages, kind: 'user_message', debug };
+      return {
+        requestId,
+        userText: fallbackText,
+        selectedImages,
+        mode: debug.agentMode || debug.agentClientMessage?.runRequest?.mode || 'AGENT_MODE_UNSPECIFIED',
+        kind: 'user_message',
+        debug,
+      };
     }
     if (agentOneof) {
       return { requestId, userText: '', kind: agentOneof, debug };
@@ -1200,6 +1422,7 @@ function decodeBidiAppendRequest(bodyBuffer) {
       return {
         requestId,
         userText: lexicalTexts[0],
+        mode: 'AGENT_MODE_UNSPECIFIED',
         kind: 'user_message',
         debug,
       };
@@ -1429,6 +1652,30 @@ function buildAgentHeartbeatFrame() {
   return buildAgentInteractionFrame(13, encodeMessage([]));
 }
 
+function buildAgentInteractionQueryFrame(queryField, queryPayload, queryId = 1) {
+  const interactionQuery = concatBytes([
+    encodeInt32Field(1, Math.max(1, Number(queryId) || 1)),
+    encodeBytesField(queryField, queryPayload),
+  ]);
+  return buildAgentServerMessageField(7, interactionQuery);
+}
+
+function buildAgentAskQuestionQueryFrame(argumentsValue = {}, toolCallId = '', queryId = 1) {
+  return buildAgentInteractionQueryFrame(
+    3,
+    encodeAgentToolArgsPayload('AskQuestion', argumentsValue, toolCallId),
+    queryId,
+  );
+}
+
+function buildAgentCreatePlanQueryFrame(argumentsValue = {}, toolCallId = '', queryId = 1) {
+  return buildAgentInteractionQueryFrame(
+    7,
+    encodeAgentToolArgsPayload('CreatePlan', argumentsValue, toolCallId),
+    queryId,
+  );
+}
+
 function normalizeCheckpointPath(filePath) {
   const normalized = String(filePath || '').replace(/\//g, '\\');
   return normalized.replace(/^([A-Z]):\\/, (match, drive) => `${drive.toLowerCase()}:\\`);
@@ -1513,7 +1760,11 @@ function getAgentNativeToolSpec(toolName) {
   if (normalized === 'write' || normalized === 'edit' || normalized === 'patchedit') return { field: 12, name: 'Edit' };
   if (normalized === 'ls') return { field: 13, name: 'LS' };
   if (normalized === 'readlints' || normalized === 'diagnostics') return { field: 14, name: 'ReadLints' };
+  if (normalized === 'semanticsearch' || normalized === 'semsearch' || normalized === 'semantic_search') return { field: 16, name: 'SemanticSearch' };
+  if (normalized === 'createplan' || normalized === 'create_plan') return { field: 17, name: 'CreatePlan' };
   if (normalized === 'websearch' || normalized === 'web_search') return { field: 18, name: 'WebSearch' };
+  if (normalized === 'task') return { field: 19, name: 'Task' };
+  if (normalized === 'askquestion' || normalized === 'ask_question') return { field: 23, name: 'AskQuestion' };
   if (normalized === 'webfetch' || normalized === 'web_fetch' || normalized === 'fetch') return { field: 37, name: 'WebFetch' };
   return null;
 }
@@ -1903,6 +2154,30 @@ function encodeAgentToolArgsPayload(toolName, args = {}, toolCallId = '') {
         encodeOptionalStringField(1, normalizedArgs.search_term || normalizedArgs.searchTerm || normalizedArgs.query),
         encodeOptionalStringField(2, toolCallId),
       ]);
+    case 'SemanticSearch':
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.query),
+        encodeRepeatedStringField(2, normalizedArgs.target_directories || normalizedArgs.targetDirectories),
+        encodeOptionalStringField(3, normalizedArgs.explanation),
+      ]);
+    case 'CreatePlan':
+      return concatBytes([
+        encodeBytesField(1, concatBytes([
+          encodeOptionalStringField(1, normalizedArgs.plan),
+          ...(Array.isArray(normalizedArgs.todos) ? normalizedArgs.todos : []).map((todo) => encodeBytesField(2, encodeAgentTodoItem(todo))),
+          encodeOptionalStringField(3, normalizedArgs.overview),
+          encodeOptionalStringField(4, normalizedArgs.name),
+        ])),
+        encodeOptionalStringField(2, toolCallId),
+      ]);
+    case 'AskQuestion':
+      return concatBytes([
+        encodeBytesField(1, concatBytes([
+          encodeOptionalStringField(1, normalizedArgs.title),
+          ...(Array.isArray(normalizedArgs.questions) ? normalizedArgs.questions : []).map((question) => encodeBytesField(2, encodeAskQuestionQuestion(question))),
+        ])),
+        encodeOptionalStringField(2, toolCallId),
+      ]);
     case 'WebFetch':
       return concatBytes([
         encodeOptionalStringField(1, normalizedArgs.url),
@@ -1918,6 +2193,47 @@ function encodeWebSearchReference(reference = {}) {
     encodeOptionalStringField(1, reference.title),
     encodeOptionalStringField(2, reference.url),
     encodeOptionalStringField(3, reference.chunk),
+  ]);
+}
+
+function encodeAskQuestionOption(option = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, option.id),
+    encodeOptionalStringField(2, option.label),
+  ]);
+}
+
+function encodeAskQuestionQuestion(question = {}) {
+  const options = Array.isArray(question.options) ? question.options : [];
+  return concatBytes([
+    encodeOptionalStringField(1, question.id),
+    encodeOptionalStringField(2, question.prompt),
+    ...options.map((option) => encodeBytesField(3, encodeAskQuestionOption(option))),
+    encodeOptionalBoolField(4, question.allow_multiple === true || question.allowMultiple === true),
+  ]);
+}
+
+function encodeSemSearchCodeResult(result = {}) {
+  const codeBlock = result.codeBlock || {};
+  const range = codeBlock.range && typeof codeBlock.range === 'object'
+    ? concatBytes([
+      encodeBytesField(1, concatBytes([
+        encodeOptionalIntField(1, Number(codeBlock.range.startLine) || 0),
+        encodeOptionalIntField(2, Number(codeBlock.range.startColumn) || 0),
+      ])),
+      encodeBytesField(2, concatBytes([
+        encodeOptionalIntField(1, Number(codeBlock.range.endLine) || 0),
+        encodeOptionalIntField(2, Number(codeBlock.range.endColumn) || 0),
+      ])),
+    ])
+    : Buffer.alloc(0);
+  return concatBytes([
+    encodeBytesField(1, concatBytes([
+      encodeOptionalStringField(1, codeBlock.relativeWorkspacePath),
+      encodeOptionalStringField(4, codeBlock.contents),
+      range.length ? encodeBytesField(3, range) : Buffer.alloc(0),
+    ])),
+    encodeOptionalIntField(2, Number(result.score) || 0),
   ]);
 }
 
@@ -2009,6 +2325,72 @@ function encodeAgentToolResultPayload(toolName, args = {}, execution = null, too
           encodeOptionalIntField(3, Number(execution.diagnosticCount) || 0),
         ]),
       }]);
+    case 'SemanticSearch': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'Semantic search failed'),
+          ]),
+        }]);
+      }
+      const matches = Array.isArray(execution.matches) ? execution.matches : [];
+      return encodeMessage([{
+        field: 1,
+        value: concatBytes([
+          encodeOptionalStringField(1, resultText),
+          ...matches.map((item) => encodeBytesField(2, encodeSemSearchCodeResult(item))),
+        ]),
+      }]);
+    }
+    case 'CreatePlan': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'CreatePlan failed'),
+          ]),
+        }]);
+      }
+      return encodeMessage([{
+        field: 1,
+        value: concatBytes([
+          encodeOptionalStringField(3, execution.planPath || ''),
+        ]),
+      }]);
+    }
+    case 'Task': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'Task failed'),
+          ]),
+        }]);
+      }
+      return encodeMessage([{
+        field: 1,
+        value: concatBytes([
+          encodeOptionalStringField(2, execution.agentId || ''),
+          encodeOptionalBoolField(3, execution.isBackground === true),
+          encodeOptionalInt64Field(4, Number(execution.durationMs) || 0),
+        ]),
+      }]);
+    }
+    case 'AskQuestion': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'AskQuestion failed'),
+          ]),
+        }]);
+      }
+      return encodeMessage([{
+        field: 4,
+        value: Buffer.alloc(0),
+      }]);
+    }
     case 'WebSearch': {
       if (!execution.ok) {
         return encodeMessage([{
@@ -2246,6 +2628,7 @@ module.exports = {
   decodeCursorChatRequest,
   decodeRunSseRequestId,
   decodeBidiAppendRequest,
+  extractAgentModeFromPayload,
   readConnectFrames,
   summarizeConnectFrames,
   summarizeAgentServerStream,
@@ -2274,6 +2657,9 @@ module.exports = {
   buildAgentEditToolCallDeltaFrame,
   buildAgentTurnEndedFrame,
   buildAgentHeartbeatFrame,
+  buildAgentInteractionQueryFrame,
+  buildAgentAskQuestionQueryFrame,
+  buildAgentCreatePlanQueryFrame,
   buildAgentConversationCheckpointFrame,
   buildAgentToolCallFrame,
   buildStructuredToolCallSnapshot,

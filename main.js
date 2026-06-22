@@ -382,7 +382,8 @@ async function cleanupRelayBeforeQuit() {
       reloadCursor: false,
       clearSystemProxy: false,
       stopRunner: true,
-      fast: true,
+      fast: false,
+      resetActiveAgentConversation: true,
     });
   } catch (error) {
     logMainError('relay quit cleanup', error);

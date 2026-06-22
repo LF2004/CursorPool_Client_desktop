@@ -5,6 +5,13 @@ import { reasoningEffortLabel } from './relay-profiles.js';
 
 const usagePageState = { page: 1, pageSize: 20, total: 0 };
 const USAGE_POLL_INTERVAL_MS = 1000;
+const USAGE_VIEW_MODES = {
+  compact: 'compact',
+  detail: 'detail',
+};
+const usageViewState = {
+  mode: USAGE_VIEW_MODES.compact,
+};
 
 let usagePollTimer = null;
 let usagePollActive = false;
@@ -12,8 +19,39 @@ let usageRefreshInFlight = false;
 let usagePollPaused = false;
 let usageScrollEndTimer = null;
 let lastUsageFingerprint = '';
+let lastUsageRows = [];
 let pendingUsageRows = null;
 let pendingUsageApply = null;
+
+function getUsageVisibleColumnCount() {
+  return usageViewState.mode === USAGE_VIEW_MODES.detail ? 9 : 7;
+}
+
+function formatUsageModeLabel(value) {
+  const text = String(value || '').trim().toUpperCase();
+  if (text === 'AGENT_MODE_PLAN' || text === 'PLAN') return 'Plan';
+  if (text === 'AGENT_MODE_ASK' || text === 'ASK') return 'Ask';
+  if (text === 'AGENT_MODE_MULTITASK' || text === 'MULTITASK' || text === 'TASK') return 'Multitask';
+  return 'Agent';
+}
+
+function applyUsageViewMode(mode = USAGE_VIEW_MODES.compact) {
+  usageViewState.mode = mode === USAGE_VIEW_MODES.detail ? USAGE_VIEW_MODES.detail : USAGE_VIEW_MODES.compact;
+  const root = $('usage');
+  if (root) root.dataset.usageView = usageViewState.mode;
+  const compactBtn = $('usageViewCompactBtn');
+  const detailBtn = $('usageViewDetailBtn');
+  if (compactBtn) {
+    const active = usageViewState.mode === USAGE_VIEW_MODES.compact;
+    compactBtn.classList.toggle('active', active);
+    compactBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+  if (detailBtn) {
+    const active = usageViewState.mode === USAGE_VIEW_MODES.detail;
+    detailBtn.classList.toggle('active', active);
+    detailBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
 
 function formatDate(value) {
   if (!value) return '-';
@@ -55,7 +93,7 @@ function setUsageLoading(loading) {
   const body = $('usageTableBody');
   if (!body) return;
   if (loading) {
-    body.innerHTML = '<tr><td colspan="8" class="record-table-loading"><i class="fa fa-spinner fa-spin" aria-hidden="true"></i> 加载中…</td></tr>';
+    body.innerHTML = `<tr><td colspan="${getUsageVisibleColumnCount()}" class="record-table-loading"><i class="fa fa-spinner fa-spin" aria-hidden="true"></i> 加载中…</td></tr>`;
   }
   const root = $('usagePagination');
   if (root) root.classList.toggle('record-pagination-busy', Boolean(loading));
@@ -245,6 +283,8 @@ function buildUsageFingerprint(data = {}, rows = []) {
   const summary = data.summary || {};
   const rowSig = rows.map((row) => [
     row.id,
+    row.mode,
+    row.phase,
     row.status,
     row.billed_points,
     row.total_tokens,
@@ -387,10 +427,12 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
   if (!body) return;
   const scroller = preserveScroll ? document.querySelector('#usage .usage-table-scroll') : null;
   const scrollTop = scroller?.scrollTop ?? 0;
+  lastUsageRows = Array.isArray(rows) ? rows : [];
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="8" class="record-table-loading">暂无调用记录</td></tr>';
+    body.innerHTML = `<tr><td colspan="${getUsageVisibleColumnCount()}" class="record-table-loading">暂无调用记录</td></tr>`;
     return;
   }
+  const isDetail = usageViewState.mode === USAGE_VIEW_MODES.detail;
   body.innerHTML = rows.map((row) => {
     const status = String(row.status || 'unknown');
     const statusClass = status === 'success'
@@ -404,6 +446,7 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
     const reasoningEffort = String(row.reasoning_effort || '').trim();
     const phase = String(row.phase || '-');
     const endpointMode = String(row.endpoint_mode || '').trim();
+    const modeLabel = formatUsageModeLabel(row.mode);
     return `
       <tr>
         <td class="mono usage-time">${escapeHtml(formatDate(row.created_at))}</td>
@@ -413,10 +456,11 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
             ${row.model_label ? `<span class="usage-muted">${escapeHtml(row.model_label)}</span>` : ''}
           </div>
         </td>
+        <td class="usage-mode-cell"><span class="usage-mode-badge">${escapeHtml(modeLabel)}</span></td>
         <td class="usage-reasoning-cell" title="${escapeHtml(reasoningEffort || '未记录')}">${escapeHtml(reasoningEffort ? reasoningEffortLabel(reasoningEffort) : '-')}</td>
-        <td class="usage-phase-cell">
+        ${isDetail ? `<td class="usage-phase-cell">
           <span class="mono">${escapeHtml(phase)}</span>${endpointMode ? `<span class="usage-muted"> · ${escapeHtml(endpointMode)}</span>` : ''}
-        </td>
+        </td>` : ''}
         <td class="usage-token-cell">
           <div class="usage-token-content">
             <div class="usage-token-row">
@@ -452,7 +496,7 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
           </div>
         </td>
         <td><span class="usage-status ${statusClass}" title="${escapeHtml(row.error || '')}">${escapeHtml(statusLabel)}</span></td>
-        <td class="mono usage-request" title="${escapeHtml(row.request_id || '')}">${escapeHtml(row.request_id || '-')}</td>
+        ${isDetail ? `<td class="mono usage-request" title="${escapeHtml(row.request_id || '')}">${escapeHtml(row.request_id || '-')}</td>` : ''}
       </tr>
     `;
   }).join('');
@@ -545,8 +589,19 @@ export function stopUsagePolling() {
 
 export function bindUsageEvents() {
   attachUsagePopoverHandlers();
+  applyUsageViewMode(usageViewState.mode);
   const refreshBtn = $('usageRefreshBtn');
   if (refreshBtn) refreshBtn.onclick = () => refreshUsage(1);
+  const compactBtn = $('usageViewCompactBtn');
+  if (compactBtn) compactBtn.onclick = () => {
+    applyUsageViewMode(USAGE_VIEW_MODES.compact);
+    renderRows(lastUsageRows, { preserveScroll: true });
+  };
+  const detailBtn = $('usageViewDetailBtn');
+  if (detailBtn) detailBtn.onclick = () => {
+    applyUsageViewMode(USAGE_VIEW_MODES.detail);
+    renderRows(lastUsageRows, { preserveScroll: true });
+  };
   const clearBtn = $('usageClearBtn');
   if (clearBtn) {
     clearBtn.onclick = async () => {

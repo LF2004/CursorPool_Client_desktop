@@ -738,6 +738,24 @@ body.theme-light .log-detail { color: #374151; }
   flex: 0 0 auto;
   margin-left: auto;
 }
+.usage-view-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.42);
+  border: 1px solid rgba(71, 85, 105, 0.42);
+}
+.usage-view-toggle .ghost-btn {
+  min-height: 36px;
+  padding: 8px 12px;
+}
+.usage-view-toggle .ghost-btn.active {
+  background: rgba(var(--accent-rgb), 0.18);
+  border-color: rgba(var(--accent-rgb), 0.55);
+  color: rgba(255, 255, 255, 0.96);
+}
 .usage-filter-card .input,
 .usage-filter-card .ghost-btn,
 .usage-filter-card .record-btn-danger {
@@ -1093,7 +1111,7 @@ body.theme-light .log-detail { color: #374151; }
 }
 .usage-link:hover { text-decoration: underline; }
 .usage-table {
-  min-width: calc(1060px * var(--app-font-scale, 1));
+  min-width: calc(1180px * var(--app-font-scale, 1));
 }
 .usage-table.record-table th {
   font-size: var(--usage-table-head-font-size);
@@ -1128,25 +1146,53 @@ body.theme-light .log-detail { color: #374151; }
   min-width: calc(160px * var(--app-font-scale, 1));
 }
 .usage-table th:nth-child(3) {
+  width: calc(96px * var(--app-font-scale, 1));
+  min-width: calc(96px * var(--app-font-scale, 1));
+}
+.usage-table th:nth-child(4) {
   width: calc(84px * var(--app-font-scale, 1));
   min-width: calc(84px * var(--app-font-scale, 1));
   white-space: nowrap;
   padding-left: calc(2px * var(--app-font-scale, 1));
   padding-right: calc(4px * var(--app-font-scale, 1));
 }
-.usage-table th:nth-child(4) { width: 118px; }
 .usage-table th:nth-child(5) {
+  width: 118px;
+}
+.usage-table th:nth-child(6) {
   width: calc(210px * var(--app-font-scale, 1));
   min-width: calc(210px * var(--app-font-scale, 1));
 }
-.usage-table th:nth-child(6) {
+.usage-table th:nth-child(7) {
   width: calc(118px * var(--app-font-scale, 1));
   min-width: calc(118px * var(--app-font-scale, 1));
 }
-.usage-table th:nth-child(7) { width: 88px; }
-.usage-table th:nth-child(8) {
+.usage-table th:nth-child(8) { width: 88px; }
+.usage-table th:nth-child(9) {
   width: 140px;
   min-width: 140px;
+}
+.usage-page[data-usage-view="compact"] .usage-table [data-usage-col="phase"],
+.usage-page[data-usage-view="compact"] .usage-table [data-usage-col="request"],
+.usage-page[data-usage-view="compact"] .usage-phase-cell,
+.usage-page[data-usage-view="compact"] .usage-request {
+  display: none;
+}
+.usage-mode-cell {
+  white-space: nowrap;
+}
+.usage-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 74px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.12);
+  border: 1px solid rgba(var(--accent-rgb), 0.34);
+  color: rgba(255, 255, 255, 0.95);
+  font-size: var(--usage-table-compact-font-size);
+  font-weight: 600;
 }
 .usage-table td.usage-time {
   overflow: visible;
@@ -1523,7 +1569,9 @@ body.theme-light .usage-popover-total .mono { color: #059669; }
   .usage-filter-actions {
     margin-left: 0;
     width: 100%;
+    flex-wrap: wrap;
   }
+  .usage-view-toggle,
   .usage-filter-actions .ghost-btn,
   .usage-filter-actions .record-btn-danger {
     flex: 1 1 0;

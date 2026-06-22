@@ -9,6 +9,7 @@ const {
   forceQuitCursorForRestart,
   quitCursorAndWait,
   launchCursorApp,
+  startNewCursorAgentConversation,
   waitForCursorWindowReady,
   reloadRunningCursorWindow,
   focusCursorAndSendChatMessage,
@@ -1203,6 +1204,8 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   const clearSystemProxy = payload.clearSystemProxy === true;
   clearRelayRuntimeState();
   const cursorWasRunning = isCursorRunningHeuristic();
+  const resetActiveAgentConversation = payload.resetActiveAgentConversation !== false && cursorWasRunning && !restartCursor;
+  const stopRunnerFast = payload.fast === true && !resetActiveAgentConversation;
 
   if (restartCursor && cursorWasRunning) {
     await quitCursorAndWait({ throwOnTimeout: false });
@@ -1228,6 +1231,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   let restarted = false;
   let reloaded = false;
   let runnerStopped = false;
+  let agentConversationReset = { ok: false, skipped: true, message: '未请求切换 Agent 对话' };
   const runtimePatchChanged = Boolean(mainJsRestoreResult?.changed || reviewBridgeRestoreResult?.changed);
   if (restartCursor) {
     const launch = launchCursorApp({
@@ -1237,7 +1241,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
     await stopLocalRelayRunner();
     runnerStopped = true;
   } else if (payload.fast === true || payload.stopRunner === true || payload.stopRunner !== false) {
-    await stopLocalRelayRunner({ fast: payload.fast === true });
+    await stopLocalRelayRunner({ fast: stopRunnerFast });
     runnerStopped = true;
   } else if (!runtimePatchChanged && reloadCursor && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
@@ -1246,6 +1250,11 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   if (!restartCursor && !isCursorRunningHeuristic()) {
     await stopLocalRelayRunner();
     runnerStopped = true;
+  }
+
+  if (resetActiveAgentConversation) {
+    await sleep(250);
+    agentConversationReset = startNewCursorAgentConversation();
   }
 
   const status = await readCursorRelayProxyConfig({ lightweight: true });
@@ -1257,6 +1266,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
     runnerStopped,
     hotSwitched: !restartCursor && !runtimePatchChanged,
     requiresCursorRestart: runtimePatchChanged,
+    agentConversationReset,
     mainJsRestoreResult,
     reviewBridgeRestoreResult,
     systemProxy: systemProxyResult,
@@ -1575,6 +1585,7 @@ async function runRelayAgentDialogTest(payload = {}) {
   }
 
   const customPrompt = String(payload?.prompt || payload?.userPrompt || payload?.message || '').trim();
+  const requestedMode = String(payload?.mode || payload?.agentMode || 'AGENT_MODE_AGENT').trim() || 'AGENT_MODE_AGENT';
   const token = customPrompt ? '' : createRelayAgentTestToken();
   const prompt = customPrompt || buildRelayAgentTestPrompt(token);
   const port = Number(runner.port || DEFAULT_PORT);
@@ -1590,6 +1601,7 @@ async function runRelayAgentDialogTest(payload = {}) {
   const probe = await runRelayAgentConnectionTest({
     port,
     prompt,
+    mode: requestedMode,
     targetHosts,
     timeoutMs: customPrompt ? directTimeoutMs : Math.min(30000, directTimeoutMs),
   });
