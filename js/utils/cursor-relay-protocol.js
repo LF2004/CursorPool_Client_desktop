@@ -338,11 +338,15 @@ function summarizeAgentClientMessagePayload(payload) {
       const conversationStateFields = parseFields(getFieldBytes(innerFields, 8) || Buffer.alloc(0));
       const runMode = getFieldVarint(innerFields, 10);
       const conversationMode = getFieldVarint(conversationStateFields, 10);
+      const actionFields = parseFields(getFieldBytes(innerFields, 2) || Buffer.alloc(0));
       out.runRequest = {
         stableConversationId: decodeUtf8(getFieldBytes(innerFields, 5) || Buffer.alloc(0)).trim(),
         requestedModelId: decodeUtf8(getFieldBytes(requestedModelFields, 1) || Buffer.alloc(0)).trim(),
         mode: mapAgentModeNumberToName(runMode || conversationMode || 0),
+        action: actionFields.length ? summarizeConversationActionPayload(actionFields) : null,
       };
+    } else if (out.oneof === 'conversation_action') {
+      out.conversationAction = summarizeConversationActionPayload(innerFields);
     } else if (out.oneof === 'interaction_response') {
       out.interactionResponse = summarizeInteractionResponse(innerFields);
     }
@@ -794,13 +798,7 @@ function decodeCursorChatRequest(bodyBuffer) {
 }
 
 function extractUserTextFromConversationAction(convAction) {
-  const convFields = parseFields(convAction);
-  const userAction = getFieldBytes(convFields, 1);
-  if (!userAction?.length) return '';
-  const userFields = parseFields(userAction);
-  const userMessage = getFieldBytes(userFields, 1);
-  if (!userMessage?.length) return '';
-  return decodeUtf8(getFieldBytes(parseFields(userMessage), 1) || Buffer.alloc(0)).trim();
+  return String(summarizeConversationActionPayload(convAction)?.userText || '').trim();
 }
 
 function extractUserTextFromAgentPayload(payload) {
@@ -821,6 +819,111 @@ function extractUserTextFromAgentPayload(payload) {
     if (text) return text;
   }
   return collectTextParts(fields);
+}
+
+function summarizeUserMessagePayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  return {
+    text: decodeUtf8(getFieldBytes(fields, 1) || Buffer.alloc(0)).trim(),
+    messageId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+    mode: mapAgentModeNumberToName(getFieldVarint(fields, 4) || 0),
+    richText: decodeUtf8(getFieldBytes(fields, 8) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeConversationPlanPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  return {
+    plan: decodeUtf8(getFieldBytes(fields, 1) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeRequestContextPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const envFields = parseFields(getFieldBytes(fields, 4) || Buffer.alloc(0));
+  return {
+    workspacePaths: envFields
+      .filter((field) => field.field === 2 && field.wireType === 2)
+      .map((field) => decodeUtf8(field.bytes || Buffer.alloc(0)).trim())
+      .filter(Boolean),
+    projectFolder: decodeUtf8(getFieldBytes(envFields, 11) || Buffer.alloc(0)).trim(),
+    shell: decodeUtf8(getFieldBytes(envFields, 3) || Buffer.alloc(0)).trim(),
+    timeZone: decodeUtf8(getFieldBytes(envFields, 10) || Buffer.alloc(0)).trim(),
+    userIntentSummary: decodeUtf8(getFieldBytes(fields, 21) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeConversationActionPayload(payload) {
+  const fields = Array.isArray(payload) ? payload : parseFields(payload || Buffer.alloc(0));
+  const actionField = fields.find((field) => [1, 2, 3, 4, 5, 6, 7, 8, 10].includes(field.field) && field.wireType === 2);
+  const kind = actionField
+    ? ({
+      1: 'user_message_action',
+      2: 'resume_action',
+      3: 'cancel_action',
+      4: 'summarize_action',
+      5: 'shell_command_action',
+      6: 'start_plan_action',
+      7: 'execute_plan_action',
+      8: 'async_ask_question_completion_action',
+      10: 'cancel_subagent_action',
+    }[actionField.field] || '')
+    : '';
+  const summary = {
+    kind,
+    userText: '',
+    cancelReason: '',
+    executionMode: 'AGENT_MODE_UNSPECIFIED',
+    plan: '',
+    planFileUri: '',
+    planFileContent: '',
+    isSpec: false,
+    messageId: '',
+    requestContext: null,
+    fields: getFieldNumbers(fields),
+  };
+  if (!actionField?.bytes?.length) return summary;
+  const actionFields = parseFields(actionField.bytes);
+  switch (kind) {
+    case 'user_message_action': {
+      const userMessage = summarizeUserMessagePayload(getFieldBytes(actionFields, 1) || Buffer.alloc(0));
+      summary.userText = userMessage.text;
+      summary.messageId = userMessage.messageId;
+      summary.executionMode = userMessage.mode;
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      break;
+    }
+    case 'start_plan_action': {
+      const userMessage = summarizeUserMessagePayload(getFieldBytes(actionFields, 1) || Buffer.alloc(0));
+      summary.userText = userMessage.text;
+      summary.messageId = userMessage.messageId;
+      summary.executionMode = userMessage.mode;
+      summary.isSpec = Boolean(getFieldVarint(actionFields, 3));
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      break;
+    }
+    case 'execute_plan_action': {
+      const planSummary = summarizeConversationPlanPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      summary.plan = planSummary.plan;
+      summary.planFileUri = decodeUtf8(getFieldBytes(actionFields, 3) || Buffer.alloc(0)).trim();
+      summary.planFileContent = decodeUtf8(getFieldBytes(actionFields, 4) || Buffer.alloc(0)).trim();
+      summary.executionMode = mapAgentModeNumberToName(getFieldVarint(actionFields, 5) || 0);
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 1) || Buffer.alloc(0));
+      break;
+    }
+    case 'cancel_action':
+      summary.cancelReason = decodeUtf8(getFieldBytes(actionFields, 1) || Buffer.alloc(0)).trim();
+      break;
+    case 'resume_action':
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      break;
+    case 'cancel_subagent_action':
+      summary.subagentId = decodeUtf8(getFieldBytes(actionFields, 1) || Buffer.alloc(0)).trim();
+      break;
+    default:
+      break;
+  }
+  return summary;
 }
 
 function mapAgentModeNumberToName(value) {
@@ -2075,6 +2178,40 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
             totalFiles: files.length,
           },
         },
+      },
+    };
+  }
+  if (normalized === 'websearch' || normalized === 'web_search') {
+    const results = Array.isArray(execution.results) ? execution.results : [];
+    const references = Array.isArray(execution.references) ? execution.references : [];
+    const normalizedResults = results.length
+      ? results
+      : references
+        .filter((reference) => String(reference?.url || '').trim())
+        .map((reference, index) => ({
+          id: String(index + 1),
+          title: String(reference?.title || '').trim(),
+          url: String(reference?.url || '').trim(),
+          snippet: String(reference?.snippet || reference?.chunk || '').trim(),
+          rank: index + 1,
+        }));
+    return {
+      webSearchToolCall: {
+        args: {
+          searchTerm: String(safeArgs.search_term || safeArgs.searchTerm || safeArgs.query || execution.args?.search_term || '').trim(),
+          toolCallId: callId || undefined,
+        },
+        result: execution.ok === false
+          ? { error: { error: execution.resultText || 'Web search failed' } }
+          : {
+            success: {
+              references: normalizedResults.map((item) => ({
+                title: String(item?.title || '').trim(),
+                url: String(item?.url || '').trim(),
+                chunk: String(item?.snippet || '').trim(),
+              })),
+            },
+          },
       },
     };
   }

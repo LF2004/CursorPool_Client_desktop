@@ -101,6 +101,11 @@ const MAX_COMPLETION_VERIFICATION_ROUNDS = 0;
 const DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS = 16;
 const DEFAULT_MAX_INCOMPLETE_TODO_CONTINUATIONS = 0;
 const DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS = 6;
+const MAX_TRACKED_WEB_SEARCH_ATTEMPTS = 12;
+const MAX_SIMILAR_LOW_RELEVANCE_WEB_SEARCHES = 2;
+const MAX_WEB_SEARCH_CALLS_PER_ROUND = 2;
+const MAX_WEB_SEARCH_CALLS_PER_TURN = 2;
+const WEB_SEARCH_FETCH_TIMEOUT_MS = 4500;
 const POST_MUTATION_STOP_AFTER_TEXT_MS = 2500;
 const FORCE_MUTATION_AFTER_READ_ONLY_ROUNDS = 2;
 const DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS = 12000;
@@ -117,6 +122,23 @@ const RECENT_EXECUTION_WORKSPACE_PATH = path.join(process.env.USERPROFILE || pro
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
+
+const WEB_SEARCH_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'link', 'links',
+  '官网', '官方', '教程', '使用', '设计', '一个', '网页',
+  'search', 'find', 'lookup', 'look', 'please', 'help',
+]);
+
+const WEB_SEARCH_WEAK_TOKENS = new Set([
+  'latest', 'news', 'today', 'free', 'best', 'top', 'new', 'official',
+  '国内', '热门', '免费', '好玩', '排名', '最新', '现在', '今年',
+]);
+
+const WEB_SEARCH_NEWS_INTENT_TOKENS = new Set([
+  'news', 'headline', 'headlines', 'article', 'articles',
+  '新闻', '资讯', '消息', '快讯', '头条', '报道',
+  'ニュース', '速報', '最新情報',
+]);
 
 function parseArgs(argv) {
   const out = {};
@@ -1469,30 +1491,183 @@ function rebindWaitingSessionRequestId(session = {}, nextRequestId = '', logger 
 function replayPendingInteractionQueries(session = {}, logger = null) {
   const pendingEntries = getPendingInteractionEntriesForSession(session);
   if (!pendingEntries.length) return 0;
-  const handler = getModeHandlerForSession(session);
-  const helpers = buildModeRuntimeHelpers(session);
   let replayed = 0;
   for (const pendingInteraction of pendingEntries) {
-    if (!pendingInteraction?.queryId || !pendingInteraction?.kind) continue;
-    if (typeof handler.buildInteractionQuery !== 'function') continue;
-    const replay = handler.buildInteractionQuery(
-      session,
-      {
-        name: pendingInteraction.toolName,
-        arguments: pendingInteraction.arguments || {},
-      },
-      pendingInteraction.toolCallId || '',
-      Number(pendingInteraction.queryId) || 0,
-      helpers,
-    );
-    if (!replay?.frame) continue;
-    writeAgentFrame(session, replay.frame);
-    replayed += 1;
-    logger?.info?.(
-      `agent local relay replayed interaction_query requestId=${session.requestId || '-'} queryId=${pendingInteraction.queryId} kind=${pendingInteraction.kind} tool=${pendingInteraction.toolName || '-'}`
-    );
+    replayed += replayPendingInteractionQuery(session, pendingInteraction, logger);
   }
   return replayed;
+}
+
+function replayWaitingSessionPlanCheckpoint(session = {}, logger = null) {
+  if (!session?.active) return 0;
+  const planState = getLatestSessionPlanState(session);
+  const planText = String(planState?.plan_text || planState?.plan || '').trim();
+  if (!planText) return 0;
+  const workspaceRoot = getSessionWorkspaceRoot(session);
+  const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
+  try {
+    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
+      workspaceRoot,
+      rootPromptMessagesJson: session.rootPromptMessagesJson,
+      readPaths,
+      pendingToolCalls: [],
+      plan: planText,
+      todos: Array.isArray(planState?.todos) ? planState.todos : [],
+    }));
+    logger?.info?.(
+      `agent local relay replayed waiting plan checkpoint requestId=${session.requestId || '-'} planChars=${planText.length}`
+    );
+    return 1;
+  } catch (error) {
+    logger?.warn?.(
+      `agent local relay failed to replay waiting plan checkpoint requestId=${session.requestId || '-'}: ${error.message}`
+    );
+    return 0;
+  }
+}
+
+function maybeHandleRunRequestConversationAction(session, decoded, config, logger, stats, pendingAgentInteractions, ack) {
+  const action = decoded?.debug?.agentClientMessage?.runRequest?.action || null;
+  const actionKind = String(action?.kind || '').trim();
+  if (!session || !actionKind) return false;
+  const isExecutePlan = actionKind === 'execute_plan_action';
+  const isStartPlan = actionKind === 'start_plan_action';
+  if (!isExecutePlan && !isStartPlan) return false;
+  logger?.info?.(
+    `agent local relay run_request embedded action requestId=${decoded?.requestId || '-'} actionKind=${actionKind} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'}`
+  );
+  if (isStartPlan) {
+    const planState = {
+      plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
+      plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+      plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+      todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+    };
+    rememberSessionPlanState(session, planState);
+    session.waitingForInteraction = true;
+    session.planTurnHandoff = 'create_plan';
+    updateSessionHistoryState(session, {
+      current_loop_status: 'waiting_for_interaction',
+      waiting_for_interaction: {
+        handoff: 'create_plan',
+        pending_count: 1,
+        since: new Date().toISOString(),
+      },
+      plan: planState,
+    });
+    replayWaitingSessionPlanCheckpoint(session, logger);
+    ack();
+    return true;
+  }
+  const planState = {
+    plan: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan || '').trim(),
+    plan_text: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+    plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+    todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+  };
+  rememberSessionPlanState(session, planState);
+  if (String(action.executionMode || '').trim()) {
+    session.agentMode = normalizeAgentModeName(action.executionMode);
+  } else if (getSessionAgentMode(session) === 'AGENT_MODE_PLAN') {
+    session.agentMode = 'AGENT_MODE_AGENT';
+  }
+  session.relaying = false;
+  session.waitingForInteraction = false;
+  session.planTurnHandoff = '';
+  session.deferredInteractionResponse = null;
+  const interactionResponse = buildSyntheticPlanExecutionResponse(session, action);
+  const pendingInteraction = clonePendingInteractionSnapshot(
+    findPendingInteractionQuery(pendingAgentInteractions, decoded.requestId, interactionResponse)
+    || buildFallbackPendingPlanExecution(session),
+  );
+  removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
+  if (pendingInteraction?.resumeState) {
+    const existingResumeMessages = Array.isArray(pendingInteraction.resumeState.upstreamMessages)
+      ? pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }))
+      : [];
+    pendingInteraction.resumeState = {
+      ...pendingInteraction.resumeState,
+      plan: planState,
+      userText: String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || '').trim(),
+      upstreamMessages: existingResumeMessages.length
+        ? existingResumeMessages
+        : buildLocalRelayMessages(String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || ''), session),
+    };
+    session.lastPlanResumeMessages = pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }));
+  }
+  updateSessionHistoryState(session, {
+    current_loop_status: 'running',
+    waiting_for_interaction: null,
+    plan: planState,
+  });
+  ack();
+  if (session.active && !session.aborted) {
+    resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+      .catch((error) => failAgentRelaySession(session, logger, error, 'run_request_execute_plan'));
+  }
+  return true;
+}
+
+function replayPendingInteractionQuery(session = {}, pendingInteraction = {}, logger = null) {
+  if (!pendingInteraction?.queryId || !pendingInteraction?.kind) return 0;
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildInteractionQuery !== 'function') return 0;
+  const replay = handler.buildInteractionQuery(
+    session,
+    {
+      name: pendingInteraction.toolName,
+      arguments: pendingInteraction.arguments || {},
+    },
+    pendingInteraction.toolCallId || '',
+    Number(pendingInteraction.queryId) || 0,
+    helpers,
+  );
+  if (!replay?.frame) return 0;
+  writeAgentFrame(session, replay.frame);
+  logger?.info?.(
+    `agent local relay replayed interaction_query requestId=${session.requestId || '-'} queryId=${pendingInteraction.queryId} kind=${pendingInteraction.kind} tool=${pendingInteraction.toolName || '-'}`
+  );
+  return 1;
+}
+
+function removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction = null) {
+  const key = String(pendingInteraction?.key || '').trim();
+  if (!pendingAgentInteractions?.size || !key) return false;
+  return pendingAgentInteractions.delete(key);
+}
+
+function shouldKeepWaitingForInteractionResponse(pendingInteraction = {}, interactionResponse = {}) {
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (pendingKind === 'create_plan' && responseKind === 'create_plan_request_response') {
+    const status = String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase();
+    const planUri = String(interactionResponse?.createPlan?.planUri || '').trim();
+    if (status === 'success' && planUri) return true;
+  }
+  if (pendingKind !== 'ask_question' || responseKind !== 'ask_question_interaction_response') return false;
+  const askQuestion = interactionResponse?.askQuestion || {};
+  const status = String(askQuestion.kind || '').trim().toLowerCase();
+  const answers = Array.isArray(askQuestion.answers) ? askQuestion.answers : [];
+  const hasAnswers = answers.some((answer) => {
+    const selected = Array.isArray(answer?.selectedOptionIds) ? answer.selectedOptionIds.filter(Boolean) : [];
+    const freeform = String(answer?.freeformText || '').trim();
+    return selected.length > 0 || Boolean(freeform);
+  });
+  if (status === 'success' && hasAnswers) return false;
+  if (status === 'rejected') return true;
+  if (status === 'error') return true;
+  if (!hasAnswers) return true;
+  return false;
+}
+
+function shouldReplayPendingInteractionAfterResponse(pendingInteraction = {}, interactionResponse = {}) {
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (pendingKind === 'create_plan' && responseKind === 'create_plan_request_response') {
+    return false;
+  }
+  return shouldKeepWaitingForInteractionResponse(pendingInteraction, interactionResponse);
 }
 
 function isPlaceholderRunSseSession(session = {}) {
@@ -1527,6 +1702,7 @@ function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logge
   waitingSession.relaying = false;
   waitingSession.active = true;
   waitingSession.aborted = false;
+  waitingSession.historyCompleted = false;
   startAgentHeartbeat(waitingSession);
 
   placeholderSession.req = null;
@@ -1757,10 +1933,11 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
   if (!session?.agentHistory || session.historyCompleted) return;
   session.historyCompleted = true;
   try {
-    updateSessionHistoryState(session, {
+    const statePatch = {
       current_loop_status: status || 'completed',
-      waiting_for_interaction: null,
-    });
+    };
+    if (!session.waitingForInteraction) statePatch.waiting_for_interaction = null;
+    updateSessionHistoryState(session, statePatch);
     completeAgentHistoryTurn(session.agentHistory, {
       status,
       modelCallId: modelCallId || `relay-${session.requestId || Date.now().toString(36)}`,
@@ -1798,6 +1975,14 @@ function abortAgentSession(session, logger, reason = 'aborted') {
   } catch {
     /* ignore */
   }
+  if (session.activeUpstreamResponse && typeof session.activeUpstreamResponse.destroy === 'function') {
+    try {
+      session.activeUpstreamResponse.destroy(new Error(reason));
+    } catch {
+      /* ignore */
+    }
+  }
+  session.activeUpstreamResponse = null;
   if (session.requestId) session.agentSessions?.delete(session.requestId);
   if (session.agentHistory) {
     const status = session.hadError ? 'failed' : (session.turnEnded ? 'completed' : 'aborted');
@@ -1814,6 +1999,7 @@ function finalizeInterceptedAgentSession(session) {
   session.completed = true;
   session.active = false;
   session.relaying = false;
+  session.activeUpstreamResponse = null;
   clearInterval(session.heartbeat);
   session.heartbeat = null;
   try {
@@ -1840,6 +2026,14 @@ function finalizeInterceptedAgentSession(session) {
 
 function detachWaitingInteractionSession(session, logger, reason = 'runsse_closed') {
   if (!session || session.aborted || session.completed) return false;
+  if (session.activeUpstreamResponse && typeof session.activeUpstreamResponse.destroy === 'function') {
+    try {
+      session.activeUpstreamResponse.destroy(new Error(reason));
+    } catch {
+      /* ignore */
+    }
+  }
+  session.activeUpstreamResponse = null;
   clearInterval(session.heartbeat);
   session.heartbeat = null;
   session.streamDetached = true;
@@ -1864,6 +2058,7 @@ function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
   session.streamDetached = false;
   session.relaying = false;
   beginInterceptedAgentSession(session, logger);
+  replayWaitingSessionPlanCheckpoint(session, logger);
   replayPendingInteractionQueries(session, logger);
   logger?.info?.(`agent local relay waiting session reattached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} deferred=${session.deferredInteractionResponse?.interactionResponse ? '1' : '0'}`);
   return session;
@@ -1874,6 +2069,7 @@ function failAgentRelaySession(session, logger, error, label = 'async') {
   const message = error?.message || String(error || 'Unknown relay error');
   const requestId = session.requestId || '-';
   session.hadError = true;
+  session.activeUpstreamResponse = null;
   logger?.error?.(`agent local relay ${label} failed requestId=${requestId}: ${error?.stack || message}`);
   try {
     const userVisible = `Relay failed: ${message}`;
@@ -2425,6 +2621,104 @@ function buildPlanStateFromExecution(session = {}, execution = {}) {
     : null;
 }
 
+function clonePendingInteractionSnapshot(pendingInteraction = null) {
+  if (!pendingInteraction || typeof pendingInteraction !== 'object') return null;
+  return {
+    ...pendingInteraction,
+    arguments: pendingInteraction.arguments && typeof pendingInteraction.arguments === 'object'
+      ? { ...pendingInteraction.arguments }
+      : {},
+    execution: pendingInteraction.execution && typeof pendingInteraction.execution === 'object'
+      ? { ...pendingInteraction.execution }
+      : pendingInteraction.execution || null,
+    resumeState: pendingInteraction.resumeState && typeof pendingInteraction.resumeState === 'object'
+      ? {
+          ...pendingInteraction.resumeState,
+          upstreamMessages: Array.isArray(pendingInteraction.resumeState.upstreamMessages)
+            ? pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }))
+            : [],
+        }
+      : null,
+  };
+}
+
+function rememberSessionPlanState(session = {}, planState = null) {
+  if (!session) return null;
+  session.latestPlanState = planState && typeof planState === 'object'
+    ? {
+        ...planState,
+        todos: Array.isArray(planState.todos) ? planState.todos.map((todo) => ({ ...todo })) : [],
+      }
+    : null;
+  return session.latestPlanState;
+}
+
+function getLatestSessionPlanState(session = {}) {
+  return session?.latestPlanState && typeof session.latestPlanState === 'object'
+    ? session.latestPlanState
+    : null;
+}
+
+function buildFallbackPendingPlanExecution(session = {}) {
+  const userText = String(session?.lastUserMessageCapture?.userText || '').trim();
+  if (!userText) return null;
+  const planState = getLatestSessionPlanState(session);
+  const existingResumeMessages = Array.isArray(session?.lastPlanResumeMessages)
+    ? session.lastPlanResumeMessages.map((message) => ({ ...message }))
+    : [];
+  return {
+    requestId: String(session.requestId || '').trim(),
+    queryId: 0,
+    kind: 'create_plan',
+    toolName: 'CreatePlan',
+    toolCallId: '',
+    arguments: {
+      plan: String(planState?.plan_text || planState?.plan || '').trim(),
+      todos: Array.isArray(planState?.todos) ? planState.todos : [],
+      planUri: String(planState?.plan_uri || '').trim(),
+    },
+    resumeState: {
+      userText,
+      upstreamMessages: existingResumeMessages.length
+        ? existingResumeMessages
+        : buildLocalRelayMessages(userText, session),
+      capturedAt: new Date().toISOString(),
+      stableConversationId: getSessionStableConversationId(session),
+      requestId: String(session.requestId || '').trim(),
+    },
+  };
+}
+
+function buildSyntheticPlanExecutionResponse(session = {}, conversationAction = {}) {
+  const latestPlanState = getLatestSessionPlanState(session) || {};
+  const actionPlanText = String(
+    conversationAction?.planFileContent
+    || conversationAction?.plan
+    || latestPlanState.plan_text
+    || ''
+  ).trim();
+  const actionPlanUri = String(
+    conversationAction?.planFileUri
+    || latestPlanState.plan_uri
+    || ''
+  ).trim();
+  return {
+    id: 0,
+    kind: 'execute_plan_action',
+    createPlan: {
+      kind: 'success',
+      planUri: actionPlanUri,
+      plan: actionPlanText,
+      error: '',
+    },
+    executePlan: {
+      executionMode: String(conversationAction?.executionMode || '').trim(),
+      planUri: actionPlanUri,
+      plan: actionPlanText,
+    },
+  };
+}
+
 function writeAgentTextFrame(session, text, { tokenDelta = true, recordHistory = false } = {}) {
   const value = String(text || '');
   if (!value || !session?.active) return;
@@ -2891,6 +3185,7 @@ function getToolCallSignature(toolCall, session) {
   if (name === 'shell') return `shell:${normalizeWorkspacePath(args.cwd || args.working_directory || '')}:${String(args.command || '')}`;
   if (name === 'readlints') return `readlints:${(Array.isArray(args.paths) ? args.paths : [args.path].filter(Boolean)).map(normalizeWorkspacePath).join('|')}`;
   if (name === 'todowrite') return '';
+  if (name === 'websearch') return `websearch:${normalizeSearchTermForSignature(args.search_term || args.searchTerm || args.query || '')}`;
   return `${name}:${JSON.stringify(args)}`;
 }
 
@@ -3249,7 +3544,10 @@ function buildPendingInteractionResumeMessages(session = {}, pendingInteraction 
     ...baseMessages,
     resumeMessage || {
       role: 'user',
-      content: buildInteractionContinuationPrompt(pendingInteraction, interactionResponse),
+      content: [
+        buildInteractionContinuationPrompt(pendingInteraction, interactionResponse),
+        'Do not restart or restate the original task. Continue strictly from the preserved turn context, prior assistant output, and prior tool results above.',
+      ].join('\n'),
     },
   ];
 }
@@ -3273,6 +3571,7 @@ function updatePendingInteractionResumeState(session = {}, executions = [], upst
     { role: 'assistant', content: String(streamedText || '').trim() || `Called ${waitingExecutions.length} tool(s).` },
     ...(Array.isArray(toolResultMessages) ? toolResultMessages.map((message) => ({ ...message })) : []),
   ];
+  session.lastPlanResumeMessages = resumeMessages.map((message) => ({ ...message }));
   let updated = 0;
   for (const executionEntry of waitingExecutions) {
     const pendingInteraction = findPendingInteractionQueryByExecution(session, executionEntry);
@@ -4409,6 +4708,11 @@ function buildCompletedInteractionStatePatchByMode(session = {}, interactionResp
   if (typeof handler.buildCompletedInteractionStatePatch === 'function') {
     return handler.buildCompletedInteractionStatePatch(session, interactionResponse, pendingInteraction, helpers);
   }
+  if (session?.waitingForInteraction) {
+    return {
+      current_loop_status: 'waiting_for_interaction',
+    };
+  }
   return {
     current_loop_status: 'completed',
     waiting_for_interaction: null,
@@ -4571,26 +4875,351 @@ function buildWebSearchReferences(searchTerm, results = []) {
   ];
 }
 
-async function executeWebSearchTool(args = {}) {
+function buildWebSearchResults(searchTerm, results = []) {
+  return results.map((item, index) => ({
+    id: String(index + 1),
+    title: String(item?.title || '').trim(),
+    url: String(item?.url || '').trim(),
+    snippet: String(item?.snippet || '').trim(),
+    query: String(searchTerm || '').trim(),
+    rank: index + 1,
+  })).filter((item) => item.title && item.url);
+}
+
+function tokenizeSearchText(text = '') {
+  return Array.from(new Set(
+    String(text || '')
+      .toLowerCase()
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/[^a-z0-9\u3400-\u9fff.+#-]+/gi, ' ')
+      .split(/\s+/)
+      .map((item) => item.trim())
+      .filter((item) => item.length >= 2 || /[\u3400-\u9fff]/.test(item))
+      .filter((item) => !WEB_SEARCH_STOPWORDS.has(item)),
+  ));
+}
+
+function isWeakWebSearchToken(token = '') {
+  const normalized = String(token || '').trim().toLowerCase();
+  if (!normalized) return true;
+  return WEB_SEARCH_WEAK_TOKENS.has(normalized);
+}
+
+function isNewsLikeResult(item = {}) {
+  const title = String(item?.title || '').toLowerCase();
+  const url = String(item?.url || '').toLowerCase();
+  const snippet = String(item?.snippet || '').toLowerCase();
+  const haystack = `${title} ${url} ${snippet}`;
+  return Array.from(WEB_SEARCH_NEWS_INTENT_TOKENS).some((token) => haystack.includes(token));
+}
+
+function getWebSearchQueryProfile(searchTerm = '') {
+  const queryTokens = tokenizeSearchText(searchTerm);
+  const strongTokens = queryTokens.filter((token) => !isWeakWebSearchToken(token));
+  return {
+    queryTokens,
+    strongTokens,
+    hasNewsIntent: queryTokens.some((token) => WEB_SEARCH_NEWS_INTENT_TOKENS.has(token)),
+  };
+}
+
+function scoreWebSearchResult(searchTerm = '', item = {}) {
+  const { queryTokens, strongTokens, hasNewsIntent } = getWebSearchQueryProfile(searchTerm);
+  if (!queryTokens.length) {
+    return {
+      score: 0,
+      strongMatches: 0,
+      weakMatches: 0,
+      titleMatches: 0,
+      snippetMatches: 0,
+      urlMatches: 0,
+      rejectedReason: 'empty_query',
+      newsLike: false,
+    };
+  }
+  const title = String(item?.title || '').toLowerCase();
+  const url = String(item?.url || '').toLowerCase();
+  const snippet = String(item?.snippet || '').toLowerCase();
+  const newsLike = isNewsLikeResult(item);
+  let score = 0;
+  let strongMatches = 0;
+  let weakMatches = 0;
+  let titleMatches = 0;
+  let snippetMatches = 0;
+  let urlMatches = 0;
+  for (const token of queryTokens) {
+    const weak = isWeakWebSearchToken(token);
+    let matched = false;
+    if (title.includes(token)) {
+      score += weak ? 1 : (/[\u3400-\u9fff]/.test(token) || token.length >= 5 ? 5 : 3);
+      titleMatches += 1;
+      matched = true;
+    }
+    if (url.includes(token)) {
+      score += weak ? 0.5 : 1.5;
+      urlMatches += 1;
+      matched = true;
+    }
+    if (snippet.includes(token)) {
+      score += weak ? 0.5 : (/[\u3400-\u9fff]/.test(token) || token.length >= 5 ? 2.5 : 1.5);
+      snippetMatches += 1;
+      matched = true;
+    }
+    if (matched) {
+      if (weak) weakMatches += 1;
+      else strongMatches += 1;
+    }
+  }
+  let rejectedReason = '';
+  if (strongTokens.length > 0 && strongMatches === 0) rejectedReason = 'no_strong_match';
+  if (!rejectedReason && strongTokens.length >= 2 && strongMatches < 2) rejectedReason = 'not_enough_strong_matches';
+  if (!rejectedReason && strongTokens.length === 1 && titleMatches === 0 && snippetMatches === 0) rejectedReason = 'strong_match_not_visible';
+  if (!rejectedReason && newsLike && !hasNewsIntent) rejectedReason = 'news_like_without_news_intent';
+  if (!rejectedReason && score < 4) rejectedReason = 'score_too_low';
+  if (!rejectedReason && titleMatches === 0 && snippetMatches === 0) rejectedReason = 'only_url_match';
+  return {
+    score,
+    strongMatches,
+    weakMatches,
+    titleMatches,
+    snippetMatches,
+    urlMatches,
+    rejectedReason,
+    newsLike,
+  };
+}
+
+function filterRelevantWebSearchResults(searchTerm = '', results = []) {
+  const scored = (Array.isArray(results) ? results : [])
+    .map((item) => {
+      const scoring = scoreWebSearchResult(searchTerm, item);
+      return {
+        ...item,
+        relevanceScore: Number(scoring.score) || 0,
+        relevanceStrongMatches: Number(scoring.strongMatches) || 0,
+        relevanceWeakMatches: Number(scoring.weakMatches) || 0,
+        relevanceTitleMatches: Number(scoring.titleMatches) || 0,
+        relevanceSnippetMatches: Number(scoring.snippetMatches) || 0,
+        relevanceUrlMatches: Number(scoring.urlMatches) || 0,
+        relevanceRejectedReason: scoring.rejectedReason || '',
+        newsLikeResult: Boolean(scoring.newsLike),
+      };
+    });
+  const accepted = scored
+    .filter((item) => !item.relevanceRejectedReason)
+    .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    .slice(0, 8);
+  const rejected = scored
+    .filter((item) => item.relevanceRejectedReason)
+    .sort((a, b) => b.relevanceScore - a.relevanceScore);
+  return {
+    accepted,
+    rejected,
+    bestRejectedReason: rejected[0]?.relevanceRejectedReason || '',
+  };
+}
+
+function summarizeRejectedWebSearchResults(results = []) {
+  return (Array.isArray(results) ? results : [])
+    .slice(0, 5)
+    .map((item) => {
+      const reason = item?.relevanceRejectedReason || 'unknown';
+      const title = String(item?.title || '').trim() || String(item?.url || '').trim() || 'Untitled result';
+      return `${title} [${reason}]`;
+    })
+    .join('; ');
+}
+
+function rememberWebSearchAttempt(session, details = {}) {
+  if (!session) return;
+  const attempts = Array.isArray(session.webSearchAttempts) ? session.webSearchAttempts : [];
+  attempts.push({
+    signature: String(details.signature || '').trim(),
+    normalizedSignature: String(details.normalizedSignature || '').trim(),
+    searchTerm: String(details.searchTerm || '').trim(),
+    provider: String(details.provider || '').trim(),
+    ok: Boolean(details.ok),
+    rejectedReason: String(details.rejectedReason || '').trim(),
+    createdAt: new Date().toISOString(),
+  });
+  session.webSearchAttempts = attempts.slice(-MAX_TRACKED_WEB_SEARCH_ATTEMPTS);
+}
+
+function countSimilarLowRelevanceWebSearchAttempts(session, normalizedSignature = '') {
+  if (!normalizedSignature) return 0;
+  const attempts = Array.isArray(session?.webSearchAttempts) ? session.webSearchAttempts : [];
+  return attempts.filter((item) => item?.normalizedSignature === normalizedSignature && item?.ok === false).length;
+}
+
+function buildLowRelevanceWebSearchResultText(searchTerm = '', options = {}) {
+  const provider = String(options.provider || '').trim();
+  const rejectedSummary = String(options.rejectedSummary || '').trim();
+  const attemptCount = Number(options.attemptCount) || 0;
+  const extra = [];
+  if (provider) extra.push(`Provider: ${provider}`);
+  if (attemptCount > 1) extra.push(`Similar failed attempts this turn: ${attemptCount}`);
+  if (rejectedSummary) extra.push(`Rejected results: ${rejectedSummary}`);
+  return [
+    `Web search returned only low-relevance results for "${searchTerm}".`,
+    'Do not broaden or repeat the same search blindly.',
+    'Use a more specific query or switch strategies.',
+    ...extra,
+  ].join(' ');
+}
+
+function countWebSearchExecutionsThisTurn(session = {}) {
+  const attempts = Array.isArray(session?.webSearchAttempts) ? session.webSearchAttempts : [];
+  return attempts.length;
+}
+
+function normalizeSearchTermForSignature(value = '') {
+  return tokenizeSearchText(value).sort().join('|');
+}
+
+function parseBingRssResults(xml = '') {
+  const results = [];
+  const items = String(xml || '').match(/<item>[\s\S]*?<\/item>/gi) || [];
+  for (const itemXml of items.slice(0, 8)) {
+    const title = decodeHtmlEntities((itemXml.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || '')).replace(/\s+/g, ' ').trim();
+    const url = decodeHtmlEntities((itemXml.match(/<link>([\s\S]*?)<\/link>/i)?.[1] || '')).replace(/\s+/g, ' ').trim();
+    const snippet = decodeHtmlEntities((itemXml.match(/<description>([\s\S]*?)<\/description>/i)?.[1] || '')).replace(/\s+/g, ' ').trim();
+    if (title && /^https?:\/\//i.test(url) && !results.some((entry) => entry.url === url)) {
+      results.push({ title, url, snippet });
+    }
+  }
+  return results;
+}
+
+async function executeWebSearchTool(args = {}, session = null) {
   const searchTerm = String(args.search_term || args.searchTerm || args.query || '').trim();
-  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(searchTerm)}`;
-  const fetched = await fetchPublicText(url, { timeoutMs: 25000, accept: 'text/html,*/*;q=0.8' });
-  if (!fetched.ok) {
+  const normalizedSignature = normalizeSearchTermForSignature(searchTerm);
+  const totalTurnAttempts = countWebSearchExecutionsThisTurn(session);
+  if (totalTurnAttempts >= MAX_WEB_SEARCH_CALLS_PER_TURN) {
+    return {
+      ok: false,
+      tool: 'WebSearch',
+      args: { ...args, search_term: searchTerm, query: searchTerm, blockedByTurnLimit: true },
+      resultText: `Web search skipped for "${searchTerm}" because this turn already used WebSearch ${totalTurnAttempts} time(s). Stop repeating searches and continue with the best available context.`,
+      results: [],
+      references: [{
+        title: 'Web search skipped',
+        chunk: `Search term: ${searchTerm}\nReason: Per-turn WebSearch limit reached (${totalTurnAttempts}/${MAX_WEB_SEARCH_CALLS_PER_TURN}).`,
+      }],
+      durationMs: 0,
+    };
+  }
+  const previousLowRelevanceAttempts = countSimilarLowRelevanceWebSearchAttempts(session, normalizedSignature);
+  if (previousLowRelevanceAttempts >= MAX_SIMILAR_LOW_RELEVANCE_WEB_SEARCHES) {
+    return {
+      ok: false,
+      tool: 'WebSearch',
+      args: { ...args, search_term: searchTerm, query: searchTerm, blockedByLoopBreaker: true },
+      resultText: buildLowRelevanceWebSearchResultText(searchTerm, {
+        provider: 'loop_breaker',
+        attemptCount: previousLowRelevanceAttempts,
+      }),
+      results: [],
+      references: [{
+        title: 'Web search blocked',
+        chunk: `Search term: ${searchTerm}\nReason: Similar low-relevance searches were already attempted ${previousLowRelevanceAttempts} time(s) in this turn.`,
+      }],
+      durationMs: 0,
+    };
+  }
+  const bingUrl = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(searchTerm)}`;
+  const bingFetched = await fetchPublicText(bingUrl, {
+    timeoutMs: WEB_SEARCH_FETCH_TIMEOUT_MS,
+    accept: 'application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8',
+  });
+  if (bingFetched?.ok) {
+    const bingFiltered = filterRelevantWebSearchResults(
+      searchTerm,
+      buildWebSearchResults(searchTerm, parseBingRssResults(bingFetched.text)),
+    );
+    const bingResults = bingFiltered.accepted;
+    const bingReferences = buildWebSearchReferences(searchTerm, bingResults);
+    const bingRejectedSummary = summarizeRejectedWebSearchResults(bingFiltered.rejected);
+    const bingAttemptCount = previousLowRelevanceAttempts + (bingResults.length > 0 ? 0 : 1);
+    const bingResultText = bingResults.length > 0
+      ? (bingReferences[0]?.chunk || `No useful web results were found for "${searchTerm}".`)
+      : buildLowRelevanceWebSearchResultText(searchTerm, {
+        provider: 'bing_rss',
+        rejectedSummary: bingRejectedSummary,
+        attemptCount: bingAttemptCount,
+      });
+    rememberWebSearchAttempt(session, {
+      signature: `websearch:${normalizedSignature}`,
+      normalizedSignature,
+      searchTerm,
+      provider: 'bing_rss',
+      ok: bingResults.length > 0,
+      rejectedReason: bingFiltered.bestRejectedReason || 'no_relevant_results',
+    });
+    return {
+      ok: bingResults.length > 0,
+      tool: 'WebSearch',
+      args: { ...args, search_term: searchTerm, query: searchTerm, provider: 'bing_rss' },
+      resultText: bingResultText,
+      results: bingResults,
+      references: bingReferences,
+      durationMs: 0,
+    };
+  }
+  const searchUrls = [
+    `https://duckduckgo.com/html/?q=${encodeURIComponent(searchTerm)}`,
+    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchTerm)}`,
+  ];
+  let fetched = null;
+  for (const url of searchUrls) {
+    // eslint-disable-next-line no-await-in-loop
+    const response = await fetchPublicText(url, { timeoutMs: WEB_SEARCH_FETCH_TIMEOUT_MS, accept: 'text/html,*/*;q=0.8' });
+    fetched = response;
+    if (response?.ok) break;
+  }
+  if (!fetched?.ok) {
     return {
       ok: false,
       tool: 'WebSearch',
       args: { ...args, search_term: searchTerm },
-      resultText: `Web search failed: ${fetched.error || `HTTP ${fetched.status}`}`,
+      resultText: `Web search failed: ${bingFetched?.error || fetched?.error || `HTTP ${bingFetched?.status || fetched?.status || 0}`}`,
+      results: [],
+      references: [{
+        title: 'Web search error',
+        chunk: `Search term: ${searchTerm}\nStatus: ${bingFetched?.status || fetched?.status || 0}\nError: ${bingFetched?.error || fetched?.error || 'Unknown error'}`,
+      }],
       durationMs: 0,
     };
   }
   const results = parseDuckDuckGoResults(fetched.text);
-  const references = buildWebSearchReferences(searchTerm, results);
+  const filteredResults = filterRelevantWebSearchResults(
+    searchTerm,
+    buildWebSearchResults(searchTerm, results),
+  );
+  const normalizedResults = filteredResults.accepted;
+  const references = buildWebSearchReferences(searchTerm, normalizedResults);
+  const rejectedSummary = summarizeRejectedWebSearchResults(filteredResults.rejected);
+  const attemptCount = previousLowRelevanceAttempts + (normalizedResults.length > 0 ? 0 : 1);
+  const resultText = normalizedResults.length > 0
+    ? (references[0]?.chunk || `No useful web results were found for "${searchTerm}".`)
+    : buildLowRelevanceWebSearchResultText(searchTerm, {
+      provider: 'duckduckgo_html',
+      rejectedSummary,
+      attemptCount,
+    });
+  rememberWebSearchAttempt(session, {
+    signature: `websearch:${normalizedSignature}`,
+    normalizedSignature,
+    searchTerm,
+    provider: 'duckduckgo_html',
+    ok: normalizedResults.length > 0,
+    rejectedReason: filteredResults.bestRejectedReason || 'no_relevant_results',
+  });
   return {
-    ok: true,
+    ok: normalizedResults.length > 0,
     tool: 'WebSearch',
-    args: { ...args, search_term: searchTerm },
-    resultText: references[0]?.chunk || '',
+    args: { ...args, search_term: searchTerm, query: searchTerm },
+    resultText,
+    results: normalizedResults,
     references,
     durationMs: 0,
   };
@@ -4838,7 +5467,7 @@ async function executeRelayTool(toolCall, session, logger) {
       };
     }
     if (lower === 'websearch' || lower === 'web_search') {
-      const execution = await executeWebSearchTool(args);
+      const execution = await executeWebSearchTool(args, session);
       return {
         ...execution,
         durationMs: Date.now() - startedAt,
@@ -4984,6 +5613,8 @@ function toToolResultMessage(toolCall, execution) {
         ok: execution.ok,
         args: execution.args,
         output: execution.resultText,
+        results: Array.isArray(execution.results) ? execution.results : undefined,
+        references: Array.isArray(execution.references) ? execution.references : undefined,
         durationMs: execution.durationMs,
       }, null, 2),
     ].join('\n'),
@@ -5282,6 +5913,7 @@ function buildPostToolRecoveryMessage(upstreamError, recoveryCount = 0) {
       `The previous upstream stream stalled before producing a final answer or another tool call (${String(upstreamError || 'stream stalled')}).`,
       `Recovery attempt ${Number(recoveryCount) + 1}/${MAX_POST_TOOL_STREAM_RECOVERIES}.`,
       'Continue from the tool results above. If another tool is required, call it; otherwise provide the final answer. Do not restart the task from scratch.',
+      'Do not restate the original user request or reopen the task as a new conversation. Continue from the exact same turn state only.',
     ].join('\n'),
   };
 }
@@ -5301,8 +5933,10 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
   session.executedToolResultsBySignature = session.executedToolResultsBySignature || new Map();
   session.toolResultSummaries = session.toolResultSummaries || [];
   const maxToolCallsPerRound = getMaxLocalToolCallsPerRound(session?.config || {});
+  let webSearchCallsThisRound = 0;
   for (const rawToolCall of toolCalls.slice(0, maxToolCallsPerRound)) {
     const toolCall = normalizeToolCallPathsForWorkspace(rawToolCall, session);
+    const lowerToolName = String(toolCall?.name || '').trim().toLowerCase();
     const signature = getToolCallSignature(toolCall, session);
     if (signature && session.executedToolSignatures.has(signature)) {
       const previousExecution = session.executedToolResultsBySignature.get(signature);
@@ -5371,6 +6005,24 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
     const stepId = (session.nextStepId = (Number(session.nextStepId) || 0) + 1);
     const stepStartedAt = Date.now();
     let execution = interceptToolExecutionByMode(session, toolCall, { startedAt: stepStartedAt });
+    if (!execution && (lowerToolName === 'websearch' || lowerToolName === 'web_search')) {
+      if (webSearchCallsThisRound >= MAX_WEB_SEARCH_CALLS_PER_ROUND) {
+        execution = {
+          ok: false,
+          tool: 'WebSearch',
+          args: toolCall.arguments || {},
+          resultText: `Skipped extra WebSearch for this round. Only ${MAX_WEB_SEARCH_CALLS_PER_ROUND} WebSearch call(s) are allowed per tool round to keep the UI responsive.`,
+          durationMs: 0,
+          skippedByWebSearchRoundBudget: true,
+        };
+      } else {
+        webSearchCallsThisRound += 1;
+        if (!session.webSearchProgressEmitted && !String(session.agentTextFrameText || '').trim()) {
+          writeAgentTextFrame(session, '正在搜索网页资料，请稍等...\n\n', { tokenDelta: true });
+          session.webSearchProgressEmitted = true;
+        }
+      }
+    }
     if (emitToolInteraction) {
       if (emitStepFrames) writeAgentFrame(session, buildAgentStepStartedFrame(stepId));
       const streamedEditState = editLikeTool ? session.upstreamToolArgumentStreams?.get(toolCallId) : null;
@@ -5509,6 +6161,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       if (String(toolCall.name || '').trim().toLowerCase() === 'createplan' && execution?.ok) {
         session.planTurnHandoff = 'create_plan';
         const planState = buildPlanStateFromExecution(session, execution);
+        rememberSessionPlanState(session, planState);
         if (planState) {
           updateSessionHistoryState(session, {
             current_loop_status: 'waiting_for_interaction',
@@ -5644,37 +6297,35 @@ async function continueAgentStreamLoop(session, options = {}) {
           streamed.text || '',
           userText,
         );
-      if (updatedInteractions > 0) {
-        session.waitingForInteraction = true;
-        session.waitingInteractionSince = Date.now();
-        session.unfinishedWorkAtEnd = false;
-        const handler = getModeHandlerForSession(session);
-        const helpers = buildModeRuntimeHelpers(session);
-        const planState = String(toolCall.name || '').trim().toLowerCase() === 'createplan'
-          ? buildPlanStateFromExecution(session, execution)
-          : (session.suppressedPlanText ? {
-            plan: String(session.suppressedPlanText || '').trim(),
-            plan_text: String(session.suppressedPlanText || '').trim(),
-            plan_uri: String(execution?.planPath || '').trim(),
-            todos: Array.isArray(session.todos) ? session.todos : [],
-          } : null);
-        const statePatch = typeof handler.buildWaitingForInteractionStatePatch === 'function'
-          ? handler.buildWaitingForInteractionStatePatch(session, {
-              handoff: session.planTurnHandoff,
-              pendingCount: updatedInteractions,
-              since: new Date(session.waitingInteractionSince).toISOString(),
-              plan: planState,
-            }, helpers)
-          : {
-              current_loop_status: 'waiting_for_interaction',
-              waiting_for_interaction: {
-                handoff: String(session.planTurnHandoff || '').trim(),
-                pending_count: Number(updatedInteractions) || 0,
+        if (updatedInteractions > 0) {
+          session.waitingForInteraction = true;
+          session.waitingInteractionSince = Date.now();
+          session.unfinishedWorkAtEnd = false;
+          const handler = getModeHandlerForSession(session);
+          const helpers = buildModeRuntimeHelpers(session);
+          const createPlanEntry = executions.find((entry) => String(entry?.toolCall?.name || '').trim().toLowerCase() === 'createplan');
+          const createPlanExecution = createPlanEntry?.execution || null;
+          const planState = createPlanExecution
+            ? buildPlanStateFromExecution(session, createPlanExecution)
+            : null;
+          if (planState) rememberSessionPlanState(session, planState);
+          const statePatch = typeof handler.buildWaitingForInteractionStatePatch === 'function'
+            ? handler.buildWaitingForInteractionStatePatch(session, {
+                handoff: session.planTurnHandoff,
+                pendingCount: updatedInteractions,
                 since: new Date(session.waitingInteractionSince).toISOString(),
-              },
-              plan: planState,
-            };
-        updateSessionHistoryState(session, statePatch);
+                plan: planState,
+              }, helpers)
+            : {
+                current_loop_status: 'waiting_for_interaction',
+                waiting_for_interaction: {
+                  handoff: String(session.planTurnHandoff || '').trim(),
+                  pending_count: Number(updatedInteractions) || 0,
+                  since: new Date(session.waitingInteractionSince).toISOString(),
+                },
+                plan: planState,
+              };
+          updateSessionHistoryState(session, statePatch);
           logger?.info?.(
             `agent local relay waiting for interaction_response requestId=${requestId} step=${toolStep} handoff=${session.planTurnHandoff} pendingInteractions=${updatedInteractions}`,
           );
@@ -6185,12 +6836,66 @@ async function continueAgentStreamLoop(session, options = {}) {
 async function resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction = null) {
   if (!session?.active || session.aborted || session.relaying) return;
   session.relaying = true;
+  session.webSearchProgressEmitted = false;
   try {
   const requestId = session.requestId || '-';
   const userText = String(pendingInteraction?.resumeState?.userText || session.lastUserMessageCapture?.userText || '').trim();
   if (!userText) {
     logger?.warn?.(`agent local relay interaction resume skipped requestId=${requestId} reason=missing_user_text`);
     return;
+  }
+  if (String(interactionResponse?.kind || '').trim() === 'create_plan_request_response') {
+    const planText = String(
+      pendingInteraction?.arguments?.plan
+      || pendingInteraction?.resumeState?.plan?.plan
+      || getLatestSessionPlanState(session)?.plan
+      || session.suppressedPlanText
+      || '',
+    ).trim();
+    const planUri = String(interactionResponse?.createPlan?.planUri || '').trim();
+    if (planText || planUri) {
+      rememberSessionPlanState(session, {
+        plan: planText || planUri,
+        plan_text: planText,
+        plan_uri: planUri,
+        todos: Array.isArray(session.todos) ? session.todos : [],
+      });
+      session.waitingForInteraction = true;
+      session.planTurnHandoff = 'create_plan';
+      session.unfinishedWorkAtEnd = false;
+      updateSessionHistoryState(session, {
+        current_loop_status: 'waiting_for_interaction',
+        waiting_for_interaction: {
+          handoff: 'create_plan',
+          pending_count: 1,
+          since: new Date().toISOString(),
+        },
+        plan: getLatestSessionPlanState(session),
+      });
+      logger?.info?.(
+        `agent local relay create_plan acknowledged requestId=${requestId} planUri=${JSON.stringify(planUri)} waiting_for_build=1`,
+      );
+      return;
+    }
+  }
+  if (String(interactionResponse?.kind || '').trim() === 'execute_plan_action') {
+    const planState = getLatestSessionPlanState(session) || {};
+    session.waitingForInteraction = false;
+    session.planTurnHandoff = '';
+    session.deferredInteractionResponse = null;
+    session.relaying = false;
+    updateSessionHistoryState(session, {
+      current_loop_status: 'running',
+      waiting_for_interaction: null,
+      plan: planState.plan || planState.plan_uri
+        ? {
+          plan: String(planState.plan || planState.plan_uri || '').trim(),
+          plan_text: String(planState.plan_text || '').trim(),
+          plan_uri: String(planState.plan_uri || '').trim(),
+          todos: Array.isArray(planState.todos) ? planState.todos : [],
+        }
+        : null,
+    });
   }
   const configuredModel = resolveRequestedUpstreamModel(config, {
     requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
@@ -6231,6 +6936,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
         localProxyPort: config.port,
       }, { phase: 'interaction_resume', agentMode }),
     ));
+    session.activeUpstreamResponse = upstream;
   } catch (error) {
     if (session.aborted) return;
     const summarized = summarizeFetchError(error);
@@ -6258,6 +6964,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
   }
 
   if (!upstream.ok) {
+    session.activeUpstreamResponse = null;
     if (session.aborted) return;
     const errorText = await upstream.text().catch(() => '');
     const summarized = summarizeUpstreamFailure(upstream.status, errorText);
@@ -6295,6 +7002,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
     reasoningOnlyMaxMs,
     filterInlineThinking,
   });
+  session.activeUpstreamResponse = null;
   recordUpstreamUsagePhase(session, config, {
     phase: 'interaction_resume',
     endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
@@ -6341,6 +7049,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
     reasoningOnlyMaxMs,
   });
   } finally {
+    if (session) session.activeUpstreamResponse = null;
     if (session) session.relaying = false;
     triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
   }
@@ -6349,6 +7058,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
 async function relayAgentUserMessage(session, userText, config, logger, stats) {
   if (!session?.active || session.aborted || session.relaying) return;
   session.relaying = true;
+  session.webSearchProgressEmitted = false;
   try {
     if (!session.agentHistory) {
       const { conversation, turnSeq } = beginAgentHistoryTurn(
@@ -6434,6 +7144,7 @@ ${String(userText || '')}
         localProxyPort: config.port,
       }, { phase: 'initial', agentMode }),
     );
+    session.activeUpstreamResponse = upstream;
 
     const streamed = await streamAgentUpstreamResponse(upstream, session, {
       collectTools: true,
@@ -6445,6 +7156,7 @@ ${String(userText || '')}
       reasoningOnlyMaxMs,
       filterInlineThinking,
     });
+    session.activeUpstreamResponse = null;
 
     recordUpstreamUsagePhase(session, config, {
       phase: 'initial',
@@ -6478,6 +7190,7 @@ ${String(userText || '')}
       reasoningOnlyMaxMs,
     });
   } finally {
+    if (session) session.activeUpstreamResponse = null;
     if (session) session.relaying = false;
     triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
   }
@@ -6632,6 +7345,11 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
     const existingWaitingSession = requestId ? agentSessions.get(requestId) : null;
     if (existingWaitingSession?.waitingForInteraction && !existingWaitingSession.aborted) {
       const session = reattachWaitingInteractionSession(existingWaitingSession, req, res, rawBody, logger);
+      if (pendingCapture) {
+        session.lastUserMessageCapture = pendingCapture;
+        session.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || session.workspaceRoot || '');
+        pendingAgentMessages.delete(requestId);
+      }
       res.on('close', () => {
         if (session?.completed) return;
         abortAgentSession(session, logger, 'runsse_closed');
@@ -6644,12 +7362,13 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
     const crossRequestWaitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, requestId);
     if (crossRequestWaitingSession && !crossRequestWaitingSession.aborted) {
       if (requestId && requestId !== crossRequestWaitingSession.requestId) {
-        agentSessions.set(requestId, crossRequestWaitingSession);
+        rebindWaitingSessionRequestId(crossRequestWaitingSession, requestId, logger);
       }
       const session = reattachWaitingInteractionSession(crossRequestWaitingSession, req, res, rawBody, logger);
       if (pendingCapture) {
         session.lastUserMessageCapture = pendingCapture;
         session.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || session.workspaceRoot || '');
+        pendingAgentMessages.delete(requestId);
       }
       res.on('close', () => {
         if (session?.completed) return;
@@ -6812,6 +7531,115 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       return;
     }
 
+    if (decoded.kind === 'conversation_action' && decoded.requestId) {
+      const action = decoded.debug?.agentClientMessage?.conversationAction || {};
+      let session = agentSessions.get(decoded.requestId);
+      const stableConversationId = extractStableConversationId(decoded.debug || null)
+        || String(decoded.debug?.agentClientMessage?.runRequest?.stableConversationId || '').trim();
+      if (!session && stableConversationId) {
+        session = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      }
+      const actionKind = String(action.kind || '').trim();
+      const actionText = [
+        userTextPreview,
+        decoded.debug?.rawTextPreview || '',
+        decoded.debug?.dataTextPreview || '',
+        action.cancelReason || '',
+        action.planFileContent || '',
+        action.plan || '',
+      ].join('\n');
+      const isCancel = actionKind === 'cancel_action'
+        || /abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(actionText);
+      const isExecutePlan = actionKind === 'execute_plan_action';
+      const isStartPlan = actionKind === 'start_plan_action';
+      logger.info(
+        `agent local relay conversation_action requestId=${decoded.requestId} sessionActive=${session?.active ? '1' : '0'} sessionAborted=${session?.aborted ? '1' : '0'} actionKind=${actionKind || '-'} isCancel=${isCancel ? '1' : '0'} isExecutePlan=${isExecutePlan ? '1' : '0'} isStartPlan=${isStartPlan ? '1' : '0'} action=${JSON.stringify(action).slice(0, 1200)}`,
+      );
+      if (!session) {
+        ack();
+        return;
+      }
+      if (isCancel) {
+        abortAgentSession(session, logger, 'conversation_action_cancel');
+        logger.info(`agent local relay conversation cancel requestId=${decoded.requestId}`);
+        ack();
+        return;
+      }
+      if (isStartPlan) {
+        const planState = {
+          plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
+          plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+          plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+          todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+        };
+        rememberSessionPlanState(session, planState);
+        session.waitingForInteraction = true;
+        session.planTurnHandoff = 'create_plan';
+        updateSessionHistoryState(session, {
+          current_loop_status: 'waiting_for_interaction',
+          waiting_for_interaction: {
+            handoff: 'create_plan',
+            pending_count: 1,
+            since: new Date().toISOString(),
+          },
+          plan: planState,
+        });
+        ack();
+        return;
+      }
+      if (isExecutePlan) {
+        const planState = {
+          plan: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan || '').trim(),
+          plan_text: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+          plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+          todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+        };
+        rememberSessionPlanState(session, planState);
+        if (String(action.executionMode || '').trim()) {
+          session.agentMode = normalizeAgentModeName(action.executionMode);
+        } else if (getSessionAgentMode(session) === 'AGENT_MODE_PLAN') {
+          session.agentMode = 'AGENT_MODE_AGENT';
+        }
+        session.relaying = false;
+        session.waitingForInteraction = false;
+        session.planTurnHandoff = '';
+        session.deferredInteractionResponse = null;
+        const interactionResponse = buildSyntheticPlanExecutionResponse(session, action);
+        const pendingInteraction = clonePendingInteractionSnapshot(
+          findPendingInteractionQuery(pendingAgentInteractions, decoded.requestId, interactionResponse)
+          || buildFallbackPendingPlanExecution(session),
+        );
+        removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
+        if (pendingInteraction?.resumeState) {
+          const existingResumeMessages = Array.isArray(pendingInteraction.resumeState.upstreamMessages)
+            ? pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }))
+            : [];
+          pendingInteraction.resumeState = {
+            ...pendingInteraction.resumeState,
+            plan: planState,
+            userText: String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || '').trim(),
+            upstreamMessages: existingResumeMessages.length
+              ? existingResumeMessages
+              : buildLocalRelayMessages(String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || ''), session),
+          };
+          session.lastPlanResumeMessages = pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }));
+        }
+        updateSessionHistoryState(session, {
+          current_loop_status: 'running',
+          waiting_for_interaction: null,
+          plan: planState,
+        });
+        ack();
+        if (session.active && !session.aborted) {
+          resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+            .catch((error) => failAgentRelaySession(session, logger, error, 'conversation_action_execute_plan'));
+        }
+        return;
+      }
+      ack();
+      return;
+    }
+
     if (decoded.kind === 'interaction_response' && decoded.requestId) {
       const interactionResponse = decoded.debug?.agentClientMessage?.interactionResponse || null;
       const matchedPendingByStableConversation = findPendingInteractionQuery(pendingAgentInteractions, decoded.requestId, interactionResponse);
@@ -6828,10 +7656,33 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       if (session && pendingInteraction) {
         appendInteractionResponseToHistory(session, pendingInteraction, interactionResponse);
       }
-      if (pendingInteraction?.key) {
-        pendingAgentInteractions.delete(pendingInteraction.key);
+      const shouldKeepWaiting = shouldKeepWaitingForInteractionResponse(pendingInteraction, interactionResponse);
+      const shouldReplayPending = shouldReplayPendingInteractionAfterResponse(pendingInteraction, interactionResponse);
+      if (!shouldKeepWaiting) {
+        removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
       }
       ack();
+      if (shouldKeepWaiting && session?.active && !session.aborted) {
+        session.waitingForInteraction = true;
+        session.waitingInteractionSince = session.waitingInteractionSince || Date.now();
+        session.planTurnHandoff = String(pendingInteraction?.kind || session.planTurnHandoff || '').trim() || session.planTurnHandoff;
+        updateSessionHistoryState(session, {
+          current_loop_status: 'waiting_for_interaction',
+          waiting_for_interaction: {
+            handoff: String(session.planTurnHandoff || pendingInteraction?.kind || '').trim(),
+            pending_count: 1,
+            since: new Date(session.waitingInteractionSince || Date.now()).toISOString(),
+          },
+          plan: getLatestSessionPlanState(session),
+        });
+        if (shouldReplayPending) {
+          replayPendingInteractionQuery(session, pendingInteraction, logger);
+        }
+        logger.info(
+          `agent local relay kept waiting for interaction requestId=${decoded.requestId} pendingKind=${pendingInteraction?.kind || '-'} responseKind=${interactionResponse?.kind || '-'}`
+        );
+        return;
+      }
       if (session?.active && !session.aborted && !session.relaying) {
         resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
           .catch((error) => failAgentRelaySession(session, logger, error, 'interaction_resume'));
@@ -6846,16 +7697,55 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       return;
     }
 
-    if (decoded.kind === 'conversation_action' && decoded.requestId) {
+    if (decoded.kind === 'run_request' && decoded.requestId) {
+      const stableConversationId = extractStableConversationId(decoded.debug || null)
+        || String(decoded.debug?.agentClientMessage?.runRequest?.stableConversationId || '').trim();
       const session = agentSessions.get(decoded.requestId);
-      const actionText = `${userTextPreview}\n${decoded.debug?.rawTextPreview || ''}\n${decoded.debug?.dataTextPreview || ''}`;
-      logger.info(
-        `agent local relay conversation_action requestId=${decoded.requestId} sessionActive=${session?.active ? '1' : '0'} sessionAborted=${session?.aborted ? '1' : '0'} matchedAbort=${/abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(actionText) ? '1' : '0'} actionText=${JSON.stringify(actionText.slice(0, 800))} agentClientMessage=${JSON.stringify(decoded.debug?.agentClientMessage || {})}`,
-      );
-      if (/abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(actionText)) {
-        abortAgentSession(session, logger, 'conversation_action_abort');
-        logger.info(`agent local relay conversation abort requestId=${decoded.requestId}`);
+      const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      if (waitingSession && !waitingSession.relaying && waitingSession !== session) {
+        if (isPlaceholderRunSseSession(session)) {
+          adoptPlaceholderRunSseSession(waitingSession, session, logger);
+        }
+        rebindWaitingSessionRequestId(waitingSession, decoded.requestId, logger);
+        if (decoded.mode) waitingSession.agentMode = normalizeAgentModeName(decoded.mode);
+        if (!waitingSession.lastUserMessageCapture && stableConversationId) {
+          waitingSession.lastUserMessageCapture = {
+            capturedAt: new Date().toISOString(),
+            requestId: decoded.requestId,
+            kind: decoded.kind,
+            mode: normalizeAgentModeName(decoded.mode || waitingSession.agentMode || 'AGENT_MODE_AGENT'),
+            userText: '',
+            userTextPreview: '',
+            selectedImages: [],
+            rawLen: rawBody.length,
+            workspaceRoot: waitingSession.workspaceRoot || '',
+            stableConversationId,
+            debug: decoded.debug || null,
+          };
+        }
+        logger.info(
+          `agent local relay mapped run_request to waiting session requestId=${decoded.requestId} stableConversationId=${JSON.stringify(stableConversationId)} handoff=${waitingSession.planTurnHandoff || waitingSession.modeTurnHandoff || '-'}`
+        );
+        if (maybeHandleRunRequestConversationAction(waitingSession, decoded, config, logger, stats, pendingAgentInteractions, ack)) {
+          return;
+        }
+        ack();
+        return;
       }
+      if (session?.active && session.waitingForInteraction && !session.relaying) {
+        if (decoded.mode) session.agentMode = normalizeAgentModeName(decoded.mode);
+        if (maybeHandleRunRequestConversationAction(session, decoded, config, logger, stats, pendingAgentInteractions, ack)) {
+          return;
+        }
+        logger.info(
+          `agent local relay waiting run_request acked requestId=${decoded.requestId} stableConversationId=${JSON.stringify(stableConversationId)} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'}`
+        );
+        ack();
+        return;
+      }
+      logger.info(
+        `agent local relay ack run_request requestId=${decoded.requestId} stableConversationId=${JSON.stringify(stableConversationId)}`
+      );
       ack();
       return;
     }
@@ -6906,6 +7796,16 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         waitingSession.lastUserMessageCapture = capture;
         waitingSession.workspaceRoot = workspaceRoot || waitingSession.workspaceRoot || '';
         logger.info(`agent local relay mapped new request to waiting session requestId=${decoded.requestId} previousRequestId=${waitingSession.requestId || '-'} stableConversationId=${JSON.stringify(stableConversationId)} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(waitingSession))}`);
+        ack();
+        return;
+      }
+      if (session?.active && session.waitingForInteraction && !session.relaying) {
+        session.agentMode = capture.mode;
+        session.lastUserMessageCapture = capture;
+        session.workspaceRoot = workspaceRoot || session.workspaceRoot || '';
+        logger.info(
+          `agent local relay waiting user_message acked requestId=${decoded.requestId} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))} textLen=${normalizedUserText.length}`,
+        );
         ack();
         return;
       }
