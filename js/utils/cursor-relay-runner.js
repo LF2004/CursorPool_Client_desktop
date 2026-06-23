@@ -118,7 +118,19 @@ const EDIT_STREAM_FLUSH_MS = 250;
 const EDIT_STREAM_FRAME_CHARS = 2048;
 const MAX_EDIT_STREAM_CONTENT_CHARS = 1400;
 const EXEC_CLIENT_WAIT_TIMEOUT_MS = 8000;
+const PLAN_WORKFLOW_PHASES = Object.freeze({
+  IDLE: 'idle',
+  PLANNING: 'planning',
+  AWAITING_ANSWERS: 'awaiting_answers',
+  ANSWERS_COLLECTED: 'answers_collected',
+  EXPLORING: 'exploring',
+  AWAITING_PLAN_PRESENTATION: 'awaiting_plan_presentation',
+  PLAN_PRESENTED: 'plan_presented',
+  EXECUTING: 'executing',
+  COMPLETED: 'completed',
+});
 const RECENT_EXECUTION_WORKSPACE_PATH = path.join(process.env.USERPROFILE || process.cwd(), '.cursorpool', 'relay', 'recent-execution-workspace.json');
+const DEFAULT_RELAY_SCAN_IGNORE = Object.freeze(['node_modules', '.git', 'dist', 'build']);
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
@@ -1415,6 +1427,301 @@ function getSessionStableConversationId(session = {}) {
     || String(session.requestId || '').trim();
 }
 
+function getCurrentConversationActionKind(session = {}) {
+  const actionKind = String(
+    session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.action?.kind
+    || ''
+  ).trim();
+  return actionKind;
+}
+
+function isPlanExecutionActionKind(actionKind = '') {
+  const normalized = String(actionKind || '').trim();
+  return normalized === 'execute_plan_action' || normalized === 'start_plan_action';
+}
+
+function shouldTreatPlanTurnAsFreshRequest(session = {}) {
+  if (!isPlanModeSession(session)) return false;
+  if (session?.waitingForInteraction) return false;
+  return !isPlanExecutionActionKind(getCurrentConversationActionKind(session));
+}
+
+function normalizeRelayUserTextForMatch(value = '') {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function isSameWaitingSessionUserMessage(session = {}, userText = '') {
+  const nextText = normalizeRelayUserTextForMatch(userText);
+  const currentText = normalizeRelayUserTextForMatch(session?.lastUserMessageCapture?.userText || '');
+  return Boolean(nextText) && Boolean(currentText) && nextText === currentText;
+}
+
+function shouldReuseWaitingSessionForPendingCapture(session = {}, pendingCapture = null) {
+  if (!session?.waitingForInteraction) return false;
+  const actionKind = String(
+    pendingCapture?.debug?.agentClientMessage?.runRequest?.action?.kind
+    || ''
+  ).trim();
+  if (isPlanExecutionActionKind(actionKind)) return true;
+  const pendingText = String(pendingCapture?.userText || '').trim();
+  if (!pendingText) return false;
+  return isSameWaitingSessionUserMessage(session, pendingText);
+}
+
+function shouldReuseWaitingSessionForRunRequest(session = {}, decoded = {}) {
+  if (!session?.waitingForInteraction) return false;
+  const actionKind = String(
+    decoded?.debug?.agentClientMessage?.runRequest?.action?.kind
+    || ''
+  ).trim();
+  return isPlanExecutionActionKind(actionKind);
+}
+
+function clearSessionPlanPresentationState(session = {}, options = {}) {
+  if (!session || typeof session !== 'object') return null;
+  const clearTodos = options.clearTodos !== false;
+  session.latestPlanState = null;
+  session.suppressedPlanText = '';
+  session.lastPlanResumeMessages = [];
+  session.planTurnHandoff = '';
+  session.deferredInteractionResponse = null;
+  session.planWorkflow = clonePlanWorkflowState();
+  if (clearTodos) {
+    session.todos = [];
+  }
+  const patch = {
+    plan_workflow: clonePlanWorkflowState(),
+    waiting_for_interaction: null,
+    plan: null,
+    current_plan_text: '',
+    current_plans: {},
+    current_todos: [],
+  };
+  if (session.agentHistory) {
+    updateSessionHistoryState(session, patch);
+  }
+  return patch;
+}
+
+function getDefaultRelayIgnoreNames(extra = []) {
+  return Array.from(new Set([
+    ...DEFAULT_RELAY_SCAN_IGNORE,
+    ...(Array.isArray(extra) ? extra : []),
+  ].map((item) => String(item || '').trim()).filter(Boolean)));
+}
+
+function getSessionScanIgnoreNames(session = {}, extra = []) {
+  const merged = [...(Array.isArray(extra) ? extra : [])];
+  if (isPlanModeSession(session)) {
+    merged.push('.cursor');
+  }
+  return getDefaultRelayIgnoreNames(merged);
+}
+
+function getDefaultPlanWorkflowState() {
+  return {
+    phase: PLAN_WORKFLOW_PHASES.IDLE,
+    updatedAt: new Date().toISOString(),
+    lastInteractionKind: '',
+    lastToolName: '',
+    currentRequestId: '',
+    draftPlanPath: '',
+    presentedPlanUri: '',
+    checkpointEmittedForPlanUri: '',
+  };
+}
+
+function clonePlanWorkflowState(state = null) {
+  if (!state || typeof state !== 'object') return getDefaultPlanWorkflowState();
+  return {
+    phase: String(state.phase || PLAN_WORKFLOW_PHASES.IDLE).trim() || PLAN_WORKFLOW_PHASES.IDLE,
+    updatedAt: String(state.updatedAt || '').trim() || new Date().toISOString(),
+    lastInteractionKind: String(state.lastInteractionKind || '').trim(),
+    lastToolName: String(state.lastToolName || '').trim(),
+    currentRequestId: String(state.currentRequestId || '').trim(),
+    draftPlanPath: String(state.draftPlanPath || '').trim(),
+    presentedPlanUri: String(state.presentedPlanUri || '').trim(),
+    checkpointEmittedForPlanUri: String(state.checkpointEmittedForPlanUri || '').trim(),
+  };
+}
+
+function ensurePlanWorkflowState(session = {}) {
+  if (!session || typeof session !== 'object') return getDefaultPlanWorkflowState();
+  session.planWorkflow = clonePlanWorkflowState(session.planWorkflow);
+  return session.planWorkflow;
+}
+
+function getPlanWorkflowPhase(session = {}) {
+  return String(ensurePlanWorkflowState(session).phase || PLAN_WORKFLOW_PHASES.IDLE).trim() || PLAN_WORKFLOW_PHASES.IDLE;
+}
+
+function isPlanModeSession(session = {}) {
+  return getSessionAgentMode(session) === 'AGENT_MODE_PLAN';
+}
+
+function isPlanCheckpointVisiblePhase(phase = '') {
+  const normalized = String(phase || '').trim();
+  return normalized === PLAN_WORKFLOW_PHASES.PLAN_PRESENTED
+    || normalized === PLAN_WORKFLOW_PHASES.EXECUTING
+    || normalized === PLAN_WORKFLOW_PHASES.COMPLETED;
+}
+
+function getVisiblePlanState(session = {}) {
+  if (!isPlanCheckpointVisiblePhase(getPlanWorkflowPhase(session))) return null;
+  return getLatestSessionPlanState(session);
+}
+
+function syncPlanWorkflowState(session = {}) {
+  if (!session) return null;
+  const snapshot = clonePlanWorkflowState(session.planWorkflow);
+  session.planWorkflow = snapshot;
+  if (session.agentHistory) {
+    updateSessionHistoryState(session, {
+      plan_workflow: snapshot,
+    });
+  }
+  return snapshot;
+}
+
+function setPlanWorkflowPhase(session = {}, phase = PLAN_WORKFLOW_PHASES.IDLE, extra = {}) {
+  if (!session) return null;
+  const current = ensurePlanWorkflowState(session);
+  const nextPhase = String(phase || PLAN_WORKFLOW_PHASES.IDLE).trim() || PLAN_WORKFLOW_PHASES.IDLE;
+  const next = {
+    ...current,
+    ...extra,
+    phase: nextPhase,
+    updatedAt: new Date().toISOString(),
+  };
+  if (!next.currentRequestId) {
+    next.currentRequestId = String(session.requestId || '').trim();
+  }
+  session.planWorkflow = next;
+  return syncPlanWorkflowState(session);
+}
+
+function updatePlanWorkflowForToolExecution(session = {}, toolCall = {}, execution = {}) {
+  if (!isPlanModeSession(session) || !execution?.ok) return null;
+  const lower = String(toolCall?.name || execution?.tool || '').trim().toLowerCase();
+  if (lower === 'askquestion') {
+    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.AWAITING_ANSWERS, {
+      lastToolName: 'AskQuestion',
+      currentRequestId: String(session.requestId || '').trim(),
+    });
+  }
+  if (lower === 'createplan') {
+    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.AWAITING_PLAN_PRESENTATION, {
+      lastToolName: 'CreatePlan',
+      currentRequestId: String(session.requestId || '').trim(),
+      draftPlanPath: String(execution.planPath || '').trim(),
+    });
+  }
+  if (isReadOnlyContextToolName(lower)) {
+    const currentPhase = getPlanWorkflowPhase(session);
+    const nextPhase = currentPhase === PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED
+      ? PLAN_WORKFLOW_PHASES.EXPLORING
+      : (currentPhase === PLAN_WORKFLOW_PHASES.PLANNING || currentPhase === PLAN_WORKFLOW_PHASES.IDLE
+        ? PLAN_WORKFLOW_PHASES.EXPLORING
+        : currentPhase);
+    return setPlanWorkflowPhase(session, nextPhase, {
+      lastToolName: canonicalToolName(toolCall?.name || execution?.tool || ''),
+      currentRequestId: String(session.requestId || '').trim(),
+    });
+  }
+  return null;
+}
+
+function updatePlanWorkflowForInteractionResponse(session = {}, interactionResponse = {}, pendingInteraction = {}) {
+  if (!isPlanModeSession(session)) return null;
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (responseKind === 'ask_question_interaction_response') {
+    const askQuestion = interactionResponse?.askQuestion || {};
+    const status = String(askQuestion.kind || '').trim().toLowerCase();
+    const answers = Array.isArray(askQuestion.answers) ? askQuestion.answers : [];
+    const hasAnswers = answers.some((answer) => {
+      const selected = Array.isArray(answer?.selectedOptionIds) ? answer.selectedOptionIds.filter(Boolean) : [];
+      const freeform = String(answer?.freeformText || '').trim();
+      return selected.length > 0 || Boolean(freeform);
+    });
+    if (status === 'success' && hasAnswers) {
+      return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED, {
+        lastInteractionKind: responseKind,
+        currentRequestId: String(session.requestId || '').trim(),
+      });
+    }
+    return null;
+  }
+  if (responseKind === 'create_plan_request_response'
+    && String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase() === 'success') {
+    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.PLAN_PRESENTED, {
+      lastInteractionKind: responseKind,
+      currentRequestId: String(session.requestId || '').trim(),
+      presentedPlanUri: String(interactionResponse?.createPlan?.planUri || '').trim()
+        || String(pendingInteraction?.arguments?.planUri || '').trim(),
+    });
+  }
+  return null;
+}
+
+function updatePlanWorkflowForConversationAction(session = {}, actionKind = '', action = {}) {
+  if (!isPlanModeSession(session)) return null;
+  if (actionKind === 'start_plan_action') {
+    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.PLAN_PRESENTED, {
+      lastInteractionKind: actionKind,
+      currentRequestId: String(session.requestId || '').trim(),
+      presentedPlanUri: String(action.planFileUri || '').trim() || ensurePlanWorkflowState(session).presentedPlanUri,
+    });
+  }
+  if (actionKind === 'execute_plan_action') {
+    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.EXECUTING, {
+      lastInteractionKind: actionKind,
+      currentRequestId: String(session.requestId || '').trim(),
+      presentedPlanUri: String(action.planFileUri || '').trim() || ensurePlanWorkflowState(session).presentedPlanUri,
+    });
+  }
+  return null;
+}
+
+function emitPresentedPlanCheckpoint(session = {}, logger = null, options = {}) {
+  if (!session?.active) return 0;
+  const workflow = ensurePlanWorkflowState(session);
+  if (!isPlanCheckpointVisiblePhase(workflow.phase)) return 0;
+  const planState = getLatestSessionPlanState(session);
+  const planText = String(planState?.plan_text || planState?.plan || '').trim();
+  if (!planText) return 0;
+  const checkpointKey = String(
+    workflow.presentedPlanUri
+    || planState?.plan_uri
+    || workflow.draftPlanPath
+    || `inline:${planText.length}`
+  ).trim();
+  if (!options.force && checkpointKey && workflow.checkpointEmittedForPlanUri === checkpointKey) return 0;
+  const workspaceRoot = getSessionWorkspaceRoot(session);
+  const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
+  try {
+    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
+      workspaceRoot,
+      rootPromptMessagesJson: session.rootPromptMessagesJson,
+      readPaths,
+      pendingToolCalls: [],
+      plan: planText,
+      todos: Array.isArray(planState?.todos) ? planState.todos : [],
+    }));
+    setPlanWorkflowPhase(session, workflow.phase, {
+      checkpointEmittedForPlanUri: checkpointKey,
+    });
+    logger?.info?.(
+      `agent local relay emitted presented plan checkpoint requestId=${session.requestId || '-'} phase=${workflow.phase} planChars=${planText.length} planUri=${JSON.stringify(String(planState?.plan_uri || workflow.presentedPlanUri || ''))}`
+    );
+    return 1;
+  } catch (error) {
+    logger?.warn?.(
+      `agent local relay failed to emit presented plan checkpoint requestId=${session.requestId || '-'}: ${error.message}`
+    );
+    return 0;
+  }
+}
+
 function findWaitingSessionByStableConversationId(agentSessions, stableConversationId = '', excludeRequestId = '') {
   const target = String(stableConversationId || '').trim();
   if (!target || !agentSessions?.size) return null;
@@ -1481,6 +1788,18 @@ function rebindWaitingSessionRequestId(session = {}, nextRequestId = '', logger 
   if (previousRequestId) session.agentSessions?.delete(previousRequestId);
   session.requestId = normalizedNextRequestId;
   session.agentSessions?.set(normalizedNextRequestId, session);
+  if (session.agentHistory?.state) {
+    const currentTurnSeq = Number(session.agentTurnSeq || session.agentHistory.state.current_turn_seq || 1) || 1;
+    updateSessionHistoryState(session, {
+      current_request_id: normalizedNextRequestId,
+      current_loop_id: `${currentTurnSeq}:${normalizedNextRequestId}`,
+    });
+  }
+  if (session.planWorkflow && typeof session.planWorkflow === 'object') {
+    setPlanWorkflowPhase(session, getPlanWorkflowPhase(session), {
+      currentRequestId: normalizedNextRequestId,
+    });
+  }
   const rebound = rebindSessionPendingInteractionRequestIds(session, previousRequestId, normalizedNextRequestId);
   logger?.info?.(
     `agent local relay rebound waiting session requestId=${previousRequestId || '-'} -> ${normalizedNextRequestId} pendingInteractions=${rebound}`
@@ -1499,31 +1818,7 @@ function replayPendingInteractionQueries(session = {}, logger = null) {
 }
 
 function replayWaitingSessionPlanCheckpoint(session = {}, logger = null) {
-  if (!session?.active) return 0;
-  const planState = getLatestSessionPlanState(session);
-  const planText = String(planState?.plan_text || planState?.plan || '').trim();
-  if (!planText) return 0;
-  const workspaceRoot = getSessionWorkspaceRoot(session);
-  const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
-  try {
-    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
-      workspaceRoot,
-      rootPromptMessagesJson: session.rootPromptMessagesJson,
-      readPaths,
-      pendingToolCalls: [],
-      plan: planText,
-      todos: Array.isArray(planState?.todos) ? planState.todos : [],
-    }));
-    logger?.info?.(
-      `agent local relay replayed waiting plan checkpoint requestId=${session.requestId || '-'} planChars=${planText.length}`
-    );
-    return 1;
-  } catch (error) {
-    logger?.warn?.(
-      `agent local relay failed to replay waiting plan checkpoint requestId=${session.requestId || '-'}: ${error.message}`
-    );
-    return 0;
-  }
+  return emitPresentedPlanCheckpoint(session, logger, { force: true });
 }
 
 function maybeHandleRunRequestConversationAction(session, decoded, config, logger, stats, pendingAgentInteractions, ack) {
@@ -1537,6 +1832,11 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
     `agent local relay run_request embedded action requestId=${decoded?.requestId || '-'} actionKind=${actionKind} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'}`
   );
   if (isStartPlan) {
+    ensureOpenSessionHistoryTurn(session, config, {
+      includeUserMessage: false,
+      includeRequestContext: false,
+      includeModePromptContexts: false,
+    });
     const planState = {
       plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
       plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
@@ -1544,8 +1844,10 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
       todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
     };
     rememberSessionPlanState(session, planState);
+    updatePlanWorkflowForConversationAction(session, actionKind, action);
     session.waitingForInteraction = true;
     session.planTurnHandoff = 'create_plan';
+    syncOfficialPlanState(session, { appendPromptContext: false });
     updateSessionHistoryState(session, {
       current_loop_status: 'waiting_for_interaction',
       waiting_for_interaction: {
@@ -1555,7 +1857,7 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
       },
       plan: planState,
     });
-    replayWaitingSessionPlanCheckpoint(session, logger);
+    emitPresentedPlanCheckpoint(session, logger, { force: true });
     ack();
     return true;
   }
@@ -1566,6 +1868,13 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
     todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
   };
   rememberSessionPlanState(session, planState);
+  updatePlanWorkflowForConversationAction(session, actionKind, action);
+  syncOfficialPlanState(session, { appendPromptContext: false });
+  ensureOpenSessionHistoryTurn(session, config, {
+    includeUserMessage: false,
+    includeRequestContext: false,
+    includeModePromptContexts: false,
+  });
   if (String(action.executionMode || '').trim()) {
     session.agentMode = normalizeAgentModeName(action.executionMode);
   } else if (getSessionAgentMode(session) === 'AGENT_MODE_PLAN') {
@@ -1582,16 +1891,16 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
   );
   removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
   if (pendingInteraction?.resumeState) {
-    const existingResumeMessages = Array.isArray(pendingInteraction.resumeState.upstreamMessages)
-      ? pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }))
-      : [];
+    const executionUserText = String(
+      session.lastUserMessageCapture?.userText
+      || pendingInteraction.resumeState.userText
+      || '',
+    ).trim();
     pendingInteraction.resumeState = {
       ...pendingInteraction.resumeState,
       plan: planState,
-      userText: String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || '').trim(),
-      upstreamMessages: existingResumeMessages.length
-        ? existingResumeMessages
-        : buildLocalRelayMessages(String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || ''), session),
+      userText: executionUserText,
+      upstreamMessages: buildLocalRelayMessages(executionUserText, session),
     };
     session.lastPlanResumeMessages = pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }));
   }
@@ -1599,6 +1908,49 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
     current_loop_status: 'running',
     waiting_for_interaction: null,
     plan: planState,
+  });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'metadata',
+    payload: {
+      type: 'mode',
+      value: {
+        explicit: true,
+        mode: 'agent',
+        source: 'execute_plan_action',
+      },
+    },
+  });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'metadata',
+    payload: {
+      type: 'run_request',
+      value: {
+        model_id: String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim(),
+        model_name: String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim(),
+        prewarm: false,
+      },
+    },
+  });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'prompt_context',
+    payload: {
+      source: 'mode_change',
+      role: 'user',
+      content: '<system_reminder>\nAt this point, the active mode changed to agent; follow later mode reminders if present.\n</system_reminder>',
+    },
+  });
+  syncOfficialPlanState(session, { appendPromptContext: true });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'prompt_context',
+    payload: {
+      source: 'active_mode_contract',
+      role: 'user',
+      content: '<system_reminder>\nFor the turn that contains this reminder, the active mode is agent. CreatePlan is not available in this mode; do not call CreatePlan. If the user explicitly asks to create or revise a plan, call SwitchMode to return to plan mode first. If there is an accepted or current plan, execute or continue the implementation using the available agent-mode tools.\n</system_reminder>',
+    },
   });
   ack();
   if (session.active && !session.aborted) {
@@ -1642,8 +1994,24 @@ function shouldKeepWaitingForInteractionResponse(pendingInteraction = {}, intera
   const responseKind = String(interactionResponse?.kind || '').trim();
   if (pendingKind === 'create_plan' && responseKind === 'create_plan_request_response') {
     const status = String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase();
-    const planUri = String(interactionResponse?.createPlan?.planUri || '').trim();
-    if (status === 'success' && planUri) return true;
+    const planText = String(
+      interactionResponse?.createPlan?.plan
+      || pendingInteraction?.arguments?.plan
+      || pendingInteraction?.resumeState?.plan?.plan_text
+      || pendingInteraction?.resumeState?.plan?.plan
+      || ''
+    ).trim();
+    const planUri = String(
+      interactionResponse?.createPlan?.planUri
+      || pendingInteraction?.arguments?.planUri
+      || pendingInteraction?.resumeState?.plan?.plan_uri
+      || ''
+    ).trim();
+    if (status === 'success' && (planText || planUri)) return true;
+    if (status === 'rejected') return true;
+    if (status === 'error') return true;
+    if (!planText && !planUri) return true;
+    return false;
   }
   if (pendingKind !== 'ask_question' || responseKind !== 'ask_question_interaction_response') return false;
   const askQuestion = interactionResponse?.askQuestion || {};
@@ -1659,6 +2027,44 @@ function shouldKeepWaitingForInteractionResponse(pendingInteraction = {}, intera
   if (status === 'error') return true;
   if (!hasAnswers) return true;
   return false;
+}
+
+function syncPlanWorkflowAfterToolExecution(session = {}, toolCall = {}, execution = {}) {
+  if (!session || !execution) return null;
+  return updatePlanWorkflowForToolExecution(session, toolCall, execution);
+}
+
+function syncPresentedPlanStateFromInteractionResponse(session = {}, interactionResponse = {}, pendingInteraction = {}) {
+  if (!session) return null;
+  if (String(interactionResponse?.kind || '').trim() !== 'create_plan_request_response') return null;
+  const latestPlanState = getLatestSessionPlanState(session) || {};
+  const planText = String(
+    interactionResponse?.createPlan?.plan
+    || pendingInteraction?.arguments?.plan
+    || pendingInteraction?.resumeState?.plan?.plan_text
+    || pendingInteraction?.resumeState?.plan?.plan
+    || latestPlanState.plan_text
+    || latestPlanState.plan
+    || session.suppressedPlanText
+    || ''
+  ).trim();
+  const planUri = String(
+    interactionResponse?.createPlan?.planUri
+    || pendingInteraction?.arguments?.planUri
+    || pendingInteraction?.resumeState?.plan?.plan_uri
+    || latestPlanState.plan_uri
+    || ''
+  ).trim();
+  const todos = Array.isArray(latestPlanState.todos)
+    ? latestPlanState.todos
+    : (Array.isArray(session.todos) ? session.todos : []);
+  if (!planText && !planUri) return null;
+  return rememberSessionPlanState(session, {
+    plan: planText || planUri,
+    plan_text: planText,
+    plan_uri: planUri,
+    todos,
+  });
 }
 
 function shouldReplayPendingInteractionAfterResponse(pendingInteraction = {}, interactionResponse = {}) {
@@ -1691,9 +2097,13 @@ function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logge
   waitingSession.req = placeholderSession.req;
   waitingSession.res = placeholderSession.res;
   waitingSession.rawBody = placeholderSession.rawBody;
-  waitingSession.generatedChunks = Array.isArray(placeholderSession.generatedChunks)
+  const preservedChunks = Array.isArray(waitingSession.generatedChunks)
+    ? waitingSession.generatedChunks.slice()
+    : [];
+  const placeholderChunks = Array.isArray(placeholderSession.generatedChunks)
     ? placeholderSession.generatedChunks.slice()
     : [];
+  waitingSession.generatedChunks = preservedChunks.concat(placeholderChunks);
   waitingSession.turnEnded = false;
   waitingSession.connectEnded = false;
   waitingSession.completed = false;
@@ -1722,6 +2132,7 @@ function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logge
   logger?.info?.(
     `agent local relay adopted placeholder RunSSE requestId=${placeholderSession.requestId || '-'} into waiting session requestId=${waitingSession.requestId || '-'}`
   );
+  replayWaitingSessionPlanCheckpoint(waitingSession, logger);
   replayPendingInteractionQueries(waitingSession, logger);
   return waitingSession;
 }
@@ -1933,14 +2344,19 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
   if (!session?.agentHistory || session.historyCompleted) return;
   session.historyCompleted = true;
   try {
-    const statePatch = {
-      current_loop_status: status || 'completed',
-    };
-    if (!session.waitingForInteraction) statePatch.waiting_for_interaction = null;
+    const statePatch = session.waitingForInteraction
+      ? {
+        current_loop_status: 'waiting_for_interaction',
+      }
+      : {
+        current_loop_status: status || 'completed',
+        waiting_for_interaction: null,
+      };
     updateSessionHistoryState(session, statePatch);
     completeAgentHistoryTurn(session.agentHistory, {
       status,
       modelCallId: modelCallId || `relay-${session.requestId || Date.now().toString(36)}`,
+      preserveWaitingForInteraction: Boolean(session.waitingForInteraction),
     });
     updateAgentHistoryUsage(session.config || {}, { turns_completed: status === 'completed' ? 1 : 0 });
   } catch (error) {
@@ -2045,8 +2461,39 @@ function detachWaitingInteractionSession(session, logger, reason = 'runsse_close
   return true;
 }
 
+function finalizeWaitingInteractionSessionStream(session, logger, reason = 'interaction_completed') {
+  if (!session || session.aborted || session.completed) return false;
+  session.ignoreNextRunsseClose = true;
+  try {
+    if (session.active && session.res) {
+      if (!session.turnEnded) {
+        writeAgentFrame(session, buildAgentTurnEndedFrame());
+        session.turnEnded = true;
+      }
+      if (!session.connectEnded) {
+        writeAgentFrame(session, buildConnectEndFrame());
+        session.connectEnded = true;
+      }
+      persistGeneratedAgentRunSseResponse(session, session.logger || logger);
+      session.res.end();
+    }
+  } catch (error) {
+    logger?.warn?.(`agent local relay waiting session visible finalize failed requestId=${session.requestId || '-'}: ${error.message}`);
+  }
+  clearInterval(session.heartbeat);
+  session.heartbeat = null;
+  session.streamDetached = true;
+  session.intercepted = false;
+  session.relaying = false;
+  session.req = null;
+  session.res = null;
+  logger?.info?.(`agent local relay waiting session finalized requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} reason=${reason}`);
+  return true;
+}
+
 function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
   if (!session) return null;
+  session.ignoreNextRunsseClose = false;
   session.req = req;
   session.res = res;
   session.rawBody = rawBody;
@@ -2650,6 +3097,9 @@ function rememberSessionPlanState(session = {}, planState = null) {
         todos: Array.isArray(planState.todos) ? planState.todos.map((todo) => ({ ...todo })) : [],
       }
     : null;
+  if (session.latestPlanState && Array.isArray(session.latestPlanState.todos)) {
+    updateSessionTodos(session, session.latestPlanState.todos, false);
+  }
   return session.latestPlanState;
 }
 
@@ -2657,6 +3107,83 @@ function getLatestSessionPlanState(session = {}) {
   return session?.latestPlanState && typeof session.latestPlanState === 'object'
     ? session.latestPlanState
     : null;
+}
+
+function mapTodoStatusToOfficial(todo = {}) {
+  const normalized = normalizeTodoStatus(todo?.status);
+  if (normalized === 'in_progress') return 'TODO_STATUS_IN_PROGRESS';
+  if (normalized === 'completed') return 'TODO_STATUS_COMPLETED';
+  if (normalized === 'cancelled') return 'TODO_STATUS_CANCELLED';
+  return 'TODO_STATUS_PENDING';
+}
+
+function buildOfficialCurrentTodos(session = {}) {
+  return normalizeTodoItems(session.todos || getLatestSessionPlanState(session)?.todos || [])
+    .map((todo) => ({
+      id: todo.id,
+      content: todo.content,
+      status: mapTodoStatusToOfficial(todo),
+    }));
+}
+
+function formatOfficialTodoListPrompt(session = {}) {
+  const todos = normalizeTodoItems(session.todos || getLatestSessionPlanState(session)?.todos || []);
+  if (!todos.length) return '<todo_list>\n</todo_list>';
+  const lines = todos.map((todo) => `- [${todo.status}] ${todo.id}: ${todo.content}`);
+  return `<todo_list>\n${lines.join('\n')}\n</todo_list>`;
+}
+
+function syncOfficialPlanState(session = {}, options = {}) {
+  if (!session?.agentHistory?.state) return null;
+  const planState = getLatestSessionPlanState(session);
+  if (!planState) return null;
+  const planText = String(planState.plan_text || planState.plan || '').trim();
+  const planUri = String(planState.plan_uri || '').trim();
+  const currentTodos = buildOfficialCurrentTodos(session);
+  const currentPlans = planUri
+    ? {
+        current: {
+          id: 'current',
+          path: planUri,
+        },
+      }
+    : {};
+  const patch = {
+    current_plan_text: planText,
+    current_plans: currentPlans,
+    current_todos: currentTodos,
+  };
+  updateSessionHistoryState(session, patch);
+  if (options.appendPromptContext) {
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'structured_state/current_plan',
+        role: 'user',
+        content: `<current_plan>\n${planText}\n</current_plan>`,
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'structured_state/todo_list',
+        role: 'user',
+        content: formatOfficialTodoListPrompt(session),
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'structured_state/todo_reminder',
+        role: 'user',
+        content: '<system_reminder>\nYou are currently under the todo section, be sure to track tasks and do not forget to update.\n</system_reminder>',
+      },
+    });
+  }
+  return patch;
 }
 
 function buildFallbackPendingPlanExecution(session = {}) {
@@ -2916,6 +3443,126 @@ function appendSessionHistory(session, item) {
   } catch (error) {
     session?.logger?.warn?.(`agent history append failed requestId=${session?.requestId || '-'}: ${error.message}`);
   }
+}
+
+function beginSessionHistoryTurn(session, config, options = {}) {
+  const {
+    userText = '',
+    includeUserMessage = false,
+    includeRequestContext = false,
+    includeModePromptContexts = false,
+  } = options;
+  const { conversation, turnSeq } = beginAgentHistoryTurn(
+    config,
+    session?.requestId || '',
+    getSessionWorkspaceRoot(session),
+    session?.lastUserMessageCapture || null,
+  );
+  session.agentHistory = conversation;
+  session.agentTurnSeq = turnSeq;
+  session.historyCompleted = false;
+  if (
+    shouldTreatPlanTurnAsFreshRequest(session)
+    && !isPlanExecutionActionKind(getCurrentConversationActionKind(session))
+  ) {
+    clearSessionPlanPresentationState(session, { clearTodos: true });
+  }
+  const agentModeForHistory = getSessionAgentMode(session);
+  const requestedModelId = String(
+    session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
+  ).trim();
+  if (session.agentHistory?.state) session.agentHistory.state.mode = getCursorModeDirectory(agentModeForHistory);
+  if (includeRequestContext) {
+    appendSessionHistory(session, {
+      role: 'user',
+      kind: 'request_context',
+      payload: {
+        env: {
+          osVersion: `${process.platform} ${process.getSystemVersion ? process.getSystemVersion() : ''}`.trim(),
+          workspacePaths: [getSessionWorkspaceRoot(session)],
+          shell: 'powershell',
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+        },
+        fileContents: {},
+        readLintsEnabled: true,
+        mcpInfoComplete: true,
+        envInfoComplete: true,
+      },
+    });
+  }
+  if (includeUserMessage) {
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'metadata',
+      payload: {
+        type: 'mode',
+        value: {
+          explicit: true,
+          mode: getCursorModeDirectory(agentModeForHistory),
+          source: 'user_message',
+        },
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'metadata',
+      payload: {
+        type: 'run_request',
+        value: {
+          model_id: requestedModelId,
+          model_name: requestedModelId,
+          prewarm: false,
+        },
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'user',
+      kind: 'user_message',
+      payload: {
+        text: String(userText || ''),
+        mode: agentModeForHistory,
+      },
+    });
+  }
+  if (includeModePromptContexts) {
+    const handler = getModeHandlerForSession(session);
+    const helpers = buildModeRuntimeHelpers(session);
+    const promptContexts = typeof handler.buildPlanInitialPromptContexts === 'function'
+      ? handler.buildPlanInitialPromptContexts({
+        session,
+        userText: String(userText || ''),
+      }, helpers)
+      : [];
+    for (const promptContext of promptContexts) {
+      appendSessionHistory(session, {
+        role: 'system',
+        kind: 'prompt_context',
+        payload: {
+          source: String(promptContext?.source || '').trim() || 'mode_context',
+          role: String(promptContext?.role || 'user'),
+          content: String(promptContext?.content || ''),
+        },
+      });
+    }
+  }
+  if (includeUserMessage) {
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'current_user_request',
+        role: 'user',
+        content: `<current_user_request>\n${String(userText || '')}\n</current_user_request>`,
+      },
+    });
+  }
+  return conversation;
+}
+
+function ensureOpenSessionHistoryTurn(session, config, options = {}) {
+  if (session?.agentHistory && !session.historyCompleted) return false;
+  beginSessionHistoryTurn(session, config, options);
+  return true;
 }
 
 function updateSessionHistoryState(session, patch = {}) {
@@ -3560,6 +4207,51 @@ function appendInteractionResponseToHistory(session = {}, pendingInteraction = {
     : null;
   if (!item) return;
   appendSessionHistory(session, item);
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  const toolName = String(pendingInteraction?.toolName || '').trim();
+  const toolCallId = String(pendingInteraction?.toolCallId || '').trim();
+  const interactionResult = responseKind === 'ask_question_interaction_response'
+    ? {
+        ok: String(interactionResponse?.askQuestion?.kind || '').trim().toLowerCase() === 'success',
+        answers: Array.isArray(interactionResponse?.askQuestion?.answers) ? interactionResponse.askQuestion.answers : [],
+        resultText: String(interactionResponse?.askQuestion?.kind || '').trim().toLowerCase() === 'success'
+          ? `ask question answers=${Array.isArray(interactionResponse?.askQuestion?.answers) ? interactionResponse.askQuestion.answers.length : 0}`
+          : String(interactionResponse?.askQuestion?.error || interactionResponse?.askQuestion?.rejectedReason || 'AskQuestion failed'),
+      }
+    : responseKind === 'create_plan_request_response'
+      ? {
+          ok: String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase() === 'success',
+          planPath: String(interactionResponse?.createPlan?.planUri || pendingInteraction?.arguments?.planUri || '').trim(),
+          resultText: String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase() === 'success'
+            ? `create plan success uri=${String(interactionResponse?.createPlan?.planUri || pendingInteraction?.arguments?.planUri || '').trim()}`
+            : String(interactionResponse?.createPlan?.error || 'CreatePlan failed'),
+        }
+      : null;
+  if (!interactionResult || !toolName || !toolCallId) return;
+  const existingItems = Array.isArray(session?.agentHistory?.context?.items) ? session.agentHistory.context.items : [];
+  if (existingItems.some((entry) => (
+    entry?.role === 'tool'
+    && entry?.kind === 'tool_result'
+    && String(entry?.tool_call_id || '').trim() === toolCallId
+  ))) {
+    return;
+  }
+  const structuredToolCall = buildStructuredToolCallSnapshot(toolName, pendingInteraction?.arguments || {}, interactionResult, toolCallId);
+  appendSessionHistory(session, {
+    role: 'tool',
+    kind: 'tool_result',
+    tool_call_id: toolCallId,
+    payload: {
+      tool_call_id: toolCallId,
+      tool_name: toolName,
+      arguments: JSON.stringify(pendingInteraction?.arguments || {}),
+      result_text: interactionResult.resultText || '',
+      ok: Boolean(interactionResult.ok),
+      duration_ms: 0,
+      ...(structuredToolCall ? { tool_call: structuredToolCall } : {}),
+    },
+  });
 }
 
 function updatePendingInteractionResumeState(session = {}, executions = [], upstreamMessages = [], toolResultMessages = [], streamedText = '', userText = '') {
@@ -4164,7 +4856,7 @@ function matchesGlobPath(filePath, rootPath, matchers = []) {
 
 function walkFiles(root, options = {}) {
   const out = [];
-  const ignore = new Set(['node_modules', '.git', 'dist', 'build', ...(options.ignore || [])].map((item) => String(item).toLowerCase()));
+  const ignore = new Set(getDefaultRelayIgnoreNames(options.ignore).map((item) => String(item).toLowerCase()));
   const max = Number(options.max) || 500;
   function walk(dir) {
     if (out.length >= max) return;
@@ -4191,7 +4883,7 @@ function walkFiles(root, options = {}) {
 
 function shouldIgnoreLsEntry(name = '', ignore = []) {
   const normalized = String(name || '').toLowerCase();
-  const patterns = Array.isArray(ignore) ? ignore : [];
+  const patterns = getDefaultRelayIgnoreNames(ignore);
   return patterns.some((pattern) => {
     const value = String(pattern || '').trim().toLowerCase();
     if (!value) return false;
@@ -5395,7 +6087,9 @@ async function executeRelayTool(toolCall, session, logger) {
       const noMatch = !result.ok && Number(result.code) === 1;
       if (!result.ok && !noMatch && /access is denied|EPERM|ENOENT|not recognized/i.test(`${output}\n${result.error}`)) {
         fallbackUsed = true;
-        const files = fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory() ? walkFiles(targetPath, { max: 500 }) : [targetPath];
+        const files = fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()
+          ? walkFiles(targetPath, { max: 500, ignore: getSessionScanIgnoreNames(session) })
+          : [targetPath];
         const globMatchers = args.glob ? buildGlobMatchers(args.glob) : [];
         const matches = [];
         let regex = null;
@@ -5441,7 +6135,7 @@ async function executeRelayTool(toolCall, session, logger) {
       const targetPath = resolveWorkspacePath(args.target_directory || args.path || '', session);
       const pattern = String(args.glob_pattern || args.pattern || '*').trim() || '*';
       const globMatchers = buildGlobMatchers(pattern);
-      const files = walkFiles(targetPath, { max: 1000 })
+      const files = walkFiles(targetPath, { max: 1000, ignore: getSessionScanIgnoreNames(session) })
         .filter((file) => matchesGlobPath(file, targetPath, globMatchers))
         .slice(0, 200);
       const resultText = files.length
@@ -5451,9 +6145,10 @@ async function executeRelayTool(toolCall, session, logger) {
     }
     if (lower === 'ls') {
       const targetPath = resolveWorkspacePath(args.path || '', session);
-      const directoryTree = buildLsDirectoryTreeNode(targetPath, args.ignore);
+      const lsIgnore = getSessionScanIgnoreNames(session, args.ignore);
+      const directoryTree = buildLsDirectoryTreeNode(targetPath, lsIgnore);
       const fileCount = countFilesInDirectoryTree(directoryTree);
-      const listing = listDirectory(targetPath, args.ignore);
+      const listing = listDirectory(targetPath, lsIgnore);
       const resultText = listing
         ? `ls success path=${targetPath} files=${fileCount}\n${listing}`
         : `ls success path=${targetPath} files=0`;
@@ -5663,7 +6358,7 @@ async function executeSemanticSearchTool(args = {}, session = {}) {
   const words = query.split(/\s+/).map((item) => item.trim()).filter((item) => item.length >= 2).slice(0, 6);
   const files = [];
   roots.forEach((root) => {
-    walkFiles(root, { max: 300 }).forEach((file) => {
+    walkFiles(root, { max: 300, ignore: getSessionScanIgnoreNames(session) }).forEach((file) => {
       if (!files.includes(file)) files.push(file);
     });
   });
@@ -6159,22 +6854,10 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       }
       if (!interactionQueryDispatch) emitVisibleToolResultSummary(session, toolCall, execution);
       if (String(toolCall.name || '').trim().toLowerCase() === 'createplan' && execution?.ok) {
-        session.planTurnHandoff = 'create_plan';
         const planState = buildPlanStateFromExecution(session, execution);
         rememberSessionPlanState(session, planState);
-        if (planState) {
-          updateSessionHistoryState(session, {
-            current_loop_status: 'waiting_for_interaction',
-            waiting_for_interaction: {
-              handoff: 'create_plan',
-              pending_count: 1,
-              since: new Date().toISOString(),
-            },
-            plan: planState,
-          });
-        }
-        emitPlanConversationCheckpointFrames(session, { ...toolCall, id: toolCallId }, execution, logger);
       }
+      syncPlanWorkflowAfterToolExecution(session, toolCall, execution);
       if (isMutation && execution?.ok) {
         emitAgentMutationCheckpointFrames(session, { ...toolCall, id: toolCallId }, execution, logger);
         appendLatestEditReminder(session, execution.args?.path || toolCall.arguments?.path || '');
@@ -6820,6 +7503,11 @@ async function continueAgentStreamLoop(session, options = {}) {
   logger?.info?.(
     `agent local relay final text frame requestId=${requestId} finalTextLen=${String(finalText || '').length} sentTextDelta=${session.sentTextDelta ? '1' : '0'} finalAlreadySent=${finalTextAlreadySent ? '1' : '0'} sentTextLen=${String(session.agentTextFrameText || '').length}`,
   );
+  if (isPlanModeSession(session) && !session.unfinishedWorkAtEnd && !upstreamError) {
+    setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.COMPLETED, {
+      currentRequestId: String(session.requestId || '').trim(),
+    });
+  }
   writeAgentFrame(session, buildAgentTurnEndedFrame());
   session.turnEnded = true;
   markUpstreamUsageCompleted(session, config, finalStatus, upstreamError);
@@ -6845,21 +7533,9 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
     return;
   }
   if (String(interactionResponse?.kind || '').trim() === 'create_plan_request_response') {
-    const planText = String(
-      pendingInteraction?.arguments?.plan
-      || pendingInteraction?.resumeState?.plan?.plan
-      || getLatestSessionPlanState(session)?.plan
-      || session.suppressedPlanText
-      || '',
-    ).trim();
-    const planUri = String(interactionResponse?.createPlan?.planUri || '').trim();
-    if (planText || planUri) {
-      rememberSessionPlanState(session, {
-        plan: planText || planUri,
-        plan_text: planText,
-        plan_uri: planUri,
-        todos: Array.isArray(session.todos) ? session.todos : [],
-      });
+    const planState = syncPresentedPlanStateFromInteractionResponse(session, interactionResponse, pendingInteraction);
+    if (planState) {
+      updatePlanWorkflowForInteractionResponse(session, interactionResponse, pendingInteraction);
       session.waitingForInteraction = true;
       session.planTurnHandoff = 'create_plan';
       session.unfinishedWorkAtEnd = false;
@@ -6870,15 +7546,22 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
           pending_count: 1,
           since: new Date().toISOString(),
         },
-        plan: getLatestSessionPlanState(session),
+        plan: planState,
       });
+      emitPresentedPlanCheckpoint(session, logger, { force: true });
       logger?.info?.(
-        `agent local relay create_plan acknowledged requestId=${requestId} planUri=${JSON.stringify(planUri)} waiting_for_build=1`,
+        `agent local relay create_plan acknowledged requestId=${requestId} planUri=${JSON.stringify(String(planState?.plan_uri || ''))} waiting_for_build=1`,
       );
       return;
     }
   }
   if (String(interactionResponse?.kind || '').trim() === 'execute_plan_action') {
+    if (isPlanModeSession(session)) {
+      setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.EXECUTING, {
+        lastInteractionKind: String(interactionResponse?.kind || '').trim(),
+        currentRequestId: String(session.requestId || '').trim(),
+      });
+    }
     const planState = getLatestSessionPlanState(session) || {};
     session.waitingForInteraction = false;
     session.planTurnHandoff = '';
@@ -7060,52 +7743,30 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
   session.relaying = true;
   session.webSearchProgressEmitted = false;
   try {
-    if (!session.agentHistory) {
-      const { conversation, turnSeq } = beginAgentHistoryTurn(
-        config,
-        session.requestId || '',
-        getSessionWorkspaceRoot(session),
-        session.lastUserMessageCapture || null,
-      );
-      session.agentHistory = conversation;
-      session.agentTurnSeq = turnSeq;
-      const agentModeForHistory = getSessionAgentMode(session);
-      if (session.agentHistory?.state) session.agentHistory.state.mode = getCursorModeDirectory(agentModeForHistory);
-      appendSessionHistory(session, {
-        role: 'user',
-        kind: 'request_context',
-        payload: {
-          env: {
-            osVersion: `${process.platform} ${process.getSystemVersion ? process.getSystemVersion() : ''}`.trim(),
-            workspacePaths: [getSessionWorkspaceRoot(session)],
-            shell: 'powershell',
-            timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-          },
-          fileContents: {},
-          readLintsEnabled: true,
-          mcpInfoComplete: true,
-          envInfoComplete: true,
-        },
+    if (shouldTreatPlanTurnAsFreshRequest(session)) {
+      clearSessionPlanPresentationState(session, { clearTodos: true });
+    }
+    if (
+      isPlanModeSession(session)
+      && !session.waitingForInteraction
+      && !isPlanCheckpointVisiblePhase(getPlanWorkflowPhase(session))
+    ) {
+      setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.PLANNING, {
+        currentRequestId: String(session.requestId || '').trim(),
+        lastInteractionKind: '',
+        lastToolName: '',
+        draftPlanPath: '',
+        presentedPlanUri: '',
+        checkpointEmittedForPlanUri: '',
       });
-      appendSessionHistory(session, {
-        role: 'user',
-        kind: 'user_message',
-        payload: {
-          text: String(userText || ''),
-          mode: agentModeForHistory,
-        },
-      });
-      appendSessionHistory(session, {
-        role: 'system',
-        kind: 'prompt_context',
-        payload: {
-          source: 'current_user_request',
-          role: 'user',
-          content: `<current_user_request>
-${String(userText || '')}
-</current_user_request>`,
-        },
-      });
+    }
+    const startedNewTurn = ensureOpenSessionHistoryTurn(session, config, {
+      userText,
+      includeUserMessage: true,
+      includeRequestContext: true,
+      includeModePromptContexts: isPlanModeSession(session),
+    });
+    if (startedNewTurn) {
       updateAgentHistoryUsage(config, { requests: 1 });
     }
 
@@ -7352,6 +8013,11 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       }
       res.on('close', () => {
         if (session?.completed) return;
+        if (session?.ignoreNextRunsseClose) {
+          session.ignoreNextRunsseClose = false;
+          logger?.info?.(`agent local relay ignored runsse close after finalize requestId=${session?.requestId || '-'}`);
+          return;
+        }
         abortAgentSession(session, logger, 'runsse_closed');
       });
       if (session?.deferredInteractionResponse?.interactionResponse && !session.relaying) {
@@ -7360,7 +8026,11 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       return;
     }
     const crossRequestWaitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, requestId);
-    if (crossRequestWaitingSession && !crossRequestWaitingSession.aborted) {
+    if (
+      crossRequestWaitingSession
+      && !crossRequestWaitingSession.aborted
+      && shouldReuseWaitingSessionForPendingCapture(crossRequestWaitingSession, pendingCapture)
+    ) {
       if (requestId && requestId !== crossRequestWaitingSession.requestId) {
         rebindWaitingSessionRequestId(crossRequestWaitingSession, requestId, logger);
       }
@@ -7372,6 +8042,11 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       }
       res.on('close', () => {
         if (session?.completed) return;
+        if (session?.ignoreNextRunsseClose) {
+          session.ignoreNextRunsseClose = false;
+          logger?.info?.(`agent local relay ignored runsse close after finalize requestId=${session?.requestId || '-'}`);
+          return;
+        }
         abortAgentSession(session, logger, 'runsse_closed');
       });
       if (session?.deferredInteractionResponse?.interactionResponse && !session.relaying) {
@@ -7437,6 +8112,11 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
     }
     res.on('close', () => {
       if (session.completed) return;
+      if (session?.ignoreNextRunsseClose) {
+        session.ignoreNextRunsseClose = false;
+        logger?.info?.(`agent local relay ignored runsse close after finalize requestId=${session?.requestId || '-'}`);
+        return;
+      }
       abortAgentSession(session, logger, 'runsse_closed');
     });
     return;
@@ -7470,13 +8150,6 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
     logger.info(
       `protocol BidiAppend conversation_action debug requestId=${decoded.requestId || '-'} rawTextPreview=${JSON.stringify(decoded.debug?.rawTextPreview || '')} dataTextPreview=${JSON.stringify(decoded.debug?.dataTextPreview || '')} agentShape=${JSON.stringify(decoded.debug?.agentShape || '')} agentClientMessage=${JSON.stringify(decoded.debug?.agentClientMessage || {})}`,
     );
-  } else if (decoded.kind !== 'client_heartbeat' && decoded.kind !== 'user_message') {
-    const stopCandidateText = `${userTextPreview}\n${decoded.debug?.rawTextPreview || ''}\n${decoded.debug?.dataTextPreview || ''}`;
-    if (/abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(stopCandidateText)) {
-      logger.info(
-        `protocol BidiAppend stop-candidate requestId=${decoded.requestId || '-'} kind=${decoded.kind || '-'} protocolOneof=${protocolOneof} rawTextPreview=${JSON.stringify(decoded.debug?.rawTextPreview || '')} dataTextPreview=${JSON.stringify(decoded.debug?.dataTextPreview || '')} agentClientMessage=${JSON.stringify(decoded.debug?.agentClientMessage || {})}`,
-      );
-    }
   }
 
   const samplePath = persistProtocolSample(config, 'bidi', rawBody, {
@@ -7540,16 +8213,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         session = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
       }
       const actionKind = String(action.kind || '').trim();
-      const actionText = [
-        userTextPreview,
-        decoded.debug?.rawTextPreview || '',
-        decoded.debug?.dataTextPreview || '',
-        action.cancelReason || '',
-        action.planFileContent || '',
-        action.plan || '',
-      ].join('\n');
-      const isCancel = actionKind === 'cancel_action'
-        || /abort|aborted|cancel|stop|interrupt|terminate|pause/i.test(actionText);
+      const isCancel = actionKind === 'cancel_action';
       const isExecutePlan = actionKind === 'execute_plan_action';
       const isStartPlan = actionKind === 'start_plan_action';
       logger.info(
@@ -7566,6 +8230,11 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         return;
       }
       if (isStartPlan) {
+        ensureOpenSessionHistoryTurn(session, config, {
+          includeUserMessage: false,
+          includeRequestContext: false,
+          includeModePromptContexts: false,
+        });
         const planState = {
           plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
           plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
@@ -7573,6 +8242,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
           todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
         };
         rememberSessionPlanState(session, planState);
+        updatePlanWorkflowForConversationAction(session, actionKind, action);
         session.waitingForInteraction = true;
         session.planTurnHandoff = 'create_plan';
         updateSessionHistoryState(session, {
@@ -7584,10 +8254,16 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
           },
           plan: planState,
         });
+        emitPresentedPlanCheckpoint(session, logger, { force: true });
         ack();
         return;
       }
       if (isExecutePlan) {
+        ensureOpenSessionHistoryTurn(session, config, {
+          includeUserMessage: false,
+          includeRequestContext: false,
+          includeModePromptContexts: false,
+        });
         const planState = {
           plan: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan || '').trim(),
           plan_text: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan_text || '').trim(),
@@ -7595,6 +8271,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
           todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
         };
         rememberSessionPlanState(session, planState);
+        updatePlanWorkflowForConversationAction(session, actionKind, action);
         if (String(action.executionMode || '').trim()) {
           session.agentMode = normalizeAgentModeName(action.executionMode);
         } else if (getSessionAgentMode(session) === 'AGENT_MODE_PLAN') {
@@ -7655,26 +8332,50 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       );
       if (session && pendingInteraction) {
         appendInteractionResponseToHistory(session, pendingInteraction, interactionResponse);
+        syncPresentedPlanStateFromInteractionResponse(session, interactionResponse, pendingInteraction);
+        updatePlanWorkflowForInteractionResponse(session, interactionResponse, pendingInteraction);
       }
       const shouldKeepWaiting = shouldKeepWaitingForInteractionResponse(pendingInteraction, interactionResponse);
       const shouldReplayPending = shouldReplayPendingInteractionAfterResponse(pendingInteraction, interactionResponse);
+      const shouldFinalizeTurn = session && pendingInteraction
+        ? shouldFinalizeInteractionResponseTurnByMode(session, interactionResponse, pendingInteraction)
+        : false;
       if (!shouldKeepWaiting) {
         removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
       }
       ack();
+      if (shouldFinalizeTurn && session?.active && !session.aborted) {
+        session.waitingForInteraction = true;
+        session.waitingInteractionSince = session.waitingInteractionSince || Date.now();
+        session.planTurnHandoff = String(pendingInteraction?.kind || session.planTurnHandoff || '').trim() || session.planTurnHandoff;
+        updateSessionHistoryState(session, buildCompletedInteractionStatePatchByMode(session, interactionResponse, pendingInteraction));
+        syncOfficialPlanState(session, { appendPromptContext: false });
+        emitPresentedPlanCheckpoint(session, logger, { force: true });
+        completeSessionHistory(session, 'completed', `interaction-${decoded.requestId}`);
+        finalizeWaitingInteractionSessionStream(session, logger, 'interaction_completed');
+        logger.info(
+          `agent local relay finalized interaction turn requestId=${decoded.requestId} pendingKind=${pendingInteraction?.kind || '-'} responseKind=${interactionResponse?.kind || '-'}`
+        );
+        return;
+      }
       if (shouldKeepWaiting && session?.active && !session.aborted) {
         session.waitingForInteraction = true;
         session.waitingInteractionSince = session.waitingInteractionSince || Date.now();
         session.planTurnHandoff = String(pendingInteraction?.kind || session.planTurnHandoff || '').trim() || session.planTurnHandoff;
-        updateSessionHistoryState(session, {
-          current_loop_status: 'waiting_for_interaction',
-          waiting_for_interaction: {
-            handoff: String(session.planTurnHandoff || pendingInteraction?.kind || '').trim(),
-            pending_count: 1,
-            since: new Date(session.waitingInteractionSince || Date.now()).toISOString(),
-          },
-          plan: getLatestSessionPlanState(session),
-        });
+        const waitingStatePatch = buildCompletedInteractionStatePatchByMode(session, interactionResponse, pendingInteraction);
+        updateSessionHistoryState(session, waitingStatePatch?.current_loop_status === 'waiting_for_interaction'
+          ? waitingStatePatch
+          : {
+            current_loop_status: 'waiting_for_interaction',
+            waiting_for_interaction: {
+              handoff: String(session.planTurnHandoff || pendingInteraction?.kind || '').trim(),
+              pending_count: 1,
+              since: new Date(session.waitingInteractionSince || Date.now()).toISOString(),
+            },
+            plan: getLatestSessionPlanState(session),
+          });
+        syncOfficialPlanState(session, { appendPromptContext: false });
+        emitPresentedPlanCheckpoint(session, logger, { force: true });
         if (shouldReplayPending) {
           replayPendingInteractionQuery(session, pendingInteraction, logger);
         }
@@ -7702,7 +8403,12 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         || String(decoded.debug?.agentClientMessage?.runRequest?.stableConversationId || '').trim();
       const session = agentSessions.get(decoded.requestId);
       const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
-      if (waitingSession && !waitingSession.relaying && waitingSession !== session) {
+      if (
+        waitingSession
+        && !waitingSession.relaying
+        && waitingSession !== session
+        && shouldReuseWaitingSessionForRunRequest(waitingSession, decoded)
+      ) {
         if (isPlaceholderRunSseSession(session)) {
           adoptPlaceholderRunSseSession(waitingSession, session, logger);
         }
@@ -7787,7 +8493,12 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       }
       const session = agentSessions.get(decoded.requestId);
       const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
-      if (waitingSession && !waitingSession.relaying && waitingSession !== session) {
+      if (
+        waitingSession
+        && !waitingSession.relaying
+        && waitingSession !== session
+        && isSameWaitingSessionUserMessage(waitingSession, normalizedUserText)
+      ) {
         if (isPlaceholderRunSseSession(session)) {
           adoptPlaceholderRunSseSession(waitingSession, session, logger);
         }

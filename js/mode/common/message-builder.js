@@ -12,6 +12,7 @@ function buildModeRelayMessages(input = {}) {
     imageParts = [],
     modeName = 'AGENT_MODE_AGENT',
     extraSystemLines = [],
+    promptContextMessages = [],
   } = input;
 
   const user = String(userText || '');
@@ -46,6 +47,14 @@ function buildModeRelayMessages(input = {}) {
         ...(Array.isArray(extraSystemLines) ? extraSystemLines : []),
       ].filter(Boolean).join('\n'),
     },
+    ...(Array.isArray(promptContextMessages)
+      ? promptContextMessages
+        .filter((message) => message && typeof message === 'object' && String(message.content || '').trim())
+        .map((message) => ({
+          role: String(message.role || 'user'),
+          content: String(message.content || ''),
+        }))
+      : []),
     { role: 'user', content: userContent },
   ];
 }

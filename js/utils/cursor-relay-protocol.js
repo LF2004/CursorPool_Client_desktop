@@ -1475,6 +1475,8 @@ function decodeBidiAppendRequest(bodyBuffer) {
       hasBlobId: Boolean(blobIdBase64),
     }));
     const agentOneof = debug.agentClientMessage?.oneof || '';
+    const runRequestActionKind = String(debug.agentClientMessage?.runRequest?.action?.kind || '').trim();
+    debug.runRequestActionKind = runRequestActionKind;
     if (agentOneof === 'kv_client_message' || firstField === 3) {
       return { requestId, userText: '', kind: 'kv_client', debug };
     }
@@ -1489,6 +1491,16 @@ function decodeBidiAppendRequest(bodyBuffer) {
     }
     if (agentOneof === 'client_heartbeat' || firstField === 7) {
       return { requestId, userText: '', kind: 'client_heartbeat', debug };
+    }
+    if (agentOneof === 'run_request' && runRequestActionKind && runRequestActionKind !== 'user_message_action') {
+      return {
+        requestId,
+        userText: '',
+        selectedImages,
+        mode: debug.agentMode || debug.agentClientMessage?.runRequest?.mode || 'AGENT_MODE_UNSPECIFIED',
+        kind: 'run_request',
+        debug,
+      };
     }
     const userText = extractUserTextFromAgentPayload(agentPayload);
     if (userText) {
@@ -2211,6 +2223,44 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
                 chunk: String(item?.snippet || '').trim(),
               })),
             },
+        },
+      },
+    };
+  }
+  if (normalized === 'askquestion' || normalized === 'ask_question') {
+    const questions = Array.isArray(safeArgs.questions) ? safeArgs.questions : [];
+    const answers = Array.isArray(execution.answers) ? execution.answers : [];
+    return {
+      askQuestionToolCall: {
+        args: {
+          title: String(safeArgs.title || '').trim(),
+          questions,
+        },
+        result: execution.ok === false
+          ? { error: { errorMessage: resultText || 'AskQuestion failed' } }
+          : {
+            success: {
+              answers,
+            },
+          },
+      },
+    };
+  }
+  if (normalized === 'createplan' || normalized === 'create_plan') {
+    const todos = Array.isArray(safeArgs.todos) ? safeArgs.todos : [];
+    return {
+      createPlanToolCall: {
+        args: {
+          plan: String(safeArgs.plan || '').trim(),
+          overview: String(safeArgs.overview || '').trim(),
+          name: String(safeArgs.name || '').trim(),
+          todos,
+        },
+        result: execution.ok === false
+          ? { error: { errorMessage: resultText || 'CreatePlan failed' } }
+          : {
+            planUri: String(execution.planPath || execution.planUri || safeArgs.planUri || '').trim(),
+            success: {},
           },
       },
     };

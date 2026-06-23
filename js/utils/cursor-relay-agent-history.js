@@ -139,7 +139,11 @@ function appendHistoryItem(conversation, item = {}) {
 
 function completeTurn(conversation, options = {}) {
   if (!conversation) return;
-  conversation.state.current_loop_status = options.status || 'completed';
+  const preserveWaiting = Boolean(options.preserveWaitingForInteraction)
+    && String(conversation.state?.current_loop_status || '').trim() === 'waiting_for_interaction';
+  conversation.state.current_loop_status = preserveWaiting
+    ? 'waiting_for_interaction'
+    : (options.status || 'completed');
   conversation.state.last_provider_call = options.lastProviderCall || conversation.state.last_provider_call || null;
   appendHistoryItem(conversation, {
     role: 'system',

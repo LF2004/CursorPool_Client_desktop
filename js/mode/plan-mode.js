@@ -28,6 +28,47 @@ const PLAN_TOOL_NAMES = [
 ];
 
 const PLAN_MUTATION_TOOL_NAMES = new Set(['write', 'edit', 'patchedit', 'strreplace', 'delete']);
+const PLAN_ACTIVE_MODE_CONTRACT = [
+  '<system_reminder>',
+  'For the turn that contains this reminder, the active mode is plan. Do not modify files or system state. Use CreatePlan when the plan is ready or needs updating.',
+  '</system_reminder>',
+].join('\n');
+const PLAN_LATEST_USER_INTENT = [
+  '<system_reminder>',
+  'Prefer clear staged plans with concrete checkpoints.',
+  '</system_reminder>',
+].join('\n');
+
+function buildPlanInitialPromptContexts(input = {}) {
+  void input;
+  const planReminder = readModeText('AGENT_MODE_PLAN', 'system_reminder.txt');
+  return [
+    {
+      source: 'mode_change',
+      role: 'user',
+      content: [
+        '<system_reminder>',
+        'At this point, the active mode changed to plan; follow later mode reminders if present.',
+        '</system_reminder>',
+      ].join('\n'),
+    },
+    {
+      source: 'plan_turn_contract',
+      role: 'user',
+      content: planReminder,
+    },
+    {
+      source: 'active_mode_contract',
+      role: 'user',
+      content: PLAN_ACTIVE_MODE_CONTRACT,
+    },
+    {
+      source: 'latest_user_intent',
+      role: 'user',
+      content: PLAN_LATEST_USER_INTENT,
+    },
+  ].filter((entry) => String(entry.content || '').trim());
+}
 
 function hasSuccessfulToolResult(session = {}, toolName = '') {
   const target = String(toolName || '').trim().toLowerCase();
@@ -97,6 +138,7 @@ function buildInteractionContinuationPrompt(pendingInteraction = {}, interaction
       `Interaction status: ${status}.`,
       answersSummary ? `Answers:\n${answersSummary}` : 'Answers: none provided.',
       'Do not ask the same clarification again. Use these answers to continue the plan immediately.',
+      'Before calling CreatePlan, perform one fresh read-only reconnaissance step in the current workspace after these answers so the plan reflects the updated scope.',
     ].join('\n');
   }
   if (responseKind === 'create_plan_request_response' || pendingKind === 'create_plan') {
@@ -214,10 +256,50 @@ function getInteractionPendingKindFromResponse(interactionResponse = {}) {
   return '';
 }
 
-function isSuccessfulCreatePlanInteractionResponse(interactionResponse = {}) {
+function resolveCreatePlanPresentationState(session = {}, interactionResponse = {}, pendingInteraction = {}) {
+  const latestPlanState = session?.latestPlanState && typeof session.latestPlanState === 'object'
+    ? session.latestPlanState
+    : {};
+  const workflow = session?.planWorkflow && typeof session.planWorkflow === 'object'
+    ? session.planWorkflow
+    : {};
+  const planText = String(
+    interactionResponse?.createPlan?.plan
+    || pendingInteraction?.arguments?.plan
+    || pendingInteraction?.resumeState?.plan?.plan_text
+    || pendingInteraction?.resumeState?.plan?.plan
+    || latestPlanState.plan_text
+    || latestPlanState.plan
+    || session?.suppressedPlanText
+    || ''
+  ).trim();
+  const planUri = String(
+    interactionResponse?.createPlan?.planUri
+    || pendingInteraction?.arguments?.planUri
+    || pendingInteraction?.resumeState?.plan?.plan_uri
+    || latestPlanState.plan_uri
+    || workflow.presentedPlanUri
+    || workflow.draftPlanPath
+    || ''
+  ).trim();
+  const todos = Array.isArray(latestPlanState.todos)
+    ? latestPlanState.todos.map((todo) => ({ ...todo }))
+    : (Array.isArray(pendingInteraction?.arguments?.todos)
+      ? pendingInteraction.arguments.todos.map((todo) => ({ ...todo }))
+      : []);
+  if (!planText && !planUri) return null;
+  return {
+    plan: planText || planUri,
+    plan_text: planText,
+    plan_uri: planUri,
+    todos,
+  };
+}
+
+function isSuccessfulCreatePlanInteractionResponse(session = {}, interactionResponse = {}, pendingInteraction = {}) {
   return String(interactionResponse?.kind || '').trim() === 'create_plan_request_response'
     && String(interactionResponse?.createPlan?.kind || '').trim() === 'success'
-    && Boolean(String(interactionResponse?.createPlan?.planUri || '').trim());
+    && Boolean(resolveCreatePlanPresentationState(session, interactionResponse, pendingInteraction));
 }
 
 function buildPendingInteractionResumeState(session = {}, context = {}) {
@@ -253,31 +335,24 @@ function buildResumedInteractionStatePatch() {
 }
 
 function shouldFinalizeInteractionResponseTurn(session = {}, interactionResponse = {}, pendingInteraction = {}, helpers = {}) {
-  void session;
-  void interactionResponse;
-  void pendingInteraction;
   void helpers;
-  return false;
+  return isSuccessfulCreatePlanInteractionResponse(session, interactionResponse, pendingInteraction);
 }
 
 function buildCompletedInteractionStatePatch(session = {}, interactionResponse = {}, pendingInteraction = {}, helpers = {}) {
-  const planUri = String(interactionResponse?.createPlan?.planUri || pendingInteraction?.arguments?.planUri || '').trim();
-  const planText = String(interactionResponse?.createPlan?.plan || pendingInteraction?.arguments?.plan || '').trim();
-  const pendingCount = Number(pendingInteraction?.queryId || 1) > 0 ? 1 : 0;
-  return {
-    current_loop_status: 'waiting_for_interaction',
-    waiting_for_interaction: {
+  const planState = resolveCreatePlanPresentationState(session, interactionResponse, pendingInteraction);
+  void helpers;
+  if (isSuccessfulCreatePlanInteractionResponse(session, interactionResponse, pendingInteraction)) {
+    return buildWaitingForInteractionStatePatch(session, {
       handoff: 'create_plan',
-      pending_count: pendingCount,
-      since: new Date().toISOString(),
-    },
-    plan: (planText || planUri)
-      ? {
-        plan: planText || planUri,
-        plan_text: planText || '',
-        plan_uri: planUri,
-      }
-      : null,
+      pendingCount: 1,
+      plan: planState,
+    });
+  }
+  return {
+    current_loop_status: 'completed',
+    waiting_for_interaction: null,
+    plan: planState,
   };
 }
 
@@ -358,6 +433,7 @@ function buildLocalRelayMessages(input = {}) {
     modeName: 'AGENT_MODE_PLAN',
     cursorAgentPrompt: readModeText('AGENT_MODE_PLAN', 'system_prompt.txt'),
     cursorModeReminder: readModeText('AGENT_MODE_PLAN', 'system_reminder.txt'),
+    promptContextMessages: buildPlanInitialPromptContexts(input),
     extraSystemLines: [
       'In plan mode, prioritize producing and confirming a plan before execution when the task is complex.',
       'If key choices are still unresolved, use AskQuestion before CreatePlan.',
@@ -499,6 +575,7 @@ module.exports = {
   buildToolDefinitionsForChat,
   buildToolDefinitionsForResponses,
   buildLocalRelayMessages,
+  buildPlanInitialPromptContexts,
   shouldUseNativeExecForTool,
   getUpstreamRequestOptions() {
     return {
