@@ -87,6 +87,15 @@ function saveConversation(conversation) {
   writeJson(conversation.statePath, conversation.state);
 }
 
+function updateConversationState(conversation, patch = {}) {
+  if (!conversation || !patch || typeof patch !== 'object') return;
+  conversation.state = conversation.state && typeof conversation.state === 'object'
+    ? conversation.state
+    : {};
+  Object.assign(conversation.state, patch);
+  saveConversation(conversation);
+}
+
 function beginTurn(config = {}, requestId = '', workspaceRoot = '', capture = null) {
   const stableConversationId = String(capture?.stableConversationId || capture?.conversationId || '').trim();
   const conversation = loadConversation(config, stableConversationId || requestId, { requestId, workspaceRoot });
@@ -169,5 +178,6 @@ module.exports = {
   completeTurn,
   getConversationId,
   getHistoryRoot,
+  updateConversationState,
   updateUsage,
 };

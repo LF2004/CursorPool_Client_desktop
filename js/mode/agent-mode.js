@@ -55,10 +55,25 @@ function shouldUseNativeExecForTool(session, toolCall, helpers = {}) {
   return shouldUseNativeExecForToolByMode(session, toolCall, helpers);
 }
 
+function getUpstreamPhaseConfig(context = {}) {
+  void context;
+  return {
+    fetch: {
+      preferredEndpointMode: 'chat',
+    },
+  };
+}
+
 module.exports = {
   AGENT_TOOL_NAMES,
   buildToolDefinitionsForChat,
   buildToolDefinitionsForResponses,
   buildLocalRelayMessages,
   shouldUseNativeExecForTool,
+  getUpstreamPhaseConfig,
+  getUpstreamRequestOptions() {
+    return {
+      preferredEndpointMode: 'chat',
+    };
+  },
 };

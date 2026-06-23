@@ -7,6 +7,10 @@ const {
   buildToolDefinitionsForResponses: buildResponsesToolDefinitions,
 } = require('./common/tools');
 const { shouldUseNativeExecForToolByMode } = require('./common/policy');
+const {
+  buildAgentAskQuestionQueryFrame,
+  buildAgentCreatePlanQueryFrame,
+} = require('../utils/cursor-relay-protocol');
 
 const PLAN_TOOL_NAMES = [
   'Read',
@@ -35,6 +39,86 @@ function hasCreatePlanResult(session = {}) {
   return hasSuccessfulToolResult(session, 'createplan');
 }
 
+function isPlanInteractionToolName(toolName = '') {
+  const lower = String(toolName || '').trim().toLowerCase();
+  return lower === 'createplan' || lower === 'askquestion';
+}
+
+function buildHistoryInteractionQueryKind(kind = '') {
+  if (kind === 'ask_question') return 'ask_question_interaction_query';
+  if (kind === 'create_plan') return 'create_plan_request_query';
+  return String(kind || '').trim();
+}
+
+function buildHistoryInteractionQueryRequest(kind = '', args = {}) {
+  if (kind === 'ask_question') {
+    return {
+      title: String(args.title || '').trim(),
+      questions: Array.isArray(args.questions) ? args.questions : [],
+    };
+  }
+  if (kind === 'create_plan') {
+    return {
+      name: String(args.name || '').trim(),
+      overview: String(args.overview || '').trim(),
+      plan: String(args.plan || '').trim(),
+      todos: Array.isArray(args.todos) ? args.todos : [],
+    };
+  }
+  return args && typeof args === 'object' ? args : {};
+}
+
+function formatAskQuestionAnswersForContinuation(answers = []) {
+  const lines = (Array.isArray(answers) ? answers : [])
+    .map((answer) => {
+      const questionId = String(answer?.questionId || '').trim() || 'question';
+      const selected = Array.isArray(answer?.selectedOptionIds) && answer.selectedOptionIds.length
+        ? `selected=${answer.selectedOptionIds.join(', ')}`
+        : '';
+      const freeform = String(answer?.freeformText || '').trim()
+        ? `freeform=${String(answer.freeformText).trim()}`
+        : '';
+      const detail = [selected, freeform].filter(Boolean).join('; ');
+      return `- ${questionId}${detail ? `: ${detail}` : ''}`;
+    })
+    .filter(Boolean);
+  return lines.join('\n');
+}
+
+function buildInteractionContinuationPrompt(pendingInteraction = {}, interactionResponse = {}) {
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  if (responseKind === 'ask_question_interaction_response' || pendingKind === 'ask_question') {
+    const askQuestion = interactionResponse?.askQuestion || {};
+    const status = String(askQuestion.kind || 'success').trim() || 'success';
+    const answersSummary = formatAskQuestionAnswersForContinuation(askQuestion.answers || []);
+    return [
+      'The pending AskQuestion interaction has completed. Continue the same plan turn from this clarification.',
+      `Interaction status: ${status}.`,
+      answersSummary ? `Answers:\n${answersSummary}` : 'Answers: none provided.',
+      'Do not ask the same clarification again. Use these answers to continue the plan immediately.',
+    ].join('\n');
+  }
+  if (responseKind === 'create_plan_request_response' || pendingKind === 'create_plan') {
+    const createPlan = interactionResponse?.createPlan || {};
+    const status = String(createPlan.kind || 'success').trim() || 'success';
+    const planUri = String(createPlan.planUri || '').trim();
+    const error = String(createPlan.error || '').trim();
+    return [
+      'The pending CreatePlan interaction has completed. Continue the same plan workflow from that plan state.',
+      `Interaction status: ${status}.`,
+      planUri ? `Plan URI: ${planUri}` : '',
+      error ? `Error: ${error}` : '',
+      'If the plan is approved, mirror the plan into TodoWrite and continue the workflow instead of recreating the same plan.',
+    ].filter(Boolean).join('\n');
+  }
+  return [
+    'A pending plan interaction has completed.',
+    `Interaction payload: ${JSON.stringify(interactionResponse || {})}`,
+    'Continue the same turn from this interaction result without restarting from scratch.',
+  ].join('\n');
+}
+
 function getPostToolTurnAction(session = {}, executions = [], context = {}, helpers = {}) {
   const successfulExecutions = Array.isArray(executions)
     ? executions.filter((entry) => entry?.execution?.ok)
@@ -58,6 +142,143 @@ function getPostToolTurnAction(session = {}, executions = [], context = {}, help
   void context;
   void helpers;
   return null;
+}
+
+function shouldDispatchInteractionQuery(session = {}, toolCall = {}, execution = null) {
+  if (!execution?.ok) return false;
+  void session;
+  return isPlanInteractionToolName(toolCall?.name || '');
+}
+
+function buildInteractionQuery(session = {}, toolCall = {}, toolCallId = '', queryId = 1) {
+  const toolName = String(toolCall?.name || '').trim().toLowerCase();
+  void session;
+  if (toolName === 'createplan') {
+    return {
+      queryId,
+      kind: 'create_plan',
+      frame: buildAgentCreatePlanQueryFrame(toolCall.arguments || {}, toolCallId, queryId),
+    };
+  }
+  if (toolName === 'askquestion') {
+    return {
+      queryId,
+      kind: 'ask_question',
+      frame: buildAgentAskQuestionQueryFrame(toolCall.arguments || {}, toolCallId, queryId),
+    };
+  }
+  return null;
+}
+
+function buildInteractionQueryHistoryItem(pendingInteraction = {}) {
+  return {
+    role: 'system',
+    kind: 'interaction_query',
+    tool_call_id: String(pendingInteraction.toolCallId || '').trim(),
+    payload: {
+      id: Number(pendingInteraction.queryId) || 0,
+      kind: buildHistoryInteractionQueryKind(pendingInteraction.kind),
+      tool_call_id: String(pendingInteraction.toolCallId || '').trim(),
+      tool_name: String(pendingInteraction.toolName || '').trim(),
+      request: buildHistoryInteractionQueryRequest(pendingInteraction.kind, pendingInteraction.arguments || {}),
+    },
+  };
+}
+
+function buildInteractionResponseHistoryItem(pendingInteraction = {}, interactionResponse = {}) {
+  return {
+    role: 'system',
+    kind: 'interaction_response',
+    payload: {
+      id: Number(interactionResponse?.id) || 0,
+      kind: String(interactionResponse?.kind || '').trim(),
+      tool_name: String(pendingInteraction?.toolName || '').trim(),
+      interaction_kind: String(pendingInteraction?.kind || interactionResponse?.kind || '').trim(),
+      query_id: Number(pendingInteraction?.queryId) || 0,
+      response: interactionResponse || {},
+    },
+  };
+}
+
+function buildInteractionResumeMessage(pendingInteraction = {}, interactionResponse = {}) {
+  return {
+    role: 'user',
+    content: buildInteractionContinuationPrompt(pendingInteraction, interactionResponse),
+  };
+}
+
+function getInteractionPendingKindFromResponse(interactionResponse = {}) {
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (responseKind === 'create_plan_request_response') return 'create_plan';
+  if (responseKind === 'ask_question_interaction_response') return 'ask_question';
+  return '';
+}
+
+function isSuccessfulCreatePlanInteractionResponse(interactionResponse = {}) {
+  return String(interactionResponse?.kind || '').trim() === 'create_plan_request_response'
+    && String(interactionResponse?.createPlan?.kind || '').trim() === 'success'
+    && Boolean(String(interactionResponse?.createPlan?.planUri || '').trim());
+}
+
+function buildPendingInteractionResumeState(session = {}, context = {}) {
+  return {
+    userText: String(context.userText || '').trim(),
+    upstreamMessages: Array.isArray(context.upstreamMessages)
+      ? context.upstreamMessages.map((message) => ({ ...message }))
+      : [],
+    capturedAt: context.capturedAt || new Date().toISOString(),
+    stableConversationId: String(context.stableConversationId || '').trim(),
+    requestId: String(context.requestId || session.requestId || '').trim(),
+  };
+}
+
+function buildWaitingForInteractionStatePatch(session = {}, context = {}) {
+  const since = String(context.since || '').trim() || new Date().toISOString();
+  return {
+    current_loop_status: 'waiting_for_interaction',
+    waiting_for_interaction: {
+      handoff: String(context.handoff || session.modeTurnHandoff || session.planTurnHandoff || '').trim(),
+      pending_count: Number(context.pendingCount) || 0,
+      since,
+    },
+    plan: context.plan || null,
+  };
+}
+
+function buildResumedInteractionStatePatch() {
+  return {
+    current_loop_status: 'running',
+    waiting_for_interaction: null,
+  };
+}
+
+function shouldFinalizeInteractionResponseTurn(session = {}, interactionResponse = {}, pendingInteraction = {}, helpers = {}) {
+  void session;
+  void interactionResponse;
+  void pendingInteraction;
+  void helpers;
+  return false;
+}
+
+function buildCompletedInteractionStatePatch(session = {}, interactionResponse = {}, pendingInteraction = {}, helpers = {}) {
+  const planUri = String(interactionResponse?.createPlan?.planUri || pendingInteraction?.arguments?.planUri || '').trim();
+  const planText = String(interactionResponse?.createPlan?.plan || pendingInteraction?.arguments?.plan || '').trim();
+  const pendingCount = Number(pendingInteraction?.queryId || 1) > 0 ? 1 : 0;
+  return {
+    current_loop_status: 'waiting_for_interaction',
+    waiting_for_interaction: {
+      handoff: 'create_plan',
+      pending_count: pendingCount,
+      since: new Date().toISOString(),
+    },
+    plan: (planText || planUri)
+      ? {
+        plan: planText || planUri,
+        plan_text: planText || '',
+        plan_uri: planUri,
+      }
+      : null,
+  };
 }
 
 function isLikelyReadOnlyShellCommand(command = '') {
@@ -139,6 +360,8 @@ function buildLocalRelayMessages(input = {}) {
     cursorModeReminder: readModeText('AGENT_MODE_PLAN', 'system_reminder.txt'),
     extraSystemLines: [
       'In plan mode, prioritize producing and confirming a plan before execution when the task is complex.',
+      'If key choices are still unresolved, use AskQuestion before CreatePlan.',
+      'Do not output the full plan as plain assistant text. Keep the plan content inside CreatePlan and checkpoint state.',
       'Do not write, edit, patch, or delete files unless the user explicitly asks to leave plan mode and execute.',
     ],
   });
@@ -187,7 +410,7 @@ function getMaxContinuationCount(session = {}, options = {}, helpers = {}) {
 }
 
 function shouldContinueIncompleteWork(session = {}, finalText = '', toolCalls = [], upstreamError = '', continuationCount = 0, options = {}, helpers = {}) {
-  if (session?.planTurnHandoff) return false;
+  if (session?.modeTurnHandoff || session?.planTurnHandoff) return false;
   if (upstreamError) return false;
   if (Array.isArray(toolCalls) && toolCalls.length) return false;
 
@@ -209,7 +432,7 @@ function shouldContinueIncompleteWork(session = {}, finalText = '', toolCalls = 
 }
 
 function shouldForceContinuationToolChoice(session = {}, finalText = '', options = {}, helpers = {}) {
-  if (session?.planTurnHandoff) return false;
+  if (session?.modeTurnHandoff || session?.planTurnHandoff) return false;
   const incompleteTodos = Array.isArray(helpers.getIncompleteTodos?.(session))
     ? helpers.getIncompleteTodos(session)
     : [];
@@ -232,7 +455,7 @@ function buildIncompleteContinuationMessage(session = {}, finalText = '', contin
   const maxContinuations = getMaxContinuationCount(session, options, helpers);
 
   const nextStepInstruction = !hasPlan
-    ? 'Plan mode still has not produced a CreatePlan result. Use CreatePlan now with a concise overview, the proposed plan, and 3-7 actionable todo items. Do not execute file mutations.'
+    ? 'Plan mode still has not produced a CreatePlan result. Use AskQuestion if important choices remain unclear; otherwise use CreatePlan now with a concise overview, the proposed plan, and 3-7 actionable todo items. Do not execute file mutations.'
     : (incompleteTodos.length
       ? 'There are still unfinished plan todos. Update TodoWrite if needed, then provide the confirmation-ready plan summary for the user. Do not execute file mutations.'
       : 'Provide the confirmation-ready plan summary now. Do not execute file mutations.');
@@ -256,7 +479,7 @@ function buildIncompleteContinuationMessage(session = {}, finalText = '', contin
 }
 
 function hasIncompleteWorkAtEnd(session = {}, finalText = '', toolCalls = [], upstreamError = '', options = {}, helpers = {}) {
-  if (session?.planTurnHandoff) return false;
+  if (session?.modeTurnHandoff || session?.planTurnHandoff) return false;
   if (upstreamError) return false;
   if (Array.isArray(toolCalls) && toolCalls.length) return false;
 
@@ -277,8 +500,24 @@ module.exports = {
   buildToolDefinitionsForResponses,
   buildLocalRelayMessages,
   shouldUseNativeExecForTool,
+  getUpstreamRequestOptions() {
+    return {
+      preferredEndpointMode: 'chat',
+    };
+  },
   interceptToolExecution,
   getPostToolTurnAction,
+  shouldDispatchInteractionQuery,
+  buildInteractionQuery,
+  buildInteractionQueryHistoryItem,
+  buildInteractionResponseHistoryItem,
+  buildInteractionResumeMessage,
+  getInteractionPendingKindFromResponse,
+  buildPendingInteractionResumeState,
+  buildWaitingForInteractionStatePatch,
+  buildResumedInteractionStatePatch,
+  shouldFinalizeInteractionResponseTurn,
+  buildCompletedInteractionStatePatch,
   getMaxContinuationCount,
   shouldContinueIncompleteWork,
   shouldForceContinuationToolChoice,

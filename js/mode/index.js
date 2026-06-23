@@ -36,10 +36,20 @@ function shouldUseNativeExecForModeTool(session, toolCall, helpers = {}) {
   return getModeHandler(modeName).shouldUseNativeExecForTool(session, toolCall, helpers);
 }
 
+function getUpstreamRequestOptionsForMode(modeName = '', context = {}) {
+  const normalizedMode = normalizeAgentModeName(modeName || context.mode || 'AGENT_MODE_AGENT');
+  const handler = getModeHandler(normalizedMode);
+  if (typeof handler.getUpstreamRequestOptions === 'function') {
+    return handler.getUpstreamRequestOptions({ ...context, mode: normalizedMode }) || {};
+  }
+  return {};
+}
+
 module.exports = {
   getModeHandler,
   buildToolDefinitionsForChatByMode,
   buildToolDefinitionsForResponsesByMode,
   buildLocalRelayMessagesForMode,
   shouldUseNativeExecForModeTool,
+  getUpstreamRequestOptionsForMode,
 };

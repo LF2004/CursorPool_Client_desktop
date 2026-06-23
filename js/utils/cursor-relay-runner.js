@@ -28,8 +28,6 @@ const {
   buildAgentToolCallCompletedFrame,
   buildAgentEditToolCallDeltaFrame,
   buildAgentConversationCheckpointFrame,
-  buildAgentAskQuestionQueryFrame,
-  buildAgentCreatePlanQueryFrame,
   buildAgentExecReadFrame,
   buildAgentExecWriteFrame,
   buildAgentExecDeleteFrame,
@@ -47,6 +45,7 @@ const {
   beginTurn: beginAgentHistoryTurn,
   appendHistoryItem: appendAgentHistoryItem,
   completeTurn: completeAgentHistoryTurn,
+  updateConversationState: updateAgentHistoryConversationState,
   updateUsage: updateAgentHistoryUsage,
 } = require('./cursor-relay-agent-history');
 const {
@@ -66,6 +65,7 @@ const {
   buildToolDefinitionsForResponsesByMode,
   buildLocalRelayMessagesForMode,
   shouldUseNativeExecForModeTool,
+  getUpstreamRequestOptionsForMode,
 } = require('../mode');
 const {
   isTodoToolName,
@@ -457,7 +457,10 @@ function toChatMessages(messages = [], options = {}) {
   });
 }
 
-function prefersResponsesApi(upstream = {}) {
+function prefersResponsesApi(upstream = {}, options = {}) {
+  const preferred = String(options.preferredEndpointMode || '').trim().toLowerCase();
+  if (preferred === 'chat') return false;
+  if (preferred === 'responses') return true;
   const providerId = String(upstream.providerId || '').trim().toLowerCase();
   if (providerId.includes('gemini') || isMimoProvider(upstream)) return false;
   return String(upstream.endpointMode || 'responses').trim().toLowerCase() !== 'chat';
@@ -573,7 +576,7 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
       }),
     },
   };
-  return prefersResponsesApi(upstream) ? [responsesAttempt, chatAttempt] : [chatAttempt, responsesAttempt];
+  return prefersResponsesApi(upstream, options) ? [responsesAttempt, chatAttempt] : [chatAttempt, responsesAttempt];
 }
 
 function shouldRetryAlternateEndpoint(status, bodyText = '') {
@@ -1401,6 +1404,152 @@ function findWaitingSessionByStableConversationId(agentSessions, stableConversat
   return null;
 }
 
+function getPendingInteractionEntriesForSession(session = {}) {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  if (!pendingAgentInteractions?.size) return [];
+  const stableConversationId = getSessionStableConversationId(session);
+  const requestId = String(session.requestId || '').trim();
+  return Array.from(pendingAgentInteractions.values())
+    .filter((entry) => {
+      const entryStableConversationId = String(entry?.stableConversationId || '').trim();
+      const entryRequestId = String(entry?.requestId || '').trim();
+      if (stableConversationId && entryStableConversationId === stableConversationId) return true;
+      return Boolean(requestId) && entryRequestId === requestId;
+    })
+    .sort((a, b) => String(a?.createdAt || '').localeCompare(String(b?.createdAt || '')));
+}
+
+function clearPendingInteractionEntriesForSession(session = {}) {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  if (!pendingAgentInteractions?.size) return 0;
+  const entries = getPendingInteractionEntriesForSession(session);
+  let cleared = 0;
+  for (const entry of entries) {
+    const key = String(entry?.key || '').trim();
+    if (!key) continue;
+    if (pendingAgentInteractions.delete(key)) cleared += 1;
+  }
+  return cleared;
+}
+
+function rebindSessionPendingInteractionRequestIds(session = {}, previousRequestId = '', nextRequestId = '') {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  const fromRequestId = String(previousRequestId || '').trim();
+  const toRequestId = String(nextRequestId || '').trim();
+  if (!pendingAgentInteractions?.size || !fromRequestId || !toRequestId || fromRequestId === toRequestId) return 0;
+  let rebound = 0;
+  for (const [key, entry] of pendingAgentInteractions.entries()) {
+    if (!entry || String(entry.requestId || '').trim() !== fromRequestId) continue;
+    const updated = {
+      ...entry,
+      requestId: toRequestId,
+      key: `${toRequestId}:${Number(entry.queryId) || 0}:${String(entry.kind || '').trim()}`,
+    };
+    pendingAgentInteractions.delete(key);
+    pendingAgentInteractions.set(updated.key, updated);
+    rebound += 1;
+  }
+  return rebound;
+}
+
+function rebindWaitingSessionRequestId(session = {}, nextRequestId = '', logger = null) {
+  const previousRequestId = String(session.requestId || '').trim();
+  const normalizedNextRequestId = String(nextRequestId || '').trim();
+  if (!session || !normalizedNextRequestId || previousRequestId === normalizedNextRequestId) return 0;
+  if (previousRequestId) session.agentSessions?.delete(previousRequestId);
+  session.requestId = normalizedNextRequestId;
+  session.agentSessions?.set(normalizedNextRequestId, session);
+  const rebound = rebindSessionPendingInteractionRequestIds(session, previousRequestId, normalizedNextRequestId);
+  logger?.info?.(
+    `agent local relay rebound waiting session requestId=${previousRequestId || '-'} -> ${normalizedNextRequestId} pendingInteractions=${rebound}`
+  );
+  return rebound;
+}
+
+function replayPendingInteractionQueries(session = {}, logger = null) {
+  const pendingEntries = getPendingInteractionEntriesForSession(session);
+  if (!pendingEntries.length) return 0;
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  let replayed = 0;
+  for (const pendingInteraction of pendingEntries) {
+    if (!pendingInteraction?.queryId || !pendingInteraction?.kind) continue;
+    if (typeof handler.buildInteractionQuery !== 'function') continue;
+    const replay = handler.buildInteractionQuery(
+      session,
+      {
+        name: pendingInteraction.toolName,
+        arguments: pendingInteraction.arguments || {},
+      },
+      pendingInteraction.toolCallId || '',
+      Number(pendingInteraction.queryId) || 0,
+      helpers,
+    );
+    if (!replay?.frame) continue;
+    writeAgentFrame(session, replay.frame);
+    replayed += 1;
+    logger?.info?.(
+      `agent local relay replayed interaction_query requestId=${session.requestId || '-'} queryId=${pendingInteraction.queryId} kind=${pendingInteraction.kind} tool=${pendingInteraction.toolName || '-'}`
+    );
+  }
+  return replayed;
+}
+
+function isPlaceholderRunSseSession(session = {}) {
+  return Boolean(
+    session
+    && session.active
+    && !session.aborted
+    && !session.completed
+    && !session.relaying
+    && !session.waitingForInteraction
+    && !session.streamDetached
+    && !session.agentHistory
+    && !session.lastUserMessageCapture
+  );
+}
+
+function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logger) {
+  if (!waitingSession || !placeholderSession || waitingSession === placeholderSession) return null;
+  clearInterval(placeholderSession.heartbeat);
+  placeholderSession.heartbeat = null;
+  waitingSession.req = placeholderSession.req;
+  waitingSession.res = placeholderSession.res;
+  waitingSession.rawBody = placeholderSession.rawBody;
+  waitingSession.generatedChunks = Array.isArray(placeholderSession.generatedChunks)
+    ? placeholderSession.generatedChunks.slice()
+    : [];
+  waitingSession.turnEnded = false;
+  waitingSession.connectEnded = false;
+  waitingSession.completed = false;
+  waitingSession.intercepted = true;
+  waitingSession.streamDetached = false;
+  waitingSession.relaying = false;
+  waitingSession.active = true;
+  waitingSession.aborted = false;
+  startAgentHeartbeat(waitingSession);
+
+  placeholderSession.req = null;
+  placeholderSession.res = null;
+  placeholderSession.rawBody = null;
+  placeholderSession.generatedChunks = [];
+  placeholderSession.active = false;
+  placeholderSession.completed = true;
+  placeholderSession.intercepted = false;
+  placeholderSession.waitingForInteraction = false;
+  placeholderSession.relaying = false;
+  if (placeholderSession.requestId) placeholderSession.agentSessions?.delete(placeholderSession.requestId);
+  if (placeholderSession.requestId) {
+    rebindWaitingSessionRequestId(waitingSession, placeholderSession.requestId, logger);
+  }
+
+  logger?.info?.(
+    `agent local relay adopted placeholder RunSSE requestId=${placeholderSession.requestId || '-'} into waiting session requestId=${waitingSession.requestId || '-'}`
+  );
+  replayPendingInteractionQueries(waitingSession, logger);
+  return waitingSession;
+}
+
 function getAgentTurnScopeKey(requestId, userText, workspaceRoot = '', debug = null) {
   const textHash = hashRelayText(userText);
   const normalizedWorkspace = normalizeWorkspaceRoot(workspaceRoot || '') || '';
@@ -1587,6 +1736,12 @@ function clearTimer(timer) {
 function beginInterceptedAgentSession(session, logger) {
   if (!session?.active || session.intercepted) return;
   session.intercepted = true;
+  try {
+    if (typeof session.res?.socket?.setNoDelay === 'function') session.res.socket.setNoDelay(true);
+    if (typeof session.res?.socket?.setKeepAlive === 'function') session.res.socket.setKeepAlive(true, 1000);
+  } catch {
+    /* ignore socket tuning failures */
+  }
   session.res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -1602,6 +1757,10 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
   if (!session?.agentHistory || session.historyCompleted) return;
   session.historyCompleted = true;
   try {
+    updateSessionHistoryState(session, {
+      current_loop_status: status || 'completed',
+      waiting_for_interaction: null,
+    });
     completeAgentHistoryTurn(session.agentHistory, {
       status,
       modelCallId: modelCallId || `relay-${session.requestId || Date.now().toString(36)}`,
@@ -1614,7 +1773,7 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
 
 function abortAgentSession(session, logger, reason = 'aborted') {
   if (!session || session.aborted) return;
-  if (session.waitingForInteraction && (reason === 'runsse_closed' || reason === 'conversation_action_abort')) {
+  if (session.waitingForInteraction && reason === 'runsse_closed') {
     detachWaitingInteractionSession(session, logger, reason);
     return;
   }
@@ -1625,8 +1784,15 @@ function abortAgentSession(session, logger, reason = 'aborted') {
   session.aborted = true;
   session.active = false;
   session.relaying = false;
+  session.waitingForInteraction = false;
+  session.waitingInteractionSince = 0;
+  session.planTurnHandoff = '';
+  session.modeTurnHandoff = '';
+  session.streamDetached = false;
+  session.deferredInteractionResponse = null;
   clearInterval(session.heartbeat);
   session.heartbeat = null;
+  const clearedPendingInteractions = clearPendingInteractionEntriesForSession(session);
   try {
     session.abortController?.abort(new Error(reason));
   } catch {
@@ -1638,7 +1804,9 @@ function abortAgentSession(session, logger, reason = 'aborted') {
     completeSessionHistory(session, status, `abort-${session.requestId || ''}`);
   }
   markUpstreamUsageCompleted(session, session.config, 'stop', reason);
-  logger?.info?.(`agent local relay session aborted requestId=${session.requestId || '-'} reason=${reason}`);
+  logger?.info?.(
+    `agent local relay session aborted requestId=${session.requestId || '-'} reason=${reason} clearedPendingInteractions=${clearedPendingInteractions}`
+  );
 }
 
 function finalizeInterceptedAgentSession(session) {
@@ -1696,6 +1864,7 @@ function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
   session.streamDetached = false;
   session.relaying = false;
   beginInterceptedAgentSession(session, logger);
+  replayPendingInteractionQueries(session, logger);
   logger?.info?.(`agent local relay waiting session reattached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} deferred=${session.deferredInteractionResponse?.interactionResponse ? '1' : '0'}`);
   return session;
 }
@@ -2181,6 +2350,81 @@ function flushAgentTextToHistory(session) {
   });
 }
 
+function shouldSuppressVisiblePlanText(session = {}, options = {}) {
+  if (getSessionAgentMode(session) !== 'AGENT_MODE_PLAN') return false;
+  const phase = String(options.phase || '').trim();
+  return phase !== 'post_mutation_summary';
+}
+
+function stashSuppressedPlanText(session = {}, text = '') {
+  const value = String(text || '');
+  if (!value) return;
+  session.suppressedPlanText = `${session.suppressedPlanText || ''}${value}`;
+}
+
+function clearSuppressedPlanText(session = {}) {
+  session.suppressedPlanText = '';
+}
+
+function getPlanCheckpointText(session = {}, execution = null) {
+  const markdown = String(execution?.markdown || '').trim();
+  if (markdown) return markdown;
+  return String(session?.suppressedPlanText || '').trim();
+}
+
+function getPlanCheckpointTodos(session = {}, execution = null) {
+  const todos = Array.isArray(execution?.args?.todos)
+    ? execution.args.todos
+    : Array.isArray(session?.todos)
+      ? session.todos
+      : [];
+  return todos;
+}
+
+function emitPlanConversationCheckpointFrames(session, toolCall, execution, logger) {
+  if (!session?.active || !execution?.ok) return;
+  const planText = String(execution?.markdown || execution?.resultText || session?.suppressedPlanText || '').trim();
+  const planTodos = getPlanCheckpointTodos(session, execution);
+  if (!planText) return;
+  const workspaceRoot = getSessionWorkspaceRoot(session);
+  const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
+  try {
+    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
+      workspaceRoot,
+      rootPromptMessagesJson: session.rootPromptMessagesJson,
+      readPaths,
+      pendingToolCalls: [buildToolCallCheckpointJson(toolCall, execution, 'pending')],
+      plan: planText,
+      todos: planTodos,
+    }));
+    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
+      workspaceRoot,
+      rootPromptMessagesJson: session.rootPromptMessagesJson,
+      readPaths,
+      pendingToolCalls: [],
+      plan: planText,
+      todos: planTodos,
+    }));
+    logger?.info?.(`agent local relay plan checkpoint emitted requestId=${session.requestId || '-'} planChars=${planText.length} planPath=${JSON.stringify(execution?.planPath || '')}`);
+  } catch (error) {
+    logger?.error?.(`agent local relay plan checkpoint emit failed requestId=${session?.requestId || '-'}: ${error.message}`);
+  }
+}
+
+function buildPlanStateFromExecution(session = {}, execution = {}) {
+  const planText = String(execution?.markdown || execution?.resultText || session?.suppressedPlanText || '').trim();
+  const planUri = String(execution?.planPath || '').trim();
+  const todos = getPlanCheckpointTodos(session, execution);
+  return planText || planUri
+    ? {
+      plan: planText || planUri,
+      plan_text: planText || '',
+      plan_uri: planUri,
+      todos,
+    }
+    : null;
+}
+
 function writeAgentTextFrame(session, text, { tokenDelta = true, recordHistory = false } = {}) {
   const value = String(text || '');
   if (!value || !session?.active) return;
@@ -2378,6 +2622,24 @@ function appendSessionHistory(session, item) {
   } catch (error) {
     session?.logger?.warn?.(`agent history append failed requestId=${session?.requestId || '-'}: ${error.message}`);
   }
+}
+
+function updateSessionHistoryState(session, patch = {}) {
+  try {
+    updateAgentHistoryConversationState(getHistory(session), patch);
+  } catch (error) {
+    session?.logger?.warn?.(`agent history state update failed requestId=${session?.requestId || '-'}: ${error.message}`);
+  }
+}
+
+function appendInteractionQueryToHistory(session = {}, pendingInteraction = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  const item = typeof handler.buildInteractionQueryHistoryItem === 'function'
+    ? handler.buildInteractionQueryHistoryItem(pendingInteraction, helpers)
+    : null;
+  if (!item) return;
+  appendSessionHistory(session, item);
 }
 
 function appendLatestEditReminder(session, filePath) {
@@ -2847,40 +3109,38 @@ function buildExecServerFrameForTool(toolName, args = {}, toolCallId = '', numer
   return null;
 }
 
-function isInteractionQueryToolName(toolName = '') {
-  const lower = String(toolName || '').trim().toLowerCase();
-  return lower === 'createplan' || lower === 'askquestion';
-}
-
 function nextInteractionQueryId(session = {}) {
   session.nextInteractionQueryId = (Number(session.nextInteractionQueryId) || 0) + 1;
   return session.nextInteractionQueryId;
 }
 
 function shouldDispatchInteractionQueryForTool(session = {}, toolCall = {}, execution = null) {
-  if (!execution?.ok) return false;
-  if (getSessionAgentMode(session) !== 'AGENT_MODE_PLAN') return false;
-  return isInteractionQueryToolName(toolCall?.name || '');
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldDispatchInteractionQuery !== 'function') return false;
+  return Boolean(handler.shouldDispatchInteractionQuery(session, toolCall, execution, helpers));
 }
 
 function buildInteractionQueryFrameForTool(session = {}, toolCall = {}, toolCallId = '') {
-  const toolName = String(toolCall?.name || '').trim().toLowerCase();
   const queryId = nextInteractionQueryId(session);
-  if (toolName === 'createplan') {
-    return {
-      queryId,
-      kind: 'create_plan',
-      frame: buildAgentCreatePlanQueryFrame(toolCall.arguments || {}, toolCallId, queryId),
-    };
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildInteractionQuery !== 'function') return null;
+  return handler.buildInteractionQuery(session, toolCall, toolCallId, queryId, helpers);
+}
+
+function getInteractionPendingKindFromResponseByMode(session = {}, interactionResponse = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.getInteractionPendingKindFromResponse === 'function') {
+    const resolved = handler.getInteractionPendingKindFromResponse(interactionResponse, helpers);
+    if (resolved) return String(resolved).trim();
   }
-  if (toolName === 'askquestion') {
-    return {
-      queryId,
-      kind: 'ask_question',
-      frame: buildAgentAskQuestionQueryFrame(toolCall.arguments || {}, toolCallId, queryId),
-    };
-  }
-  return null;
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (responseKind === 'create_plan_request_response') return 'create_plan';
+  if (responseKind === 'ask_question_interaction_response') return 'ask_question';
+  if (responseKind === 'web_search_request_response') return 'web_search';
+  return '';
 }
 
 function registerPendingInteractionQuery(session = {}, payload = {}) {
@@ -2899,6 +3159,7 @@ function registerPendingInteractionQuery(session = {}, payload = {}) {
     toolName: String(payload.toolName || '').trim(),
     arguments: payload.arguments || {},
     execution: payload.execution || null,
+    modeName: normalizeAgentModeName(payload.modeName || getSessionAgentMode(session)),
     stableConversationId: String(payload.stableConversationId || '').trim(),
     workspaceRoot: String(payload.workspaceRoot || '').trim(),
     resumeState: payload.resumeState || null,
@@ -2909,13 +3170,6 @@ function registerPendingInteractionQuery(session = {}, payload = {}) {
 function findPendingInteractionQuery(pendingAgentInteractions, requestId = '', interactionResponse = {}) {
   if (!pendingAgentInteractions?.size || !requestId) return null;
   const responseId = Number(interactionResponse?.id) || 0;
-  const responseKind = interactionResponse?.kind === 'create_plan_request_response'
-    ? 'create_plan'
-    : interactionResponse?.kind === 'ask_question_interaction_response'
-      ? 'ask_question'
-      : interactionResponse?.kind === 'web_search_request_response'
-        ? 'web_search'
-      : '';
   const stableConversationId = String(
     interactionResponse?.stableConversationId
     || interactionResponse?.conversationId
@@ -2925,6 +3179,10 @@ function findPendingInteractionQuery(pendingAgentInteractions, requestId = '', i
     .filter((entry) => entry?.requestId === requestId || (stableConversationId && entry?.stableConversationId === stableConversationId))
     .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
   if (!candidates.length) return null;
+  const modeSession = {
+    agentMode: normalizeAgentModeName(candidates[0]?.modeName || agentSessions.get(requestId)?.agentMode || 'AGENT_MODE_AGENT'),
+  };
+  const responseKind = getInteractionPendingKindFromResponseByMode(modeSession, interactionResponse);
   if (responseId > 0) {
     const exact = candidates.find((entry) => Number(entry.queryId) === responseId && (!responseKind || entry.kind === responseKind));
     if (exact) return exact;
@@ -2960,50 +3218,9 @@ function findPendingInteractionQueryByExecution(session = {}, executionEntry = {
   return candidates[0];
 }
 
-function formatAskQuestionAnswersForContinuation(answers = []) {
-  const lines = (Array.isArray(answers) ? answers : [])
-    .map((answer) => {
-      const questionId = String(answer?.questionId || '').trim() || 'question';
-      const selected = Array.isArray(answer?.selectedOptionIds) && answer.selectedOptionIds.length
-        ? `selected=${answer.selectedOptionIds.join(', ')}`
-        : '';
-      const freeform = String(answer?.freeformText || '').trim()
-        ? `freeform=${String(answer.freeformText).trim()}`
-        : '';
-      const detail = [selected, freeform].filter(Boolean).join('; ');
-      return `- ${questionId}${detail ? `: ${detail}` : ''}`;
-    })
-    .filter(Boolean);
-  return lines.join('\n');
-}
-
 function buildInteractionContinuationPrompt(pendingInteraction = {}, interactionResponse = {}) {
   const responseKind = String(interactionResponse?.kind || '').trim();
   const pendingKind = String(pendingInteraction?.kind || '').trim();
-  if (responseKind === 'ask_question_interaction_response' || pendingKind === 'ask_question') {
-    const askQuestion = interactionResponse?.askQuestion || {};
-    const status = String(askQuestion.kind || 'success').trim() || 'success';
-    const answersSummary = formatAskQuestionAnswersForContinuation(askQuestion.answers || []);
-    return [
-      'The pending AskQuestion interaction has completed. Continue the same plan turn from this clarification.',
-      `Interaction status: ${status}.`,
-      answersSummary ? `Answers:\n${answersSummary}` : 'Answers: none provided.',
-      'Do not ask the same clarification again. Use these answers to continue the plan immediately.',
-    ].join('\n');
-  }
-  if (responseKind === 'create_plan_request_response' || pendingKind === 'create_plan') {
-    const createPlan = interactionResponse?.createPlan || {};
-    const status = String(createPlan.kind || 'success').trim() || 'success';
-    const planUri = String(createPlan.planUri || '').trim();
-    const error = String(createPlan.error || '').trim();
-    return [
-      'The pending CreatePlan interaction has completed. Continue the same plan workflow from that plan state.',
-      `Interaction status: ${status}.`,
-      planUri ? `Plan URI: ${planUri}` : '',
-      error ? `Error: ${error}` : '',
-      'If the plan is approved, mirror the plan into TodoWrite and continue the workflow instead of recreating the same plan.',
-    ].filter(Boolean).join('\n');
-  }
   if (responseKind === 'web_search_request_response' || pendingKind === 'web_search') {
     return [
       'The pending WebSearch interaction has completed.',
@@ -3023,9 +3240,14 @@ function buildPendingInteractionResumeMessages(session = {}, pendingInteraction 
   const baseMessages = Array.isArray(resumeState.upstreamMessages)
     ? resumeState.upstreamMessages.map((message) => ({ ...message }))
     : buildLocalRelayMessages(resumeState.userText || session.lastUserMessageCapture?.userText || '', session);
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  const resumeMessage = typeof handler.buildInteractionResumeMessage === 'function'
+    ? handler.buildInteractionResumeMessage(pendingInteraction, interactionResponse, helpers)
+    : null;
   return [
     ...baseMessages,
-    {
+    resumeMessage || {
       role: 'user',
       content: buildInteractionContinuationPrompt(pendingInteraction, interactionResponse),
     },
@@ -3033,19 +3255,13 @@ function buildPendingInteractionResumeMessages(session = {}, pendingInteraction 
 }
 
 function appendInteractionResponseToHistory(session = {}, pendingInteraction = {}, interactionResponse = {}) {
-  appendSessionHistory(session, {
-    role: 'system',
-    kind: 'metadata',
-    payload: {
-      type: 'interaction_response',
-      value: {
-        tool_name: String(pendingInteraction?.toolName || '').trim(),
-        interaction_kind: String(pendingInteraction?.kind || interactionResponse?.kind || '').trim(),
-        query_id: Number(pendingInteraction?.queryId) || 0,
-        response: interactionResponse || {},
-      },
-    },
-  });
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  const item = typeof handler.buildInteractionResponseHistoryItem === 'function'
+    ? handler.buildInteractionResponseHistoryItem(pendingInteraction, interactionResponse, helpers)
+    : null;
+  if (!item) return;
+  appendSessionHistory(session, item);
 }
 
 function updatePendingInteractionResumeState(session = {}, executions = [], upstreamMessages = [], toolResultMessages = [], streamedText = '', userText = '') {
@@ -3061,13 +3277,14 @@ function updatePendingInteractionResumeState(session = {}, executions = [], upst
   for (const executionEntry of waitingExecutions) {
     const pendingInteraction = findPendingInteractionQueryByExecution(session, executionEntry);
     if (!pendingInteraction) continue;
-    pendingInteraction.resumeState = {
-      userText: String(userText || '').trim(),
+    pendingInteraction.resumeState = buildPendingInteractionResumeStateByMode(session, pendingInteraction, {
+      userText,
       upstreamMessages: resumeMessages,
       capturedAt: new Date().toISOString(),
       stableConversationId: getSessionStableConversationId(session),
       requestId: String(session.requestId || '').trim(),
-    };
+      executionEntry,
+    });
     updated += 1;
   }
   return updated;
@@ -3502,7 +3719,7 @@ async function collectPostMutationSummary({
       configuredModel,
       compacted.messages,
       logger,
-      {
+      buildFetchUpstreamOptionsForSession(session, {
         enableTools: false,
         signal: session.abortController?.signal || null,
         timeoutMs: POST_MUTATION_SUMMARY_TIMEOUT_MS,
@@ -3511,7 +3728,7 @@ async function collectPostMutationSummary({
         mode: agentMode,
         outboundProxy: config.outboundProxy || null,
         localProxyPort: config.port,
-      },
+      }, { phase: 'post_mutation_summary', agentMode }),
     );
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
@@ -4089,6 +4306,20 @@ function getModeHandlerForSession(session = {}) {
   return getModeHandler(getSessionAgentMode(session));
 }
 
+function getUpstreamRequestOptionsByMode(session = {}, context = {}) {
+  return getUpstreamRequestOptionsForMode(getSessionAgentMode(session), {
+    ...context,
+    session,
+  });
+}
+
+function buildFetchUpstreamOptionsForSession(session = {}, baseOptions = {}, context = {}) {
+  return {
+    ...getUpstreamRequestOptionsByMode(session, context),
+    ...baseOptions,
+  };
+}
+
 function interceptToolExecutionByMode(session = {}, toolCall = {}, context = {}) {
   const handler = getModeHandlerForSession(session);
   if (typeof handler.interceptToolExecution !== 'function') return null;
@@ -4141,6 +4372,47 @@ function getPostToolTurnActionByMode(session = {}, executions = [], context = {}
   const helpers = buildModeRuntimeHelpers(session);
   if (typeof handler.getPostToolTurnAction !== 'function') return null;
   return handler.getPostToolTurnAction(session, executions, context, helpers);
+}
+
+function buildPendingInteractionResumeStateByMode(session = {}, pendingInteraction = {}, context = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildPendingInteractionResumeState === 'function') {
+    return handler.buildPendingInteractionResumeState(session, {
+      ...context,
+      pendingInteraction,
+    }, helpers);
+  }
+  return {
+    userText: String(context.userText || '').trim(),
+    upstreamMessages: Array.isArray(context.upstreamMessages)
+      ? context.upstreamMessages.map((message) => ({ ...message }))
+      : [],
+    capturedAt: context.capturedAt || new Date().toISOString(),
+    stableConversationId: String(context.stableConversationId || '').trim(),
+    requestId: String(context.requestId || session.requestId || '').trim(),
+  };
+}
+
+function shouldFinalizeInteractionResponseTurnByMode(session = {}, interactionResponse = {}, pendingInteraction = null) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldFinalizeInteractionResponseTurn === 'function') {
+    return Boolean(handler.shouldFinalizeInteractionResponseTurn(session, interactionResponse, pendingInteraction, helpers));
+  }
+  return false;
+}
+
+function buildCompletedInteractionStatePatchByMode(session = {}, interactionResponse = {}, pendingInteraction = null) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildCompletedInteractionStatePatch === 'function') {
+    return handler.buildCompletedInteractionStatePatch(session, interactionResponse, pendingInteraction, helpers);
+  }
+  return {
+    current_loop_status: 'completed',
+    waiting_for_interaction: null,
+  };
 }
 
 function hasIncompleteWorkAtEndByMode(session = {}, finalText = '', toolCalls = [], upstreamError = '', options = {}) {
@@ -4642,6 +4914,7 @@ async function executeRelayTool(toolCall, session, logger) {
       const fileName = `${sanitizePlanFilename(args.name || 'plan')}.md`;
       const planPath = path.join(planDir, fileName);
       fs.writeFileSync(planPath, markdown, 'utf8');
+      const todos = updateSessionTodos(session, args.todos || [], false);
       return {
         ok: true,
         tool: 'CreatePlan',
@@ -4649,7 +4922,7 @@ async function executeRelayTool(toolCall, session, logger) {
           name: String(args.name || '').trim(),
           overview: String(args.overview || '').trim(),
           plan: String(args.plan || '').trim(),
-          todos: Array.isArray(args.todos) ? args.todos : [],
+          todos,
         },
         resultText: `Plan created at ${planPath}`,
         planPath,
@@ -4917,7 +5190,9 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
         if (!text) return;
         textParts.push(text);
         lastTextAt = Date.now();
-        if (options.emit !== false) {
+        if (shouldSuppressVisiblePlanText(session, options)) {
+          stashSuppressedPlanText(session, text);
+        } else if (options.emit !== false) {
           writeAgentTextFrame(session, text);
         }
       }
@@ -4950,7 +5225,9 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
     const tailText = textFilter ? textFilter.flush() : '';
     if (tailText && session.active && !session.aborted) {
       textParts.push(tailText);
-      if (options.emit !== false) {
+      if (shouldSuppressVisiblePlanText(session, options)) {
+        stashSuppressedPlanText(session, tailText);
+      } else if (options.emit !== false) {
         writeAgentTextFrame(session, tailText);
       }
     }
@@ -4967,7 +5244,7 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
     session.logger?.info?.(
       `agent local relay upstream stream end requestId=${session.requestId || '-'} phase=${phase} deltaCount=${deltaCount} textLen=${textParts.join('').length} reasoningLen=${reasoningParts.join('').length} toolCalls=${normalizeCollectedToolCalls(toolState).length} eventTypes=${JSON.stringify(eventTypes)} error=${JSON.stringify(upstreamError)} durationMs=${durationMs}`,
     );
-    if (options.emit !== false && textParts.join('').trim()) {
+    if (options.emit !== false && textParts.join('').trim() && !shouldSuppressVisiblePlanText(session, options)) {
       flushAgentTextToHistory(session);
     }
   }
@@ -5197,6 +5474,13 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
           workspaceRoot: getSessionWorkspaceRoot(session),
           createdAt: new Date().toISOString(),
         });
+        appendInteractionQueryToHistory(session, {
+          queryId: interactionQueryDispatch.queryId,
+          kind: interactionQueryDispatch.kind,
+          toolCallId,
+          toolName: historyToolName,
+          arguments: toolCall.arguments || {},
+        });
         logger.info(
           `agent local relay interaction_query sent requestId=${requestId} tool=${toolCall.name} queryId=${interactionQueryDispatch.queryId} kind=${interactionQueryDispatch.kind}`,
         );
@@ -5222,6 +5506,22 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
         );
       }
       if (!interactionQueryDispatch) emitVisibleToolResultSummary(session, toolCall, execution);
+      if (String(toolCall.name || '').trim().toLowerCase() === 'createplan' && execution?.ok) {
+        session.planTurnHandoff = 'create_plan';
+        const planState = buildPlanStateFromExecution(session, execution);
+        if (planState) {
+          updateSessionHistoryState(session, {
+            current_loop_status: 'waiting_for_interaction',
+            waiting_for_interaction: {
+              handoff: 'create_plan',
+              pending_count: 1,
+              since: new Date().toISOString(),
+            },
+            plan: planState,
+          });
+        }
+        emitPlanConversationCheckpointFrames(session, { ...toolCall, id: toolCallId }, execution, logger);
+      }
       if (isMutation && execution?.ok) {
         emitAgentMutationCheckpointFrames(session, { ...toolCall, id: toolCallId }, execution, logger);
         appendLatestEditReminder(session, execution.args?.path || toolCall.arguments?.path || '');
@@ -5233,20 +5533,22 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       execution,
       toolCallId,
     );
-    appendSessionHistory(session, {
-      role: 'tool',
-      kind: 'tool_result',
-      tool_call_id: toolCallId,
-      payload: {
+    if (!execution?.awaitingInteractionResponse) {
+      appendSessionHistory(session, {
+        role: 'tool',
+        kind: 'tool_result',
         tool_call_id: toolCallId,
-        tool_name: historyToolName,
-        arguments: JSON.stringify(toolCall.arguments || {}),
-        result_text: execution?.resultText || '',
-        ok: Boolean(execution?.ok),
-        duration_ms: Number(execution?.durationMs) || 0,
-        ...(structuredToolCall ? { tool_call: structuredToolCall } : {}),
-      },
-    });
+        payload: {
+          tool_call_id: toolCallId,
+          tool_name: historyToolName,
+          arguments: JSON.stringify(toolCall.arguments || {}),
+          result_text: execution?.resultText || '',
+          ok: Boolean(execution?.ok),
+          duration_ms: Number(execution?.durationMs) || 0,
+          ...(structuredToolCall ? { tool_call: structuredToolCall } : {}),
+        },
+      });
+    }
     session.toolResultSummaries.push({
       tool: historyToolName,
       ok: Boolean(execution?.ok),
@@ -5342,10 +5644,37 @@ async function continueAgentStreamLoop(session, options = {}) {
           streamed.text || '',
           userText,
         );
-        if (updatedInteractions > 0) {
-          session.waitingForInteraction = true;
-          session.waitingInteractionSince = Date.now();
-          session.unfinishedWorkAtEnd = false;
+      if (updatedInteractions > 0) {
+        session.waitingForInteraction = true;
+        session.waitingInteractionSince = Date.now();
+        session.unfinishedWorkAtEnd = false;
+        const handler = getModeHandlerForSession(session);
+        const helpers = buildModeRuntimeHelpers(session);
+        const planState = String(toolCall.name || '').trim().toLowerCase() === 'createplan'
+          ? buildPlanStateFromExecution(session, execution)
+          : (session.suppressedPlanText ? {
+            plan: String(session.suppressedPlanText || '').trim(),
+            plan_text: String(session.suppressedPlanText || '').trim(),
+            plan_uri: String(execution?.planPath || '').trim(),
+            todos: Array.isArray(session.todos) ? session.todos : [],
+          } : null);
+        const statePatch = typeof handler.buildWaitingForInteractionStatePatch === 'function'
+          ? handler.buildWaitingForInteractionStatePatch(session, {
+              handoff: session.planTurnHandoff,
+              pendingCount: updatedInteractions,
+              since: new Date(session.waitingInteractionSince).toISOString(),
+              plan: planState,
+            }, helpers)
+          : {
+              current_loop_status: 'waiting_for_interaction',
+              waiting_for_interaction: {
+                handoff: String(session.planTurnHandoff || '').trim(),
+                pending_count: Number(updatedInteractions) || 0,
+                since: new Date(session.waitingInteractionSince).toISOString(),
+              },
+              plan: planState,
+            };
+        updateSessionHistoryState(session, statePatch);
           logger?.info?.(
             `agent local relay waiting for interaction_response requestId=${requestId} step=${toolStep} handoff=${session.planTurnHandoff} pendingInteractions=${updatedInteractions}`,
           );
@@ -5422,7 +5751,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             configuredModel,
             upstreamMessages,
             logger,
-            {
+            buildFetchUpstreamOptionsForSession(session, {
               enableTools: true,
               signal: session.abortController?.signal || null,
               timeoutMs: sawWriteTool
@@ -5433,7 +5762,7 @@ async function continueAgentStreamLoop(session, options = {}) {
               mode: agentMode,
               outboundProxy: config.outboundProxy || null,
               localProxyPort: config.port,
-            },
+            }, { phase: postToolPhase, agentMode, sawWriteTool }),
           ));
           upstreamMode = resumedMode || upstreamMode;
           if (!upstream.ok) {
@@ -5556,7 +5885,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             configuredModel,
             upstreamMessages,
             logger,
-            {
+            buildFetchUpstreamOptionsForSession(session, {
               enableTools: true,
               signal: session.abortController?.signal || null,
               timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
@@ -5565,7 +5894,7 @@ async function continueAgentStreamLoop(session, options = {}) {
               mode: agentMode,
               outboundProxy: config.outboundProxy || null,
               localProxyPort: config.port,
-            },
+            }, { phase: completionPhase, agentMode }),
           ));
           upstreamMode = resumedMode || upstreamMode;
           if (!upstream.ok) {
@@ -5675,7 +6004,7 @@ async function continueAgentStreamLoop(session, options = {}) {
           configuredModel,
           upstreamMessages,
           logger,
-          {
+          buildFetchUpstreamOptionsForSession(session, {
             enableTools: true,
             toolChoice: forceToolForContinuation ? 'required' : 'auto',
             signal: session.abortController?.signal || null,
@@ -5685,7 +6014,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             mode: agentMode,
             outboundProxy: config.outboundProxy || null,
             localProxyPort: config.port,
-          },
+          }, { phase: continuationPhase, agentMode, forceToolForContinuation }),
         ));
         upstreamMode = resumedMode || upstreamMode;
         if (!upstream.ok) {
@@ -5893,14 +6222,14 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
       configuredModel,
       compacted.messages,
       logger,
-      {
+      buildFetchUpstreamOptionsForSession(session, {
         signal: session.abortController?.signal || null,
         requestId,
         phase: 'interaction_resume',
         mode: agentMode,
         outboundProxy: config.outboundProxy || null,
         localProxyPort: config.port,
-      },
+      }, { phase: 'interaction_resume', agentMode }),
     ));
   } catch (error) {
     if (session.aborted) return;
@@ -5983,6 +6312,17 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
   if (!session.active || session.aborted) return;
   session.waitingForInteraction = false;
   session.planTurnHandoff = '';
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  updateSessionHistoryState(
+    session,
+    typeof handler.buildResumedInteractionStatePatch === 'function'
+      ? handler.buildResumedInteractionStatePatch(session, interactionResponse, pendingInteraction, helpers)
+      : {
+        current_loop_status: 'running',
+        waiting_for_interaction: null,
+      },
+  );
   await continueAgentStreamLoop(session, {
     userText,
     config,
@@ -6085,14 +6425,14 @@ ${String(userText || '')}
       configuredModel,
       upstreamMessages,
       logger,
-      {
+      buildFetchUpstreamOptionsForSession(session, {
         signal: session.abortController?.signal || null,
         requestId,
         phase: 'initial',
         mode: agentMode,
         outboundProxy: config.outboundProxy || null,
         localProxyPort: config.port,
-      },
+      }, { phase: 'initial', agentMode }),
     );
 
     const streamed = await streamAgentUpstreamResponse(upstream, session, {
@@ -6557,10 +6897,11 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       }
       const session = agentSessions.get(decoded.requestId);
       const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
-      if (!session?.active && waitingSession && !waitingSession.relaying) {
-        if (decoded.requestId && decoded.requestId !== waitingSession.requestId) {
-          agentSessions.set(decoded.requestId, waitingSession);
+      if (waitingSession && !waitingSession.relaying && waitingSession !== session) {
+        if (isPlaceholderRunSseSession(session)) {
+          adoptPlaceholderRunSseSession(waitingSession, session, logger);
         }
+        rebindWaitingSessionRequestId(waitingSession, decoded.requestId, logger);
         waitingSession.agentMode = capture.mode;
         waitingSession.lastUserMessageCapture = capture;
         waitingSession.workspaceRoot = workspaceRoot || waitingSession.workspaceRoot || '';

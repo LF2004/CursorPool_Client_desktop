@@ -1703,6 +1703,13 @@ function encodeStringMapEntry(key, valuePayload) {
   ]);
 }
 
+function encodeConversationPlanStructure(planText = '') {
+  const text = typeof planText === 'string' ? planText : '';
+  return concatBytes([
+    encodeOptionalStringField(1, text),
+  ]);
+}
+
 function buildAgentConversationCheckpointFrame(options = {}) {
   const workspaceRoot = normalizeCheckpointPath(options.workspaceRoot || '');
   const previousWorkspaceUri = options.previousWorkspaceUri || toWorkspaceUri(workspaceRoot);
@@ -1711,6 +1718,9 @@ function buildAgentConversationCheckpointFrame(options = {}) {
   const pendingToolCalls = Array.isArray(options.pendingToolCalls) ? options.pendingToolCalls : [];
   const readPaths = Array.isArray(options.readPaths) ? options.readPaths.map(normalizeCheckpointPath).filter(Boolean) : [];
   const fileStates = options.fileStates && typeof options.fileStates === 'object' ? options.fileStates : {};
+  const planText = typeof options.plan === 'string'
+    ? options.plan
+    : (typeof options.planText === 'string' ? options.planText : '');
   const fileStateEntries = Object.entries(fileStates)
     .filter(([key, state]) => key && state && typeof state === 'object')
     .map(([key, state]) => encodeBytesField(15, encodeStringMapEntry(
@@ -1725,6 +1735,7 @@ function buildAgentConversationCheckpointFrame(options = {}) {
     ...rootPromptMessagesJson.map((item) => encodeBytesField(1, Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'))),
     ...pendingToolCalls.map((item) => encodeBytesField(4, String(item || ''))),
     encodeBytesField(5, tokenDetails),
+    planText ? encodeBytesField(7, encodeConversationPlanStructure(planText)) : Buffer.alloc(0),
     ...turns.map((item) => encodeBytesField(8, Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'))),
     previousWorkspaceUri ? encodeBytesField(9, previousWorkspaceUri) : Buffer.alloc(0),
     encodeInt32Field(10, 1),
