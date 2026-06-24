@@ -71,6 +71,18 @@ const {
   isTodoToolName,
 } = require('../mode/common/policy');
 const {
+  PLAN_WORKFLOW_PHASES,
+  getDefaultPlanWorkflowState: getDefaultPlanWorkflowStateBase,
+  clonePlanWorkflowState: clonePlanWorkflowStateBase,
+  getPlanWorkflowPhaseFromState,
+  isPlanCheckpointVisiblePhase: isPlanCheckpointVisiblePhaseBase,
+  buildPlanWorkflowStateUpdate,
+  buildPlanWorkflowUpdateForToolExecution,
+  buildPlanWorkflowUpdateForInteractionResponse,
+  shouldAllowFreshPlanExploreDespiteDuplicate: shouldAllowFreshPlanExploreDespiteDuplicateState,
+  buildPlanWorkflowUpdateForConversationAction,
+} = require('../mode/plan-workflow');
+const {
   recordRelayUsage,
   updateRelayUsageBilledPoints,
   updateRelayUsageStatusForRequest,
@@ -101,10 +113,6 @@ const MAX_COMPLETION_VERIFICATION_ROUNDS = 0;
 const DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS = 16;
 const DEFAULT_MAX_INCOMPLETE_TODO_CONTINUATIONS = 0;
 const DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS = 6;
-const MAX_TRACKED_WEB_SEARCH_ATTEMPTS = 12;
-const MAX_SIMILAR_LOW_RELEVANCE_WEB_SEARCHES = 2;
-const MAX_WEB_SEARCH_CALLS_PER_ROUND = 2;
-const MAX_WEB_SEARCH_CALLS_PER_TURN = 2;
 const WEB_SEARCH_FETCH_TIMEOUT_MS = 4500;
 const POST_MUTATION_STOP_AFTER_TEXT_MS = 2500;
 const FORCE_MUTATION_AFTER_READ_ONLY_ROUNDS = 2;
@@ -118,39 +126,11 @@ const EDIT_STREAM_FLUSH_MS = 250;
 const EDIT_STREAM_FRAME_CHARS = 2048;
 const MAX_EDIT_STREAM_CONTENT_CHARS = 1400;
 const EXEC_CLIENT_WAIT_TIMEOUT_MS = 8000;
-const PLAN_WORKFLOW_PHASES = Object.freeze({
-  IDLE: 'idle',
-  PLANNING: 'planning',
-  AWAITING_ANSWERS: 'awaiting_answers',
-  ANSWERS_COLLECTED: 'answers_collected',
-  EXPLORING: 'exploring',
-  AWAITING_PLAN_PRESENTATION: 'awaiting_plan_presentation',
-  PLAN_PRESENTED: 'plan_presented',
-  EXECUTING: 'executing',
-  COMPLETED: 'completed',
-});
 const RECENT_EXECUTION_WORKSPACE_PATH = path.join(process.env.USERPROFILE || process.cwd(), '.cursorpool', 'relay', 'recent-execution-workspace.json');
 const DEFAULT_RELAY_SCAN_IGNORE = Object.freeze(['node_modules', '.git', 'dist', 'build']);
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
-
-const WEB_SEARCH_STOPWORDS = new Set([
-  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'link', 'links',
-  '官网', '官方', '教程', '使用', '设计', '一个', '网页',
-  'search', 'find', 'lookup', 'look', 'please', 'help',
-]);
-
-const WEB_SEARCH_WEAK_TOKENS = new Set([
-  'latest', 'news', 'today', 'free', 'best', 'top', 'new', 'official',
-  '国内', '热门', '免费', '好玩', '排名', '最新', '现在', '今年',
-]);
-
-const WEB_SEARCH_NEWS_INTENT_TOKENS = new Set([
-  'news', 'headline', 'headlines', 'article', 'articles',
-  '新闻', '资讯', '消息', '快讯', '头条', '报道',
-  'ニュース', '速報', '最新情報',
-]);
 
 function parseArgs(argv) {
   const out = {};
@@ -1525,32 +1505,11 @@ function getSessionScanIgnoreNames(session = {}, extra = []) {
 }
 
 function getDefaultPlanWorkflowState() {
-  return {
-    phase: PLAN_WORKFLOW_PHASES.IDLE,
-    updatedAt: new Date().toISOString(),
-    lastInteractionKind: '',
-    lastToolName: '',
-    currentRequestId: '',
-    draftPlanPath: '',
-    presentedPlanUri: '',
-    checkpointEmittedForPlanUri: '',
-    needsFreshExploreAfterAnswers: false,
-  };
+  return getDefaultPlanWorkflowStateBase();
 }
 
 function clonePlanWorkflowState(state = null) {
-  if (!state || typeof state !== 'object') return getDefaultPlanWorkflowState();
-  return {
-    phase: String(state.phase || PLAN_WORKFLOW_PHASES.IDLE).trim() || PLAN_WORKFLOW_PHASES.IDLE,
-    updatedAt: String(state.updatedAt || '').trim() || new Date().toISOString(),
-    lastInteractionKind: String(state.lastInteractionKind || '').trim(),
-    lastToolName: String(state.lastToolName || '').trim(),
-    currentRequestId: String(state.currentRequestId || '').trim(),
-    draftPlanPath: String(state.draftPlanPath || '').trim(),
-    presentedPlanUri: String(state.presentedPlanUri || '').trim(),
-    checkpointEmittedForPlanUri: String(state.checkpointEmittedForPlanUri || '').trim(),
-    needsFreshExploreAfterAnswers: state.needsFreshExploreAfterAnswers === true,
-  };
+  return clonePlanWorkflowStateBase(state);
 }
 
 function ensurePlanWorkflowState(session = {}) {
@@ -1560,7 +1519,7 @@ function ensurePlanWorkflowState(session = {}) {
 }
 
 function getPlanWorkflowPhase(session = {}) {
-  return String(ensurePlanWorkflowState(session).phase || PLAN_WORKFLOW_PHASES.IDLE).trim() || PLAN_WORKFLOW_PHASES.IDLE;
+  return getPlanWorkflowPhaseFromState(ensurePlanWorkflowState(session));
 }
 
 function isPlanModeSession(session = {}) {
@@ -1568,10 +1527,7 @@ function isPlanModeSession(session = {}) {
 }
 
 function isPlanCheckpointVisiblePhase(phase = '') {
-  const normalized = String(phase || '').trim();
-  return normalized === PLAN_WORKFLOW_PHASES.PLAN_PRESENTED
-    || normalized === PLAN_WORKFLOW_PHASES.EXECUTING
-    || normalized === PLAN_WORKFLOW_PHASES.COMPLETED;
+  return isPlanCheckpointVisiblePhaseBase(phase);
 }
 
 function getVisiblePlanState(session = {}) {
@@ -1593,116 +1549,63 @@ function syncPlanWorkflowState(session = {}) {
 
 function setPlanWorkflowPhase(session = {}, phase = PLAN_WORKFLOW_PHASES.IDLE, extra = {}) {
   if (!session) return null;
-  const current = ensurePlanWorkflowState(session);
-  const nextPhase = String(phase || PLAN_WORKFLOW_PHASES.IDLE).trim() || PLAN_WORKFLOW_PHASES.IDLE;
-  const next = {
-    ...current,
-    ...extra,
-    phase: nextPhase,
-    updatedAt: new Date().toISOString(),
-  };
-  if (!next.currentRequestId) {
-    next.currentRequestId = String(session.requestId || '').trim();
-  }
-  session.planWorkflow = next;
+  session.planWorkflow = buildPlanWorkflowStateUpdate(
+    ensurePlanWorkflowState(session),
+    phase,
+    extra,
+    String(session.requestId || '').trim(),
+  );
   return syncPlanWorkflowState(session);
 }
 
 function updatePlanWorkflowForToolExecution(session = {}, toolCall = {}, execution = {}) {
-  if (!isPlanModeSession(session) || !execution?.ok) return null;
-  const lower = String(toolCall?.name || execution?.tool || '').trim().toLowerCase();
-  if (lower === 'askquestion') {
-    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.AWAITING_ANSWERS, {
-      lastToolName: 'AskQuestion',
-      currentRequestId: String(session.requestId || '').trim(),
-      needsFreshExploreAfterAnswers: false,
-    });
-  }
-  if (lower === 'createplan') {
-    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.AWAITING_PLAN_PRESENTATION, {
-      lastToolName: 'CreatePlan',
-      currentRequestId: String(session.requestId || '').trim(),
-      draftPlanPath: String(execution.planPath || '').trim(),
-      needsFreshExploreAfterAnswers: false,
-    });
-  }
-  if (isReadOnlyContextToolName(lower)) {
-    const currentPhase = getPlanWorkflowPhase(session);
-    const nextPhase = currentPhase === PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED
-      ? PLAN_WORKFLOW_PHASES.EXPLORING
-      : (currentPhase === PLAN_WORKFLOW_PHASES.PLANNING || currentPhase === PLAN_WORKFLOW_PHASES.IDLE
-        ? PLAN_WORKFLOW_PHASES.EXPLORING
-        : currentPhase);
-    return setPlanWorkflowPhase(session, nextPhase, {
-      lastToolName: canonicalToolName(toolCall?.name || execution?.tool || ''),
-      currentRequestId: String(session.requestId || '').trim(),
-      needsFreshExploreAfterAnswers: false,
-    });
-  }
-  return null;
+  if (!isPlanModeSession(session)) return null;
+  const next = buildPlanWorkflowUpdateForToolExecution({
+    state: ensurePlanWorkflowState(session),
+    toolName: toolCall?.name || execution?.tool || '',
+    execution,
+    requestId: String(session.requestId || '').trim(),
+    canonicalToolName,
+    isReadOnlyContextToolName,
+  });
+  if (!next) return null;
+  session.planWorkflow = next;
+  return syncPlanWorkflowState(session);
 }
 
 function updatePlanWorkflowForInteractionResponse(session = {}, interactionResponse = {}, pendingInteraction = {}) {
   if (!isPlanModeSession(session)) return null;
-  const responseKind = String(interactionResponse?.kind || '').trim();
-  if (responseKind === 'ask_question_interaction_response') {
-    const askQuestion = interactionResponse?.askQuestion || {};
-    const status = String(askQuestion.kind || '').trim().toLowerCase();
-    const answers = Array.isArray(askQuestion.answers) ? askQuestion.answers : [];
-    const hasAnswers = answers.some((answer) => {
-      const selected = Array.isArray(answer?.selectedOptionIds) ? answer.selectedOptionIds.filter(Boolean) : [];
-      const freeform = String(answer?.freeformText || '').trim();
-      return selected.length > 0 || Boolean(freeform);
-    });
-    if (status === 'success' && hasAnswers) {
-      return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED, {
-        lastInteractionKind: responseKind,
-        currentRequestId: String(session.requestId || '').trim(),
-        needsFreshExploreAfterAnswers: true,
-      });
-    }
-    return null;
-  }
-  if (responseKind === 'create_plan_request_response'
-    && String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase() === 'success') {
-    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.PLAN_PRESENTED, {
-      lastInteractionKind: responseKind,
-      currentRequestId: String(session.requestId || '').trim(),
-      presentedPlanUri: String(interactionResponse?.createPlan?.planUri || '').trim()
-        || String(pendingInteraction?.arguments?.planUri || '').trim(),
-      needsFreshExploreAfterAnswers: false,
-    });
-  }
-  return null;
+  const next = buildPlanWorkflowUpdateForInteractionResponse({
+    state: ensurePlanWorkflowState(session),
+    interactionResponse,
+    pendingInteraction,
+    requestId: String(session.requestId || '').trim(),
+  });
+  if (!next) return null;
+  session.planWorkflow = next;
+  return syncPlanWorkflowState(session);
 }
 
 function shouldAllowFreshPlanExploreDespiteDuplicate(session = {}, toolCall = {}) {
   if (!isPlanModeSession(session)) return false;
-  if (getPlanWorkflowPhase(session) !== PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED) return false;
-  const workflow = ensurePlanWorkflowState(session);
-  if (workflow.needsFreshExploreAfterAnswers !== true) return false;
-  return isReadOnlyContextToolName(String(toolCall?.name || '').trim().toLowerCase());
+  return shouldAllowFreshPlanExploreDespiteDuplicateState({
+    state: ensurePlanWorkflowState(session),
+    toolName: toolCall?.name || '',
+    isReadOnlyContextToolName,
+  });
 }
 
 function updatePlanWorkflowForConversationAction(session = {}, actionKind = '', action = {}) {
   if (!isPlanModeSession(session)) return null;
-  if (actionKind === 'start_plan_action') {
-    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.PLAN_PRESENTED, {
-      lastInteractionKind: actionKind,
-      currentRequestId: String(session.requestId || '').trim(),
-      presentedPlanUri: String(action.planFileUri || '').trim() || ensurePlanWorkflowState(session).presentedPlanUri,
-      needsFreshExploreAfterAnswers: false,
-    });
-  }
-  if (actionKind === 'execute_plan_action') {
-    return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.EXECUTING, {
-      lastInteractionKind: actionKind,
-      currentRequestId: String(session.requestId || '').trim(),
-      presentedPlanUri: String(action.planFileUri || '').trim() || ensurePlanWorkflowState(session).presentedPlanUri,
-      needsFreshExploreAfterAnswers: false,
-    });
-  }
-  return null;
+  const next = buildPlanWorkflowUpdateForConversationAction({
+    state: ensurePlanWorkflowState(session),
+    actionKind,
+    action,
+    requestId: String(session.requestId || '').trim(),
+  });
+  if (!next) return null;
+  session.planWorkflow = next;
+  return syncPlanWorkflowState(session);
 }
 
 function emitPresentedPlanCheckpoint(session = {}, logger = null, options = {}) {
@@ -2030,11 +1933,11 @@ function shouldKeepWaitingForInteractionResponse(pendingInteraction = {}, intera
       || pendingInteraction?.resumeState?.plan?.plan_uri
       || ''
     ).trim();
-    if (status === 'success' && (planText || planUri)) return true;
-    if (status === 'rejected') return true;
-    if (status === 'error') return true;
-    if (!planText && !planUri) return true;
-    return false;
+    if (status === 'success' && (planText || planUri)) return false;
+    if (status === 'rejected') return false;
+    if (status === 'error') return false;
+    if (planText || planUri) return false;
+    return true;
   }
   if (pendingKind !== 'ask_question' || responseKind !== 'ask_question_interaction_response') return false;
   const askQuestion = interactionResponse?.askQuestion || {};
@@ -3313,14 +3216,14 @@ function writeAgentTextFrame(session, text, { tokenDelta = true, recordHistory =
 }
 
 function emitUpstreamToolStartedFrame(session, payload) {
-  if (!session?.active || !payload || payload.type !== 'response.output_item.added') return;
+  if (!session?.active || !payload || payload.type !== 'response.output_item.added') return false;
   const item = payload.item || {};
-  if (item.type !== 'function_call') return;
+  if (item.type !== 'function_call') return false;
   const toolName = String(item.name || '').trim();
-  if (!toolName) return;
+  if (!toolName) return false;
   const toolCallId = String(item.call_id || item.id || `tool_${Date.now().toString(36)}`);
   session.upstreamToolStarted = session.upstreamToolStarted || new Set();
-  if (session.upstreamToolStarted.has(toolCallId)) return;
+  if (session.upstreamToolStarted.has(toolCallId)) return false;
   session.upstreamToolStarted.add(toolCallId);
   session.upstreamToolItemIds = session.upstreamToolItemIds || new Map();
   if (item.id) session.upstreamToolItemIds.set(String(item.id), toolCallId);
@@ -3332,15 +3235,17 @@ function emitUpstreamToolStartedFrame(session, payload) {
   const modelCallId = `model_${toolCallId}`;
   const args = parseJsonObject(item.arguments || '{}');
   const leanArgs = isEditLikeToolName(toolName) ? buildLeanEditToolArguments(args) : args;
-  if (!hasRequiredToolArguments({ name: toolName, arguments: leanArgs })) return;
+  if (!hasRequiredToolArguments({ name: toolName, arguments: leanArgs })) return false;
   writeAgentFrame(session, buildAgentPartialToolCallFrame(toolName, leanArgs, toolCallId, modelCallId));
   if (!isEditLikeToolName(toolName)) {
     writeAgentFrame(session, buildAgentToolCallStartedFrame(toolName, leanArgs, toolCallId, modelCallId));
   }
+  return true;
 }
 
 function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
-  if (!session?.active || !payload) return;
+  if (!session?.active || !payload) return false;
+  let emitted = false;
   const chatCalls = payload.choices?.[0]?.delta?.tool_calls;
   if (Array.isArray(chatCalls) && chatCalls.length) {
     chatCalls.forEach((call, index) => {
@@ -3357,19 +3262,19 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
       }
       const delta = String(call.function?.arguments || '');
       if (!delta) return;
-      emitUpstreamToolArgumentProgress(session, {
+      emitted = emitUpstreamToolArgumentProgress(session, {
         type: 'response.function_call_arguments.delta',
         item_id: indexKey,
         call_id: toolCallId,
         delta,
-      }, userText);
+      }, userText) || emitted;
     });
-    return;
+    return emitted;
   }
-  if (!String(payload.type || '').startsWith('response.function_call_arguments.')) return;
+  if (!String(payload.type || '').startsWith('response.function_call_arguments.')) return false;
   const rawKey = String(payload.item_id || payload.call_id || '');
   const key = session.upstreamToolItemIds?.get(rawKey) || String(payload.call_id || rawKey || '');
-  if (!key) return;
+  if (!key) return false;
   session.upstreamToolArgumentStreams = session.upstreamToolArgumentStreams || new Map();
   const existing = session.upstreamToolArgumentStreams.get(key) || {
     id: String(payload.call_id || key),
@@ -3395,7 +3300,7 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
   if (collected?.name) existing.name = String(collected.name || existing.name || '');
   if (!isEditLikeToolName(existing.name)) {
     session.upstreamToolArgumentStreams.set(key, existing);
-    return;
+    return false;
   }
   const toolCallId = existing.id;
   const modelCallId = `model_${toolCallId}`;
@@ -3408,9 +3313,11 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
     existing.emittedPath = targetPath;
     const leanArgs = { path: targetPath };
     writeAgentFrame(session, buildAgentPartialToolCallFrame(existing.name, leanArgs, toolCallId, modelCallId));
+    emitted = true;
     if (!existing.completedStarted) {
       writeAgentFrame(session, buildAgentToolCallStartedFrame(existing.name, leanArgs, toolCallId, modelCallId));
       existing.completedStarted = true;
+      emitted = true;
     }
   }
   const content = getStreamingEditContentFromArgumentsText(existing.argumentsText);
@@ -3432,6 +3339,7 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
     const chunkSize = EDIT_STREAM_FRAME_CHARS;
     for (let offset = 0; offset < pendingContentDelta.length; offset += chunkSize) {
       writeAgentFrame(session, buildAgentEditToolCallDeltaFrame(pendingContentDelta.slice(offset, offset + chunkSize), toolCallId, modelCallId));
+      emitted = true;
     }
     existing.pendingContentDelta = '';
     existing.lastContentFlushAt = Date.now();
@@ -3442,8 +3350,10 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
     if (targetPath && !leanArgs.path) leanArgs.path = targetPath;
     writeAgentFrame(session, buildAgentToolCallStartedFrame(existing.name, leanArgs, toolCallId, modelCallId));
     existing.completedStarted = true;
+    emitted = true;
   }
   session.upstreamToolArgumentStreams.set(key, existing);
+  return emitted;
 }
 
 function completeDuplicateAgentSession(session, logger, reason = 'duplicate_user_message', completedTurn = null) {
@@ -3668,6 +3578,7 @@ function canonicalToolName(name) {
   if (lower === 'patchedit' || lower === 'strreplace') return 'PatchEdit';
   if (lower === 'readlints' || lower === 'diagnostics') return 'ReadLints';
   if (isTodoToolName(lower)) return 'TodoWrite';
+  if (lower === 'ls') return 'Ls';
   if (lower === 'websearch' || lower === 'web_search') return 'WebSearch';
   if (lower === 'webfetch' || lower === 'web_fetch' || lower === 'fetch') return 'WebFetch';
   if (lower === 'write' || lower === 'edit') return 'PatchEdit';
@@ -5569,40 +5480,6 @@ async function fetchPublicText(url, options = {}) {
   }
 }
 
-function normalizeDuckDuckGoUrl(value = '') {
-  const decoded = decodeHtmlEntities(String(value || ''));
-  try {
-    const parsed = new URL(decoded, 'https://duckduckgo.com');
-    const uddg = parsed.searchParams.get('uddg');
-    if (uddg) return decodeURIComponent(uddg);
-    return parsed.href;
-  } catch {
-    return decoded;
-  }
-}
-
-function parseDuckDuckGoResults(html = '') {
-  const results = [];
-  const blockRegex = /<div[^>]+class="[^"]*result[^"]*"[\s\S]*?(?=<div[^>]+class="[^"]*result[^"]*"|<\/body>|$)/gi;
-  const blocks = String(html || '').match(blockRegex) || [];
-  for (const block of blocks) {
-    const linkMatch = block.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
-      || block.match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
-    if (!linkMatch) continue;
-    const url = normalizeDuckDuckGoUrl(linkMatch[1]);
-    if (!/^https?:\/\//i.test(url)) continue;
-    const title = htmlToReadableText(linkMatch[2]).replace(/\s+/g, ' ').trim();
-    const snippetMatch = block.match(/<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/i)
-      || block.match(/<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    const snippet = snippetMatch ? htmlToReadableText(snippetMatch[1]).replace(/\s+/g, ' ').trim() : '';
-    if (title && !results.some((item) => item.url === url)) {
-      results.push({ title, url, snippet });
-    }
-    if (results.length >= 8) break;
-  }
-  return results;
-}
-
 function buildWebSearchReferences(searchTerm, results = []) {
   const links = results.map((item, index) => `${index + 1}. [${item.title}](${item.url})`).join('\n');
   const highlights = results.map((item, index) => [
@@ -5645,194 +5522,8 @@ function buildWebSearchResults(searchTerm, results = []) {
   })).filter((item) => item.title && item.url);
 }
 
-function tokenizeSearchText(text = '') {
-  return Array.from(new Set(
-    String(text || '')
-      .toLowerCase()
-      .replace(/https?:\/\/\S+/g, ' ')
-      .replace(/[^a-z0-9\u3400-\u9fff.+#-]+/gi, ' ')
-      .split(/\s+/)
-      .map((item) => item.trim())
-      .filter((item) => item.length >= 2 || /[\u3400-\u9fff]/.test(item))
-      .filter((item) => !WEB_SEARCH_STOPWORDS.has(item)),
-  ));
-}
-
-function isWeakWebSearchToken(token = '') {
-  const normalized = String(token || '').trim().toLowerCase();
-  if (!normalized) return true;
-  return WEB_SEARCH_WEAK_TOKENS.has(normalized);
-}
-
-function isNewsLikeResult(item = {}) {
-  const title = String(item?.title || '').toLowerCase();
-  const url = String(item?.url || '').toLowerCase();
-  const snippet = String(item?.snippet || '').toLowerCase();
-  const haystack = `${title} ${url} ${snippet}`;
-  return Array.from(WEB_SEARCH_NEWS_INTENT_TOKENS).some((token) => haystack.includes(token));
-}
-
-function getWebSearchQueryProfile(searchTerm = '') {
-  const queryTokens = tokenizeSearchText(searchTerm);
-  const strongTokens = queryTokens.filter((token) => !isWeakWebSearchToken(token));
-  return {
-    queryTokens,
-    strongTokens,
-    hasNewsIntent: queryTokens.some((token) => WEB_SEARCH_NEWS_INTENT_TOKENS.has(token)),
-  };
-}
-
-function scoreWebSearchResult(searchTerm = '', item = {}) {
-  const { queryTokens, strongTokens, hasNewsIntent } = getWebSearchQueryProfile(searchTerm);
-  if (!queryTokens.length) {
-    return {
-      score: 0,
-      strongMatches: 0,
-      weakMatches: 0,
-      titleMatches: 0,
-      snippetMatches: 0,
-      urlMatches: 0,
-      rejectedReason: 'empty_query',
-      newsLike: false,
-    };
-  }
-  const title = String(item?.title || '').toLowerCase();
-  const url = String(item?.url || '').toLowerCase();
-  const snippet = String(item?.snippet || '').toLowerCase();
-  const newsLike = isNewsLikeResult(item);
-  let score = 0;
-  let strongMatches = 0;
-  let weakMatches = 0;
-  let titleMatches = 0;
-  let snippetMatches = 0;
-  let urlMatches = 0;
-  for (const token of queryTokens) {
-    const weak = isWeakWebSearchToken(token);
-    let matched = false;
-    if (title.includes(token)) {
-      score += weak ? 1 : (/[\u3400-\u9fff]/.test(token) || token.length >= 5 ? 5 : 3);
-      titleMatches += 1;
-      matched = true;
-    }
-    if (url.includes(token)) {
-      score += weak ? 0.5 : 1.5;
-      urlMatches += 1;
-      matched = true;
-    }
-    if (snippet.includes(token)) {
-      score += weak ? 0.5 : (/[\u3400-\u9fff]/.test(token) || token.length >= 5 ? 2.5 : 1.5);
-      snippetMatches += 1;
-      matched = true;
-    }
-    if (matched) {
-      if (weak) weakMatches += 1;
-      else strongMatches += 1;
-    }
-  }
-  let rejectedReason = '';
-  if (strongTokens.length > 0 && strongMatches === 0) rejectedReason = 'no_strong_match';
-  if (!rejectedReason && strongTokens.length >= 2 && strongMatches < 2) rejectedReason = 'not_enough_strong_matches';
-  if (!rejectedReason && strongTokens.length === 1 && titleMatches === 0 && snippetMatches === 0) rejectedReason = 'strong_match_not_visible';
-  if (!rejectedReason && newsLike && !hasNewsIntent) rejectedReason = 'news_like_without_news_intent';
-  if (!rejectedReason && score < 4) rejectedReason = 'score_too_low';
-  if (!rejectedReason && titleMatches === 0 && snippetMatches === 0) rejectedReason = 'only_url_match';
-  return {
-    score,
-    strongMatches,
-    weakMatches,
-    titleMatches,
-    snippetMatches,
-    urlMatches,
-    rejectedReason,
-    newsLike,
-  };
-}
-
-function filterRelevantWebSearchResults(searchTerm = '', results = []) {
-  const scored = (Array.isArray(results) ? results : [])
-    .map((item) => {
-      const scoring = scoreWebSearchResult(searchTerm, item);
-      return {
-        ...item,
-        relevanceScore: Number(scoring.score) || 0,
-        relevanceStrongMatches: Number(scoring.strongMatches) || 0,
-        relevanceWeakMatches: Number(scoring.weakMatches) || 0,
-        relevanceTitleMatches: Number(scoring.titleMatches) || 0,
-        relevanceSnippetMatches: Number(scoring.snippetMatches) || 0,
-        relevanceUrlMatches: Number(scoring.urlMatches) || 0,
-        relevanceRejectedReason: scoring.rejectedReason || '',
-        newsLikeResult: Boolean(scoring.newsLike),
-      };
-    });
-  const accepted = scored
-    .filter((item) => !item.relevanceRejectedReason)
-    .sort((a, b) => b.relevanceScore - a.relevanceScore)
-    .slice(0, 8);
-  const rejected = scored
-    .filter((item) => item.relevanceRejectedReason)
-    .sort((a, b) => b.relevanceScore - a.relevanceScore);
-  return {
-    accepted,
-    rejected,
-    bestRejectedReason: rejected[0]?.relevanceRejectedReason || '',
-  };
-}
-
-function summarizeRejectedWebSearchResults(results = []) {
-  return (Array.isArray(results) ? results : [])
-    .slice(0, 5)
-    .map((item) => {
-      const reason = item?.relevanceRejectedReason || 'unknown';
-      const title = String(item?.title || '').trim() || String(item?.url || '').trim() || 'Untitled result';
-      return `${title} [${reason}]`;
-    })
-    .join('; ');
-}
-
-function rememberWebSearchAttempt(session, details = {}) {
-  if (!session) return;
-  const attempts = Array.isArray(session.webSearchAttempts) ? session.webSearchAttempts : [];
-  attempts.push({
-    signature: String(details.signature || '').trim(),
-    normalizedSignature: String(details.normalizedSignature || '').trim(),
-    searchTerm: String(details.searchTerm || '').trim(),
-    provider: String(details.provider || '').trim(),
-    ok: Boolean(details.ok),
-    rejectedReason: String(details.rejectedReason || '').trim(),
-    createdAt: new Date().toISOString(),
-  });
-  session.webSearchAttempts = attempts.slice(-MAX_TRACKED_WEB_SEARCH_ATTEMPTS);
-}
-
-function countSimilarLowRelevanceWebSearchAttempts(session, normalizedSignature = '') {
-  if (!normalizedSignature) return 0;
-  const attempts = Array.isArray(session?.webSearchAttempts) ? session.webSearchAttempts : [];
-  return attempts.filter((item) => item?.normalizedSignature === normalizedSignature && item?.ok === false).length;
-}
-
-function buildLowRelevanceWebSearchResultText(searchTerm = '', options = {}) {
-  const provider = String(options.provider || '').trim();
-  const rejectedSummary = String(options.rejectedSummary || '').trim();
-  const attemptCount = Number(options.attemptCount) || 0;
-  const extra = [];
-  if (provider) extra.push(`Provider: ${provider}`);
-  if (attemptCount > 1) extra.push(`Similar failed attempts this turn: ${attemptCount}`);
-  if (rejectedSummary) extra.push(`Rejected results: ${rejectedSummary}`);
-  return [
-    `Web search returned only low-relevance results for "${searchTerm}".`,
-    'Do not broaden or repeat the same search blindly.',
-    'Use a more specific query or switch strategies.',
-    ...extra,
-  ].join(' ');
-}
-
-function countWebSearchExecutionsThisTurn(session = {}) {
-  const attempts = Array.isArray(session?.webSearchAttempts) ? session.webSearchAttempts : [];
-  return attempts.length;
-}
-
 function normalizeSearchTermForSignature(value = '') {
-  return tokenizeSearchText(value).sort().join('|');
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 function parseBingRssResults(xml = '') {
@@ -5851,36 +5542,16 @@ function parseBingRssResults(xml = '') {
 
 async function executeWebSearchTool(args = {}, session = null) {
   const searchTerm = String(args.search_term || args.searchTerm || args.query || '').trim();
-  const normalizedSignature = normalizeSearchTermForSignature(searchTerm);
-  const totalTurnAttempts = countWebSearchExecutionsThisTurn(session);
-  if (totalTurnAttempts >= MAX_WEB_SEARCH_CALLS_PER_TURN) {
+  if (!searchTerm) {
     return {
       ok: false,
       tool: 'WebSearch',
-      args: { ...args, search_term: searchTerm, query: searchTerm, blockedByTurnLimit: true },
-      resultText: `Web search skipped for "${searchTerm}" because this turn already used WebSearch ${totalTurnAttempts} time(s). Stop repeating searches and continue with the best available context.`,
+      args: { ...args, search_term: searchTerm, query: searchTerm },
+      resultText: 'Web search failed: empty search term.',
       results: [],
       references: [{
-        title: 'Web search skipped',
-        chunk: `Search term: ${searchTerm}\nReason: Per-turn WebSearch limit reached (${totalTurnAttempts}/${MAX_WEB_SEARCH_CALLS_PER_TURN}).`,
-      }],
-      durationMs: 0,
-    };
-  }
-  const previousLowRelevanceAttempts = countSimilarLowRelevanceWebSearchAttempts(session, normalizedSignature);
-  if (previousLowRelevanceAttempts >= MAX_SIMILAR_LOW_RELEVANCE_WEB_SEARCHES) {
-    return {
-      ok: false,
-      tool: 'WebSearch',
-      args: { ...args, search_term: searchTerm, query: searchTerm, blockedByLoopBreaker: true },
-      resultText: buildLowRelevanceWebSearchResultText(searchTerm, {
-        provider: 'loop_breaker',
-        attemptCount: previousLowRelevanceAttempts,
-      }),
-      results: [],
-      references: [{
-        title: 'Web search blocked',
-        chunk: `Search term: ${searchTerm}\nReason: Similar low-relevance searches were already attempted ${previousLowRelevanceAttempts} time(s) in this turn.`,
+        title: 'Web search error',
+        chunk: 'Search term is empty.',
       }],
       durationMs: 0,
     };
@@ -5890,93 +5561,29 @@ async function executeWebSearchTool(args = {}, session = null) {
     timeoutMs: WEB_SEARCH_FETCH_TIMEOUT_MS,
     accept: 'application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8',
   });
-  if (bingFetched?.ok) {
-    const bingFiltered = filterRelevantWebSearchResults(
-      searchTerm,
-      buildWebSearchResults(searchTerm, parseBingRssResults(bingFetched.text)),
-    );
-    const bingResults = bingFiltered.accepted;
-    const bingReferences = buildWebSearchReferences(searchTerm, bingResults);
-    const bingRejectedSummary = summarizeRejectedWebSearchResults(bingFiltered.rejected);
-    const bingAttemptCount = previousLowRelevanceAttempts + (bingResults.length > 0 ? 0 : 1);
-    const bingResultText = bingResults.length > 0
-      ? (bingReferences[0]?.chunk || `No useful web results were found for "${searchTerm}".`)
-      : buildLowRelevanceWebSearchResultText(searchTerm, {
-        provider: 'bing_rss',
-        rejectedSummary: bingRejectedSummary,
-        attemptCount: bingAttemptCount,
-      });
-    rememberWebSearchAttempt(session, {
-      signature: `websearch:${normalizedSignature}`,
-      normalizedSignature,
-      searchTerm,
-      provider: 'bing_rss',
-      ok: bingResults.length > 0,
-      rejectedReason: bingFiltered.bestRejectedReason || 'no_relevant_results',
-    });
-    return {
-      ok: bingResults.length > 0,
-      tool: 'WebSearch',
-      args: { ...args, search_term: searchTerm, query: searchTerm, provider: 'bing_rss' },
-      resultText: bingResultText,
-      results: bingResults,
-      references: bingReferences,
-      durationMs: 0,
-    };
-  }
-  const searchUrls = [
-    `https://duckduckgo.com/html/?q=${encodeURIComponent(searchTerm)}`,
-    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchTerm)}`,
-  ];
-  let fetched = null;
-  for (const url of searchUrls) {
-    // eslint-disable-next-line no-await-in-loop
-    const response = await fetchPublicText(url, { timeoutMs: WEB_SEARCH_FETCH_TIMEOUT_MS, accept: 'text/html,*/*;q=0.8' });
-    fetched = response;
-    if (response?.ok) break;
-  }
-  if (!fetched?.ok) {
+  if (!bingFetched?.ok) {
     return {
       ok: false,
       tool: 'WebSearch',
       args: { ...args, search_term: searchTerm },
-      resultText: `Web search failed: ${bingFetched?.error || fetched?.error || `HTTP ${bingFetched?.status || fetched?.status || 0}`}`,
+      resultText: `Web search failed: ${bingFetched?.error || `HTTP ${bingFetched?.status || 0}`}`,
       results: [],
       references: [{
         title: 'Web search error',
-        chunk: `Search term: ${searchTerm}\nStatus: ${bingFetched?.status || fetched?.status || 0}\nError: ${bingFetched?.error || fetched?.error || 'Unknown error'}`,
+        chunk: `Search term: ${searchTerm}\nStatus: ${bingFetched?.status || 0}\nError: ${bingFetched?.error || 'Unknown error'}`,
       }],
       durationMs: 0,
     };
   }
-  const results = parseDuckDuckGoResults(fetched.text);
-  const filteredResults = filterRelevantWebSearchResults(
-    searchTerm,
-    buildWebSearchResults(searchTerm, results),
-  );
-  const normalizedResults = filteredResults.accepted;
+  const normalizedResults = buildWebSearchResults(searchTerm, parseBingRssResults(bingFetched.text));
   const references = buildWebSearchReferences(searchTerm, normalizedResults);
-  const rejectedSummary = summarizeRejectedWebSearchResults(filteredResults.rejected);
-  const attemptCount = previousLowRelevanceAttempts + (normalizedResults.length > 0 ? 0 : 1);
   const resultText = normalizedResults.length > 0
     ? (references[0]?.chunk || `No useful web results were found for "${searchTerm}".`)
-    : buildLowRelevanceWebSearchResultText(searchTerm, {
-      provider: 'duckduckgo_html',
-      rejectedSummary,
-      attemptCount,
-    });
-  rememberWebSearchAttempt(session, {
-    signature: `websearch:${normalizedSignature}`,
-    normalizedSignature,
-    searchTerm,
-    provider: 'duckduckgo_html',
-    ok: normalizedResults.length > 0,
-    rejectedReason: filteredResults.bestRejectedReason || 'no_relevant_results',
-  });
+    : `No web results were found for "${searchTerm}".`;
   return {
     ok: normalizedResults.length > 0,
     tool: 'WebSearch',
-    args: { ...args, search_term: searchTerm, query: searchTerm },
+    args: { ...args, search_term: searchTerm, query: searchTerm, provider: 'bing_rss' },
     resultText,
     results: normalizedResults,
     references,
@@ -6221,7 +5828,7 @@ async function executeRelayTool(toolCall, session, logger) {
         : `ls success path=${targetPath} files=0`;
       return {
         ok: true,
-        tool: 'LS',
+        tool: 'Ls',
         args: { ...args, path: targetPath, workspaceRoot },
         resultText,
         directoryTree,
@@ -6695,10 +6302,38 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
   session.executedToolResultsBySignature = session.executedToolResultsBySignature || new Map();
   session.toolResultSummaries = session.toolResultSummaries || [];
   const maxToolCallsPerRound = getMaxLocalToolCallsPerRound(session?.config || {});
-  let webSearchCallsThisRound = 0;
   for (const rawToolCall of toolCalls.slice(0, maxToolCallsPerRound)) {
     const toolCall = normalizeToolCallPathsForWorkspace(rawToolCall, session);
     const lowerToolName = String(toolCall?.name || '').trim().toLowerCase();
+    if (isPlanModeSession(session) && lowerToolName === 'createplan') {
+      const existingPlanState = getLatestSessionPlanState(session);
+      const existingCreatePlanResult = Array.isArray(session?.toolResultSummaries)
+        && session.toolResultSummaries.some((entry) => (
+          entry?.ok
+          && String(entry?.tool || '').trim().toLowerCase() === 'createplan'
+        ));
+      if (existingCreatePlanResult || existingPlanState?.plan_uri || existingPlanState?.plan_text || existingPlanState?.plan) {
+        logger.info(`agent local relay repeated createplan suppressed requestId=${requestId} tool=${toolCall.name}`);
+        const duplicateCreatePlanExecution = {
+          ok: true,
+          tool: 'CreatePlan',
+          args: toolCall.arguments || {},
+          resultText: existingPlanState?.plan_uri
+            ? `CreatePlan already succeeded in this turn.\nPlan URI: ${existingPlanState.plan_uri}`
+            : 'CreatePlan already succeeded in this turn.',
+          durationMs: 0,
+          duplicateToolSkipped: true,
+          repeatedCreatePlanSuppressed: true,
+          planPath: String(existingPlanState?.plan_uri || '').trim(),
+        };
+        toolResultMessages.push(toToolResultMessage(toolCall, duplicateCreatePlanExecution));
+        executions.push({
+          toolCall,
+          execution: duplicateCreatePlanExecution,
+        });
+        continue;
+      }
+    }
     const signature = getToolCallSignature(toolCall, session);
     const allowFreshExploreDespiteDuplicate = shouldAllowFreshPlanExploreDespiteDuplicate(session, toolCall);
     if (signature && session.executedToolSignatures.has(signature) && !allowFreshExploreDespiteDuplicate) {
@@ -6773,24 +6408,6 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
     const stepId = (session.nextStepId = (Number(session.nextStepId) || 0) + 1);
     const stepStartedAt = Date.now();
     let execution = interceptToolExecutionByMode(session, toolCall, { startedAt: stepStartedAt });
-    if (!execution && (lowerToolName === 'websearch' || lowerToolName === 'web_search')) {
-      if (webSearchCallsThisRound >= MAX_WEB_SEARCH_CALLS_PER_ROUND) {
-        execution = {
-          ok: false,
-          tool: 'WebSearch',
-          args: toolCall.arguments || {},
-          resultText: `Skipped extra WebSearch for this round. Only ${MAX_WEB_SEARCH_CALLS_PER_ROUND} WebSearch call(s) are allowed per tool round to keep the UI responsive.`,
-          durationMs: 0,
-          skippedByWebSearchRoundBudget: true,
-        };
-      } else {
-        webSearchCallsThisRound += 1;
-        if (!session.webSearchProgressEmitted && !String(session.agentTextFrameText || '').trim()) {
-          writeAgentTextFrame(session, '正在搜索网页资料，请稍等...\n\n', { tokenDelta: true });
-          session.webSearchProgressEmitted = true;
-        }
-      }
-    }
     if (emitToolInteraction) {
       if (emitStepFrames) writeAgentFrame(session, buildAgentStepStartedFrame(stepId));
       const streamedEditState = editLikeTool ? session.upstreamToolArgumentStreams?.get(toolCallId) : null;
