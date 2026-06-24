@@ -27,6 +27,19 @@ const PLAN_TOOL_NAMES = [
   'SemanticSearch',
 ];
 
+const PLAN_EXPLORATION_TOOL_NAMES = [
+  'Read',
+  'Grep',
+  'Glob',
+  'LS',
+  'ReadLints',
+  'Shell',
+  'TodoWrite',
+  'WebFetch',
+  'WebSearch',
+  'SemanticSearch',
+];
+
 const PLAN_MUTATION_TOOL_NAMES = new Set(['write', 'edit', 'patchedit', 'strreplace', 'delete']);
 const PLAN_ACTIVE_MODE_CONTRACT = [
   '<system_reminder>',
@@ -413,17 +426,36 @@ function buildBlockedExecution(toolCall, reason, startedAt, extra = {}) {
   };
 }
 
+function resolvePlanWorkflowPhase(options = {}, session = {}) {
+  const candidate = String(
+    options?.planWorkflowPhase
+    || options?.planPhase
+    || session?.planWorkflow?.phase
+    || options?.phase
+    || ''
+  ).trim();
+  return candidate;
+}
+
 function buildToolDefinitionsForChat(options = {}) {
+  const phase = resolvePlanWorkflowPhase(options, options?.session);
+  const allowedToolNames = phase === 'answers_collected'
+    ? PLAN_EXPLORATION_TOOL_NAMES
+    : PLAN_TOOL_NAMES;
   return filterToolDefinitionsByName(
     mergeAgentModeToolDefinitions(buildFallbackRelayToolDefinitions(), 'AGENT_MODE_PLAN'),
-    PLAN_TOOL_NAMES,
+    allowedToolNames,
   );
 }
 
 function buildToolDefinitionsForResponses(options = {}) {
+  const phase = resolvePlanWorkflowPhase(options, options?.session);
+  const allowedToolNames = phase === 'answers_collected'
+    ? PLAN_EXPLORATION_TOOL_NAMES
+    : PLAN_TOOL_NAMES;
   return filterToolDefinitionsByName(
-    buildResponsesToolDefinitions(buildToolDefinitionsForChat(options)),
-    PLAN_TOOL_NAMES,
+    buildResponsesToolDefinitions(buildToolDefinitionsForChat({ ...options, allowedToolNames })),
+    allowedToolNames,
   );
 }
 
@@ -436,7 +468,9 @@ function buildLocalRelayMessages(input = {}) {
     promptContextMessages: buildPlanInitialPromptContexts(input),
     extraSystemLines: [
       'In plan mode, prioritize producing and confirming a plan before execution when the task is complex.',
-      'If key choices are still unresolved, use AskQuestion before CreatePlan.',
+      'After AskQuestion collects Answers, perform one fresh read-only exploration of the project structure before CreatePlan.',
+      'Treat that exploration as a required step, not a comment. If you have not inspected the workspace yet, do not call CreatePlan.',
+      'When the exploration step is complete, synthesize the plan immediately and present it through CreatePlan.',
       'Do not output the full plan as plain assistant text. Keep the plan content inside CreatePlan and checkpoint state.',
       'Do not write, edit, patch, or delete files unless the user explicitly asks to leave plan mode and execute.',
     ],
@@ -452,6 +486,15 @@ function shouldUseNativeExecForTool(session, toolCall, helpers = {}) {
 function interceptToolExecution(session, toolCall, context = {}, helpers = {}) {
   const lower = String(toolCall?.name || '').trim().toLowerCase();
   const startedAt = context.startedAt || Date.now();
+  const phase = resolvePlanWorkflowPhase(context, session);
+  if (lower === 'createplan' && phase === 'answers_collected') {
+    return buildBlockedExecution(
+      toolCall,
+      'Plan mode requires one fresh read-only Explore project structure step after AskQuestion answers before CreatePlan. Use Read/Grep/Glob/LS/Shell to inspect the workspace first, then call CreatePlan.',
+      startedAt,
+      { blockedByPlanWorkflowPhase: phase || 'answers_collected' },
+    );
+  }
   if (PLAN_MUTATION_TOOL_NAMES.has(lower)) {
     return buildBlockedExecution(
       toolCall,
@@ -509,9 +552,11 @@ function shouldContinueIncompleteWork(session = {}, finalText = '', toolCalls = 
 
 function shouldForceContinuationToolChoice(session = {}, finalText = '', options = {}, helpers = {}) {
   if (session?.modeTurnHandoff || session?.planTurnHandoff) return false;
+  const phase = String(session?.planWorkflow?.phase || '').trim();
   const incompleteTodos = Array.isArray(helpers.getIncompleteTodos?.(session))
     ? helpers.getIncompleteTodos(session)
     : [];
+  if (phase === 'answers_collected' || phase === 'exploring') return true;
   if (!hasCreatePlanResult(session)) return true;
   if (incompleteTodos.length > 0) return true;
   return Boolean(helpers.looksLikeReadOnlyExplorationStillInProgress?.(session, finalText, options));
@@ -559,11 +604,13 @@ function hasIncompleteWorkAtEnd(session = {}, finalText = '', toolCalls = [], up
   if (upstreamError) return false;
   if (Array.isArray(toolCalls) && toolCalls.length) return false;
 
+  const phase = String(session?.planWorkflow?.phase || '').trim();
   const incompleteTodos = Array.isArray(helpers.getIncompleteTodos?.(session))
     ? helpers.getIncompleteTodos(session)
     : [];
   if (incompleteTodos.length > 0) return true;
 
+  if (phase === 'answers_collected' || phase === 'exploring') return true;
   if (!hasCreatePlanResult(session)) return true;
   if (helpers.looksLikeIncompleteContinuationText?.(finalText)) return true;
   if (helpers.looksLikeReadOnlyExplorationStillInProgress?.(session, finalText, options)) return true;

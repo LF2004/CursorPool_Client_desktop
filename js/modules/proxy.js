@@ -41,6 +41,7 @@ const RELAY_BUTTON_IDS = [
   'relayOpenLogDirBtn',
   'relayViewLogBtn',
   'relayDiagnoseBtn',
+  'relayPlanUiMockBtn',
   'relayOfficialCaptureBtn',
   'relayDisableByokBtn',
   'relayTestAllBtn',
@@ -989,6 +990,10 @@ function describeRelayProxyLayers(local) {
 }
 
 function describeInterceptBadge(stats, local) {
+  if (local?.mockProxy?.active) {
+    const scenario = String(local?.mockProxy?.scenario || 'plan-full').trim() || 'plan-full';
+    return { text: `Mock:${scenario}`, tone: 'ok' };
+  }
   if (local?.runner?.mode === 'official_passthrough') {
     const seenRunSse = Number(stats?.seenAgentRunSse || 0);
     const seenBidi = Number(stats?.seenBidiAppend || 0);
@@ -1282,7 +1287,57 @@ async function enableOfficialAgentCapture() {
   }, { fullscreen: true });
 }
 
+async function enablePlanUiMock() {
+  const bridge = window.electronBridge;
+  if (!bridge?.cursorRelayStartPlanUiMock) {
+    await showAlert('当前客户端不支持 Plan UI Mock 调试。', {
+      title: 'Plan UI Mock',
+      tone: 'danger',
+    });
+    return;
+  }
+
+  const ok = await showConfirm(
+    '将启动固定 `plan-full` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是验证前端是否能完整渲染 Ask -> Explore project structure -> Plan -> Build 卡片，不依赖真实模型与真实调度。\n\n继续？',
+    { title: 'Plan UI Mock', tone: 'info', confirmText: '启动 Mock' },
+  );
+  if (!ok) return;
+
+  await withRelayBusy('正在启动 Plan UI Mock…', async () => {
+    try {
+      const result = await bridge.cursorRelayStartPlanUiMock({
+        scenario: 'plan-full',
+        restartCursor: false,
+        reloadCursor: true,
+        allowWindowFocusSwitch: true,
+      });
+      relayEnabled = true;
+      updateRelayToggleButton(true, true);
+      await refreshRelayStatus();
+      await showAlert(
+        [
+          result?.summary || 'Plan UI Mock 已启动。',
+          '',
+          '下一步请在 Cursor Agent 中发送任意一条消息。',
+          '如果前端仍然没有出现 Explore project structure 或 Build 卡片，就基本可以确定是 UI 帧兼容/渲染链路问题。',
+        ].filter(Boolean).join('\n'),
+        { title: 'Plan UI Mock 已就绪', tone: 'success' },
+      );
+    } catch (error) {
+      await refreshRelayStatus().catch(() => null);
+      await showAlert(error.message || String(error), {
+        title: 'Plan UI Mock 启动失败',
+        tone: 'danger',
+      });
+    }
+  }, { fullscreen: true });
+}
+
 function describeUserStatusHint(local, localState = null) {
+  if (local?.mockProxy?.active) {
+    const proxyServer = String(local?.mockProxy?.proxyServer || '').trim();
+    return `Plan UI Mock 已接管当前 Cursor 代理${proxyServer ? `（${proxyServer}）` : ''}。现在请直接在 Cursor Agent 里发送一条消息，观察 Ask -> Explore project structure -> Plan -> Build UI 是否完整出现。`;
+  }
   if (localState && !localState.cursorLoggedIn) {
     return 'Cursor 尚未登录。启用 Relay 时会自动检测，并从 desktop/js/utils/users.json 写入本地免登账号。';
   }
@@ -1377,7 +1432,7 @@ async function refreshRelayStatus() {
     const stats = local?.runner?.stats || local?.log?.stats || {};
     const intercept = describeInterceptBadge(stats, local);
 
-    updateRelayToggleButton(local?.enabled, local?.runner?.running);
+    updateRelayToggleButton(local?.enabled, local?.mockProxy?.active || local?.runner?.running);
     if (local?.enabled) {
       const addr = String(local?.proxyServer || local?.runner?.proxyServer || '').trim();
       setBadge($('relayLocalBadge'), addr || '已启用', 'ok');
@@ -1396,8 +1451,8 @@ async function refreshRelayStatus() {
     if (isRelayAdmin()) {
       setBadge(
         $('relayRunnerBadge'),
-        describeRunner(local?.runner),
-        local?.runner?.healthOk ? 'ok' : local?.runner?.running ? 'warn' : 'muted',
+        local?.mockProxy?.active ? 'Plan UI Mock' : describeRunner(local?.runner),
+        local?.mockProxy?.active ? 'ok' : local?.runner?.healthOk ? 'ok' : local?.runner?.running ? 'warn' : 'muted',
       );
       setBadge(
         $('relayPatchBadge'),
@@ -1413,7 +1468,9 @@ async function refreshRelayStatus() {
       setText($('relayCursorSettingsHint'), describeRelayProxyLayers(local));
       setText(
         $('relayServerHint'),
-        local?.runner?.running
+        local?.mockProxy?.active
+          ? `Plan UI Mock：${local.mockProxy.proxyServer || 'http://127.0.0.1:17888'}`
+          : local?.runner?.running
           ? `本地 runner：${local.runner.proxyServer || '127.0.0.1:17789'}`
           : '本地 runner 未运行。',
       );
@@ -1557,6 +1614,11 @@ function bindRelayLogButtons() {
   const officialCaptureBtn = $('relayOfficialCaptureBtn');
   if (officialCaptureBtn) {
     officialCaptureBtn.onclick = () => enableOfficialAgentCapture().catch(() => {});
+  }
+
+  const relayPlanUiMockBtn = $('relayPlanUiMockBtn');
+  if (relayPlanUiMockBtn) {
+    relayPlanUiMockBtn.onclick = () => enablePlanUiMock().catch(() => {});
   }
 }
 

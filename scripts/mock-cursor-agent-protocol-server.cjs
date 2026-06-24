@@ -30,6 +30,9 @@ const {
   buildAgentExecLsFrame,
   buildAgentExecShellStreamFrame,
   buildAgentExecDiagnosticsFrame,
+  buildAgentAskQuestionQueryFrame,
+  buildAgentCreatePlanQueryFrame,
+  buildAgentConversationCheckpointFrame,
   buildConnectEndFrame,
 } = require('../js/utils/cursor-relay-protocol');
 
@@ -60,7 +63,7 @@ function parseArgs(argv) {
 function printHelp() {
   console.log([
     'Usage:',
-    '  node scripts/mock-cursor-agent-protocol-server.cjs [--port 17888] [--scenario all-tools|edit-stream|file-ops|complex-multifile|minimal] [--delay 180] [--native-exec] [--dry-run] [--self-test]',
+    '  node scripts/mock-cursor-agent-protocol-server.cjs [--port 17888] [--scenario all-tools|edit-stream|file-ops|complex-multifile|minimal|plan-full] [--delay 180] [--native-exec] [--dry-run] [--self-test]',
     '',
     'What it does:',
     '  Starts a temporary HTTP CONNECT proxy that intercepts Cursor Agent RunSSE/BidiAppend',
@@ -161,6 +164,184 @@ function buildMinimalScenario() {
     { label: 'token', frame: buildAgentTokenDeltaFrame(1) },
     { label: 'turn_end', frame: buildAgentTurnEndedFrame() },
     { label: 'connect_end', frame: buildConnectEndFrame({ mock: true }) },
+  ];
+}
+
+function buildPlanFullScenario() {
+  const workspaceRoot = 'E:\\project\\h5-test';
+  const askIds = toolIds('ask_question');
+  const lsIds = toolIds('ls');
+  const globIds = toolIds('glob');
+  const planIds = toolIds('create_plan');
+  const todos = [
+    { id: 'todo_html', content: 'Create index.html shell', status: 'pending' },
+    { id: 'todo_css', content: 'Add style.css theme', status: 'pending' },
+    { id: 'todo_data', content: 'Define mock attraction dataset', status: 'pending' },
+    { id: 'todo_logic', content: 'Wire ranking interactions', status: 'pending' },
+  ];
+  const planText = [
+    '# Travel Ranking Landing Page Plan',
+    '',
+    '## Overview',
+    'Build a static HTML/CSS/JS page that ranks five domestic attractions with mock data and a China-inspired visual direction.',
+    '',
+    '## Steps',
+    '1. Create `index.html` with hero, ranking controls, and attraction cards.',
+    '2. Create `style.css` with red/gold palette, textured backgrounds, and responsive layout.',
+    '3. Create `data.js` with five attractions and multi-dimension scores.',
+    '4. Implement sorting and animated score bars in plain JavaScript.',
+    '',
+    '## Todos',
+    '- Create `index.html` shell',
+    '- Add `style.css` theme',
+    '- Define mock attraction dataset',
+    '- Wire ranking interactions',
+  ].join('\n');
+
+  return [
+    { label: 'heartbeat_1', frame: buildAgentHeartbeatFrame() },
+    { label: 'step_started_1', frame: buildAgentStepStartedFrame(1) },
+    { label: 'thinking_ask', frame: buildAgentThinkingDeltaFrame('Mock plan flow: ask, explore, then create the plan card.') },
+    { label: 'partial_ask', frame: buildAgentPartialToolCallFrame('AskQuestion', { title: 'Clarify scope' }, askIds.callId, askIds.modelCallId) },
+    { label: 'started_ask', frame: buildAgentToolCallStartedFrame('AskQuestion', { title: 'Clarify scope' }, askIds.callId, askIds.modelCallId) },
+    {
+      label: 'query_ask',
+      frame: buildAgentAskQuestionQueryFrame({
+        title: 'Clarify scope',
+        questions: [
+          {
+            id: 'project_type',
+            prompt: '你希望用什么技术栈来做这个页面？',
+            options: [{ id: 'static', label: '纯静态 HTML/CSS/JS 页面' }],
+          },
+          {
+            id: 'features',
+            prompt: '你希望页面包含哪些功能？',
+            options: [{ id: 'ranking', label: '热门景点排名列表（从夯到拉）' }],
+          },
+          {
+            id: 'data_source',
+            prompt: '景点数据来源方式？',
+            options: [{ id: 'mock', label: '使用模拟数据（静态 JSON 示例数据）' }],
+          },
+        ],
+      }, askIds.callId, 1),
+    },
+    {
+      label: 'completed_ask',
+      frame: buildCompleted('AskQuestion', { title: 'Clarify scope' }, {
+        ok: true,
+        tool: 'AskQuestion',
+        args: { title: 'Clarify scope' },
+        resultText: 'ask question answers=3',
+        answers: [
+          { questionId: 'project_type', selectedOptionIds: ['static'], freeformText: '' },
+          { questionId: 'features', selectedOptionIds: ['ranking'], freeformText: '' },
+          { questionId: 'data_source', selectedOptionIds: ['mock'], freeformText: '' },
+        ],
+        durationMs: 1,
+      }, askIds),
+    },
+    { label: 'step_completed_1', frame: buildAgentStepCompletedFrame(1, 120) },
+    { label: 'step_started_2', frame: buildAgentStepStartedFrame(2) },
+    { label: 'thinking_explore', frame: buildAgentThinkingDeltaFrame('Mock plan flow: Explore project structure after answers.') },
+    { label: 'partial_ls', frame: buildAgentPartialToolCallFrame('LS', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
+    { label: 'started_ls', frame: buildAgentToolCallStartedFrame('LS', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
+    {
+      label: 'exec_ls',
+      frame: buildAgentExecLsFrame({
+        id: lsIds.callId,
+        execId: lsIds.callId,
+        numericId: 1,
+        toolCallId: lsIds.callId,
+        path: workspaceRoot,
+        ignore: ['node_modules'],
+      }),
+    },
+    {
+      label: 'completed_ls',
+      frame: buildCompleted('LS', { path: workspaceRoot }, {
+        ok: true,
+        tool: 'LS',
+        args: { path: workspaceRoot },
+        resultText: `ls success path=${workspaceRoot} files=0`,
+        durationMs: 1,
+      }, lsIds),
+    },
+    {
+      label: 'partial_glob',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: '**/*',
+      }, globIds.callId, globIds.modelCallId),
+    },
+    {
+      label: 'started_glob',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: '**/*',
+      }, globIds.callId, globIds.modelCallId),
+    },
+    {
+      label: 'completed_glob',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: '**/*',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: '**/*',
+        },
+        resultText: 'index.html\ncss/style.css\njs/app.js\njs/data.json',
+        durationMs: 1,
+      }, globIds),
+    },
+    { label: 'step_completed_2', frame: buildAgentStepCompletedFrame(2, 180) },
+    { label: 'step_started_3', frame: buildAgentStepStartedFrame(3) },
+    { label: 'thinking_plan', frame: buildAgentThinkingDeltaFrame('Mock plan flow: exploration finished, now emit CreatePlan and Build card state.') },
+    { label: 'partial_plan', frame: buildAgentPartialToolCallFrame('CreatePlan', { name: 'Travel Ranking Landing Page' }, planIds.callId, planIds.modelCallId) },
+    { label: 'started_plan', frame: buildAgentToolCallStartedFrame('CreatePlan', { name: 'Travel Ranking Landing Page' }, planIds.callId, planIds.modelCallId) },
+    {
+      label: 'query_plan',
+      frame: buildAgentCreatePlanQueryFrame({
+        name: 'Travel Ranking Landing Page',
+        overview: 'Static travel ranking page with mock data and China-inspired visuals.',
+        plan: planText,
+        todos,
+      }, planIds.callId, 2),
+    },
+    {
+      label: 'completed_plan',
+      frame: buildCompleted('CreatePlan', { name: 'Travel Ranking Landing Page' }, {
+        ok: true,
+        tool: 'CreatePlan',
+        args: {
+          name: 'Travel Ranking Landing Page',
+          overview: 'Static travel ranking page with mock data and China-inspired visuals.',
+          plan: planText,
+          todos,
+        },
+        resultText: `Plan created at ${workspaceRoot}\\.cursor\\plans\\travel-ranking.plan.md`,
+        planPath: `${workspaceRoot}\\.cursor\\plans\\travel-ranking.plan.md`,
+        markdown: planText,
+        durationMs: 1,
+      }, planIds),
+    },
+    {
+      label: 'checkpoint_plan',
+      frame: buildAgentConversationCheckpointFrame({
+        workspaceRoot,
+        readPaths: [`${workspaceRoot}\\package.json`],
+        pendingToolCalls: [],
+        plan: planText,
+        todos,
+      }),
+    },
+    { label: 'step_completed_3', frame: buildAgentStepCompletedFrame(3, 220) },
+    { label: 'turn_end', frame: buildAgentTurnEndedFrame() },
+    { label: 'connect_end', frame: buildConnectEndFrame({ mock: true, scenario: 'plan-full' }) },
   ];
 }
 
@@ -594,6 +775,7 @@ function buildComplexMultifileScenario(options = {}) {
 function buildScenario(name, options = {}) {
   const scenario = String(name || '').trim().toLowerCase();
   if (scenario === 'minimal') return buildMinimalScenario(options);
+  if (scenario === 'plan-full') return buildPlanFullScenario(options);
   if (scenario === 'edit-stream') return buildEditStreamScenario(options);
   if (scenario === 'file-ops') return buildFileOpsScenario(options);
   if (scenario === 'complex-multifile') return buildComplexMultifileScenario(options);

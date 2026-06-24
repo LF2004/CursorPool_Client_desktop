@@ -1456,6 +1456,11 @@ function isSameWaitingSessionUserMessage(session = {}, userText = '') {
   return Boolean(nextText) && Boolean(currentText) && nextText === currentText;
 }
 
+function shouldReuseWaitingSessionForSameUserText(session = {}) {
+  if (!session?.waitingForInteraction) return false;
+  return !isPlanCheckpointVisiblePhase(getPlanWorkflowPhase(session));
+}
+
 function shouldReuseWaitingSessionForPendingCapture(session = {}, pendingCapture = null) {
   if (!session?.waitingForInteraction) return false;
   const actionKind = String(
@@ -1465,6 +1470,7 @@ function shouldReuseWaitingSessionForPendingCapture(session = {}, pendingCapture
   if (isPlanExecutionActionKind(actionKind)) return true;
   const pendingText = String(pendingCapture?.userText || '').trim();
   if (!pendingText) return false;
+  if (!shouldReuseWaitingSessionForSameUserText(session)) return false;
   return isSameWaitingSessionUserMessage(session, pendingText);
 }
 
@@ -1528,6 +1534,7 @@ function getDefaultPlanWorkflowState() {
     draftPlanPath: '',
     presentedPlanUri: '',
     checkpointEmittedForPlanUri: '',
+    needsFreshExploreAfterAnswers: false,
   };
 }
 
@@ -1542,6 +1549,7 @@ function clonePlanWorkflowState(state = null) {
     draftPlanPath: String(state.draftPlanPath || '').trim(),
     presentedPlanUri: String(state.presentedPlanUri || '').trim(),
     checkpointEmittedForPlanUri: String(state.checkpointEmittedForPlanUri || '').trim(),
+    needsFreshExploreAfterAnswers: state.needsFreshExploreAfterAnswers === true,
   };
 }
 
@@ -1607,6 +1615,7 @@ function updatePlanWorkflowForToolExecution(session = {}, toolCall = {}, executi
     return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.AWAITING_ANSWERS, {
       lastToolName: 'AskQuestion',
       currentRequestId: String(session.requestId || '').trim(),
+      needsFreshExploreAfterAnswers: false,
     });
   }
   if (lower === 'createplan') {
@@ -1614,6 +1623,7 @@ function updatePlanWorkflowForToolExecution(session = {}, toolCall = {}, executi
       lastToolName: 'CreatePlan',
       currentRequestId: String(session.requestId || '').trim(),
       draftPlanPath: String(execution.planPath || '').trim(),
+      needsFreshExploreAfterAnswers: false,
     });
   }
   if (isReadOnlyContextToolName(lower)) {
@@ -1626,6 +1636,7 @@ function updatePlanWorkflowForToolExecution(session = {}, toolCall = {}, executi
     return setPlanWorkflowPhase(session, nextPhase, {
       lastToolName: canonicalToolName(toolCall?.name || execution?.tool || ''),
       currentRequestId: String(session.requestId || '').trim(),
+      needsFreshExploreAfterAnswers: false,
     });
   }
   return null;
@@ -1647,6 +1658,7 @@ function updatePlanWorkflowForInteractionResponse(session = {}, interactionRespo
       return setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED, {
         lastInteractionKind: responseKind,
         currentRequestId: String(session.requestId || '').trim(),
+        needsFreshExploreAfterAnswers: true,
       });
     }
     return null;
@@ -1658,9 +1670,18 @@ function updatePlanWorkflowForInteractionResponse(session = {}, interactionRespo
       currentRequestId: String(session.requestId || '').trim(),
       presentedPlanUri: String(interactionResponse?.createPlan?.planUri || '').trim()
         || String(pendingInteraction?.arguments?.planUri || '').trim(),
+      needsFreshExploreAfterAnswers: false,
     });
   }
   return null;
+}
+
+function shouldAllowFreshPlanExploreDespiteDuplicate(session = {}, toolCall = {}) {
+  if (!isPlanModeSession(session)) return false;
+  if (getPlanWorkflowPhase(session) !== PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED) return false;
+  const workflow = ensurePlanWorkflowState(session);
+  if (workflow.needsFreshExploreAfterAnswers !== true) return false;
+  return isReadOnlyContextToolName(String(toolCall?.name || '').trim().toLowerCase());
 }
 
 function updatePlanWorkflowForConversationAction(session = {}, actionKind = '', action = {}) {
@@ -1670,6 +1691,7 @@ function updatePlanWorkflowForConversationAction(session = {}, actionKind = '', 
       lastInteractionKind: actionKind,
       currentRequestId: String(session.requestId || '').trim(),
       presentedPlanUri: String(action.planFileUri || '').trim() || ensurePlanWorkflowState(session).presentedPlanUri,
+      needsFreshExploreAfterAnswers: false,
     });
   }
   if (actionKind === 'execute_plan_action') {
@@ -1677,6 +1699,7 @@ function updatePlanWorkflowForConversationAction(session = {}, actionKind = '', 
       lastInteractionKind: actionKind,
       currentRequestId: String(session.requestId || '').trim(),
       presentedPlanUri: String(action.planFileUri || '').trim() || ensurePlanWorkflowState(session).presentedPlanUri,
+      needsFreshExploreAfterAnswers: false,
     });
   }
   return null;
@@ -2320,7 +2343,7 @@ function clearTimer(timer) {
   }
 }
 
-function beginInterceptedAgentSession(session, logger) {
+function beginInterceptedAgentSession(session, logger, options = {}) {
   if (!session?.active || session.intercepted) return;
   session.intercepted = true;
   try {
@@ -2336,8 +2359,35 @@ function beginInterceptedAgentSession(session, logger) {
     'X-Accel-Buffering': 'no',
   });
   if (typeof session.res.flushHeaders === 'function') session.res.flushHeaders();
-  sendAgentRunSseBootstrap(session, logger);
+  if (options.bootstrap !== false) {
+    sendAgentRunSseBootstrap(session, logger);
+  }
   startAgentHeartbeat(session);
+}
+
+function replayAgentGeneratedChunks(session, chunks = [], logger = null) {
+  if (!session?.active || !session?.res || !Array.isArray(chunks) || !chunks.length) return 0;
+  let replayed = 0;
+  for (const chunk of chunks) {
+    const buffer = Buffer.from(chunk || []);
+    if (!buffer.length) continue;
+    try {
+      session.res.write(buffer);
+      replayed += 1;
+    } catch (error) {
+      logger?.warn?.(`agent local relay replay generated chunk failed requestId=${session.requestId || '-'}: ${error.message}`);
+      break;
+    }
+  }
+  if (replayed > 0 && typeof session.res.flush === 'function') {
+    try {
+      session.res.flush();
+    } catch {
+      /* ignore flush failures */
+    }
+  }
+  logger?.info?.(`agent local relay replayed generated chunks requestId=${session.requestId || '-'} count=${replayed}`);
+  return replayed;
 }
 
 function completeSessionHistory(session, status = 'completed', modelCallId = '') {
@@ -2493,20 +2543,25 @@ function finalizeWaitingInteractionSessionStream(session, logger, reason = 'inte
 
 function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
   if (!session) return null;
+  const preservedChunks = cloneAgentGeneratedChunks(session.generatedChunks || []);
   session.ignoreNextRunsseClose = false;
   session.req = req;
   session.res = res;
   session.rawBody = rawBody;
-  session.generatedChunks = [];
+  session.generatedChunks = preservedChunks;
   session.turnEnded = false;
   session.connectEnded = false;
   session.completed = false;
   session.intercepted = false;
   session.streamDetached = false;
   session.relaying = false;
-  beginInterceptedAgentSession(session, logger);
-  replayWaitingSessionPlanCheckpoint(session, logger);
-  replayPendingInteractionQueries(session, logger);
+  beginInterceptedAgentSession(session, logger, { bootstrap: preservedChunks.length === 0 });
+  if (preservedChunks.length > 0) {
+    replayAgentGeneratedChunks(session, preservedChunks, logger);
+  } else {
+    replayWaitingSessionPlanCheckpoint(session, logger);
+    replayPendingInteractionQueries(session, logger);
+  }
   logger?.info?.(`agent local relay waiting session reattached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} deferred=${session.deferredInteractionResponse?.interactionResponse ? '1' : '0'}`);
   return session;
 }
@@ -5305,8 +5360,16 @@ function getUpstreamRequestOptionsByMode(session = {}, context = {}) {
 }
 
 function buildFetchUpstreamOptionsForSession(session = {}, baseOptions = {}, context = {}) {
+  const planWorkflowPhase = getPlanWorkflowPhase(session);
+  const mergedContext = {
+    ...context,
+    planWorkflowPhase,
+    planPhase: planWorkflowPhase,
+  };
   return {
-    ...getUpstreamRequestOptionsByMode(session, context),
+    ...getUpstreamRequestOptionsByMode(session, mergedContext),
+    planWorkflowPhase,
+    planPhase: planWorkflowPhase,
     ...baseOptions,
   };
 }
@@ -5314,7 +5377,11 @@ function buildFetchUpstreamOptionsForSession(session = {}, baseOptions = {}, con
 function interceptToolExecutionByMode(session = {}, toolCall = {}, context = {}) {
   const handler = getModeHandlerForSession(session);
   if (typeof handler.interceptToolExecution !== 'function') return null;
-  return handler.interceptToolExecution(session, toolCall, context, buildModeRuntimeHelpers(session));
+  return handler.interceptToolExecution(session, toolCall, {
+    ...context,
+    planWorkflowPhase: getPlanWorkflowPhase(session),
+    planPhase: getPlanWorkflowPhase(session),
+  }, buildModeRuntimeHelpers(session));
 }
 
 function getMaxContinuationCountByMode(session = {}, options = {}) {
@@ -6633,7 +6700,8 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
     const toolCall = normalizeToolCallPathsForWorkspace(rawToolCall, session);
     const lowerToolName = String(toolCall?.name || '').trim().toLowerCase();
     const signature = getToolCallSignature(toolCall, session);
-    if (signature && session.executedToolSignatures.has(signature)) {
+    const allowFreshExploreDespiteDuplicate = shouldAllowFreshPlanExploreDespiteDuplicate(session, toolCall);
+    if (signature && session.executedToolSignatures.has(signature) && !allowFreshExploreDespiteDuplicate) {
       const previousExecution = session.executedToolResultsBySignature.get(signature);
       logger.info(`agent local relay duplicate tool skipped requestId=${requestId} tool=${toolCall.name} signature=${JSON.stringify(signature)}`);
       const duplicateExecution = {
@@ -6653,7 +6721,12 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       });
       continue;
     }
-    if (signature) session.executedToolSignatures.add(signature);
+    if (allowFreshExploreDespiteDuplicate) {
+      logger.info(
+        `agent local relay allowing fresh plan explore after answers requestId=${requestId} tool=${toolCall.name} signature=${JSON.stringify(signature)}`,
+      );
+    }
+    if (signature && !allowFreshExploreDespiteDuplicate) session.executedToolSignatures.add(signature);
     const toolCallId = toolCall.id || `tool_${Date.now().toString(36)}`;
     const modelCallId = `model_${toolCallId}`;
     const historyToolName = canonicalToolName(toolCall.name);
@@ -6858,6 +6931,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
         rememberSessionPlanState(session, planState);
       }
       syncPlanWorkflowAfterToolExecution(session, toolCall, execution);
+      if (signature) session.executedToolSignatures.add(signature);
       if (isMutation && execution?.ok) {
         emitAgentMutationCheckpointFrames(session, { ...toolCall, id: toolCallId }, execution, logger);
         appendLatestEditReminder(session, execution.args?.path || toolCall.arguments?.path || '');
@@ -7758,6 +7832,7 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
         draftPlanPath: '',
         presentedPlanUri: '',
         checkpointEmittedForPlanUri: '',
+        needsFreshExploreAfterAnswers: false,
       });
     }
     const startedNewTurn = ensureOpenSessionHistoryTurn(session, config, {
@@ -8796,6 +8871,7 @@ function startProxy(config) {
         localNativeAgentTools: Boolean(config.localNativeAgentTools),
         structuredAgentToolCalls: Boolean(config.structuredAgentToolCalls),
         emitLocalToolInteractionFrames: config.emitLocalToolInteractionFrames !== false,
+        emitLocalStepFrames: Boolean(config.emitLocalStepFrames),
         emitSyntheticLocalNativeToolFrames: Boolean(config.emitSyntheticLocalNativeToolFrames),
         emitAgentExecServerFrames: Boolean(config.emitAgentExecServerFrames),
         maxLocalToolCallsPerRound: getMaxLocalToolCallsPerRound(config),

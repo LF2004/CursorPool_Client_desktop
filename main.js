@@ -35,6 +35,7 @@ const {
   buildRelayDiagnostics,
   disableByokForRelay,
   runRelayAgentDialogTest,
+  startRelayPlanUiMock,
 } = require('./js/utils/cursor-relay-proxy');
 const { clearRunnerLogs, initRunnerLogs } = require('./js/utils/cursor-relay-log');
 const {
@@ -309,6 +310,7 @@ ipcMain.handle('cursorRelay:readLog', async () => readRunnerLogTail());
 ipcMain.handle('cursorRelay:diagnose', async () => buildRelayDiagnostics());
 
 ipcMain.handle('cursorRelay:testAgent', async (_event, payload = {}) => runRelayAgentDialogTest(payload));
+ipcMain.handle('cursorRelay:startPlanUiMock', async (_event, payload = {}) => startRelayPlanUiMock(payload));
 
 async function openRelayTextFile(target, missingMessage) {
   if (!fssync.existsSync(target)) {

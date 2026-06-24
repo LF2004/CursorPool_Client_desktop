@@ -54,6 +54,7 @@ function buildStartOperationKey(options = {}) {
     emitAgentKvBootstrap: options.emitAgentKvBootstrap === true,
     emitLocalMutationCheckpoints: options.emitLocalMutationCheckpoints === true,
     emitLocalToolInteractionFrames: options.emitLocalToolInteractionFrames !== false,
+    emitLocalStepFrames: options.emitLocalStepFrames === true,
     emitAgentExecServerFrames: options.emitAgentExecServerFrames !== false,
     maxLocalToolCallsPerRound: Math.max(1, Math.min(32, Math.floor(Number(options.maxLocalToolCallsPerRound) || 12))),
     enableReviewBridge: options.enableReviewBridge === true,
@@ -188,6 +189,7 @@ function writeRunnerConfig({
   emitAgentKvBootstrap = false,
   emitLocalMutationCheckpoints = false,
   emitLocalToolInteractionFrames = true,
+  emitLocalStepFrames = false,
   emitAgentExecServerFrames = true,
   maxLocalToolCallsPerRound = 12,
   enableReviewBridge = false,
@@ -210,6 +212,7 @@ function writeRunnerConfig({
     emitAgentKvBootstrap: Boolean(emitAgentKvBootstrap),
     emitLocalMutationCheckpoints: Boolean(emitLocalMutationCheckpoints),
     emitLocalToolInteractionFrames: Boolean(emitLocalToolInteractionFrames),
+    emitLocalStepFrames: Boolean(emitLocalStepFrames),
     emitSyntheticLocalNativeToolFrames: false,
     emitAgentExecServerFrames: Boolean(emitAgentExecServerFrames),
     maxLocalToolCallsPerRound: Math.max(1, Math.min(32, Math.floor(Number(maxLocalToolCallsPerRound) || 12))),
@@ -418,6 +421,7 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   const wantKvBootstrap = options.emitAgentKvBootstrap === true;
   const wantLocalMutationCheckpoints = options.emitLocalMutationCheckpoints === true;
   const wantLocalToolInteractionFrames = options.emitLocalToolInteractionFrames === true;
+  const wantLocalStepFrames = options.emitLocalStepFrames === true;
   const wantSyntheticFrames = false;
   const wantExecServerFrames = options.emitAgentExecServerFrames === true;
   const wantMaxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(options.maxLocalToolCallsPerRound) || 12)));
@@ -429,6 +433,7 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   if (Boolean(healthPayload.emitAgentKvBootstrap) !== wantKvBootstrap) return false;
   if (Boolean(healthPayload.emitLocalMutationCheckpoints) !== wantLocalMutationCheckpoints) return false;
   if (Boolean(healthPayload.emitLocalToolInteractionFrames) !== wantLocalToolInteractionFrames) return false;
+  if (Boolean(healthPayload.emitLocalStepFrames) !== wantLocalStepFrames) return false;
   if (Boolean(healthPayload.emitSyntheticLocalNativeToolFrames) !== wantSyntheticFrames) return false;
   if (Boolean(healthPayload.emitAgentExecServerFrames) !== wantExecServerFrames) return false;
   if (Math.max(1, Math.floor(Number(healthPayload.maxLocalToolCallsPerRound) || 0)) !== wantMaxLocalToolCallsPerRound) return false;
@@ -460,6 +465,7 @@ function buildRunnerStartResult({
     emitAgentKvBootstrap: Boolean(written.config.emitAgentKvBootstrap),
     emitLocalMutationCheckpoints: Boolean(written.config.emitLocalMutationCheckpoints),
     emitLocalToolInteractionFrames: Boolean(written.config.emitLocalToolInteractionFrames),
+    emitLocalStepFrames: Boolean(written.config.emitLocalStepFrames),
     emitSyntheticLocalNativeToolFrames: false,
     emitAgentExecServerFrames: Boolean(written.config.emitAgentExecServerFrames),
     maxLocalToolCallsPerRound: Number(written.config.maxLocalToolCallsPerRound) || 12,
@@ -638,6 +644,9 @@ async function startLocalRelayRunner(payload = {}) {
     || String(process.env.CURSOR_RELAY_LOCAL_MUTATION_CHECKPOINTS || '').trim() === '1';
   const emitLocalToolInteractionFrames = payload.emitLocalToolInteractionFrames !== false
     && String(process.env.CURSOR_RELAY_LOCAL_TOOL_INTERACTION_FRAMES || '').trim() !== '0';
+  const emitLocalStepFrames = payload.emitLocalStepFrames === true
+    || (mode === RUNNER_MODE_LOCAL_RELAY && emitLocalToolInteractionFrames)
+    || String(process.env.CURSOR_RELAY_EMIT_STEP_FRAMES || '').trim() === '1';
   const maxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(
     payload.maxLocalToolCallsPerRound
       || process.env.CURSOR_RELAY_MAX_LOCAL_TOOL_CALLS_PER_ROUND
@@ -657,6 +666,7 @@ async function startLocalRelayRunner(payload = {}) {
     emitAgentKvBootstrap,
     emitLocalMutationCheckpoints,
     emitLocalToolInteractionFrames,
+    emitLocalStepFrames,
     emitSyntheticLocalNativeToolFrames,
     emitAgentExecServerFrames,
     maxLocalToolCallsPerRound,
@@ -684,6 +694,7 @@ async function startLocalRelayRunner(payload = {}) {
       emitAgentKvBootstrap,
       emitLocalMutationCheckpoints,
       emitLocalToolInteractionFrames,
+      emitLocalStepFrames,
       emitSyntheticLocalNativeToolFrames,
       emitAgentExecServerFrames,
       maxLocalToolCallsPerRound,
@@ -729,6 +740,7 @@ async function startLocalRelayRunner(payload = {}) {
     emitAgentKvBootstrap,
     emitLocalMutationCheckpoints,
     emitLocalToolInteractionFrames,
+    emitLocalStepFrames,
     emitSyntheticLocalNativeToolFrames,
     emitAgentExecServerFrames,
     maxLocalToolCallsPerRound,
@@ -866,6 +878,9 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     emitLocalToolInteractionFrames: Object.prototype.hasOwnProperty.call(health.payload || {}, 'emitLocalToolInteractionFrames')
       ? Boolean(health.payload?.emitLocalToolInteractionFrames)
       : Boolean(runnerConfig?.emitLocalToolInteractionFrames),
+    emitLocalStepFrames: Object.prototype.hasOwnProperty.call(health.payload || {}, 'emitLocalStepFrames')
+      ? Boolean(health.payload?.emitLocalStepFrames)
+      : Boolean(runnerConfig?.emitLocalStepFrames),
     emitSyntheticLocalNativeToolFrames: false,
     emitAgentExecServerFrames: Boolean(
       health.payload?.emitAgentExecServerFrames || runnerConfig?.emitAgentExecServerFrames,

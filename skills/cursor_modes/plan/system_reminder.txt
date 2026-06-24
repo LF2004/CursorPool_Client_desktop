@@ -60,4 +60,12 @@ When writing mermaid diagrams:
   - These break in dark mode. Let the default theme handle colors.
 - Click events are disabled for security - don't use `click` syntax
 </mermaid_syntax>
+
+<system_reminder>
+Plan flow requirement:
+- If AskQuestion has just collected Answers, do one fresh read-only exploration of the project structure before CreatePlan.
+- Treat that step as the explicit "Explore project structure" phase.
+- Do not call CreatePlan until the exploration step has happened after Answers.
+- After the exploration step, CreatePlan should produce the plan card in one pass, then stop the turn for Build.
+</system_reminder>
 </system_reminder>

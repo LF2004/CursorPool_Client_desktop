@@ -1776,17 +1776,25 @@ function buildAgentInteractionQueryFrame(queryField, queryPayload, queryId = 1) 
 }
 
 function buildAgentAskQuestionQueryFrame(argumentsValue = {}, toolCallId = '', queryId = 1) {
+  const argsPayload = encodeAgentToolArgsPayload('AskQuestion', argumentsValue, toolCallId);
   return buildAgentInteractionQueryFrame(
     3,
-    encodeAgentToolArgsPayload('AskQuestion', argumentsValue, toolCallId),
+    concatBytes([
+      argsPayload.length ? encodeBytesField(1, argsPayload) : Buffer.alloc(0),
+      encodeOptionalStringField(2, toolCallId),
+    ]),
     queryId,
   );
 }
 
 function buildAgentCreatePlanQueryFrame(argumentsValue = {}, toolCallId = '', queryId = 1) {
+  const argsPayload = encodeAgentToolArgsPayload('CreatePlan', argumentsValue, toolCallId);
   return buildAgentInteractionQueryFrame(
     7,
-    encodeAgentToolArgsPayload('CreatePlan', argumentsValue, toolCallId),
+    concatBytes([
+      argsPayload.length ? encodeBytesField(1, argsPayload) : Buffer.alloc(0),
+      encodeOptionalStringField(2, toolCallId),
+    ]),
     queryId,
   );
 }
@@ -2230,6 +2238,7 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
   if (normalized === 'askquestion' || normalized === 'ask_question') {
     const questions = Array.isArray(safeArgs.questions) ? safeArgs.questions : [];
     const answers = Array.isArray(execution.answers) ? execution.answers : [];
+    const errorText = String(execution.resultText || execution.error || 'AskQuestion failed').trim();
     return {
       askQuestionToolCall: {
         args: {
@@ -2237,7 +2246,7 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
           questions,
         },
         result: execution.ok === false
-          ? { error: { errorMessage: resultText || 'AskQuestion failed' } }
+          ? { error: { errorMessage: errorText } }
           : {
             success: {
               answers,
@@ -2248,6 +2257,7 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
   }
   if (normalized === 'createplan' || normalized === 'create_plan') {
     const todos = Array.isArray(safeArgs.todos) ? safeArgs.todos : [];
+    const errorText = String(execution.resultText || execution.error || 'CreatePlan failed').trim();
     return {
       createPlanToolCall: {
         args: {
@@ -2257,7 +2267,7 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
           todos,
         },
         result: execution.ok === false
-          ? { error: { errorMessage: resultText || 'CreatePlan failed' } }
+          ? { error: { errorMessage: errorText } }
           : {
             planUri: String(execution.planPath || execution.planUri || safeArgs.planUri || '').trim(),
             success: {},
@@ -2360,21 +2370,15 @@ function encodeAgentToolArgsPayload(toolName, args = {}, toolCallId = '') {
       ]);
     case 'CreatePlan':
       return concatBytes([
-        encodeBytesField(1, concatBytes([
-          encodeOptionalStringField(1, normalizedArgs.plan),
-          ...(Array.isArray(normalizedArgs.todos) ? normalizedArgs.todos : []).map((todo) => encodeBytesField(2, encodeAgentTodoItem(todo))),
-          encodeOptionalStringField(3, normalizedArgs.overview),
-          encodeOptionalStringField(4, normalizedArgs.name),
-        ])),
-        encodeOptionalStringField(2, toolCallId),
+        encodeOptionalStringField(1, normalizedArgs.plan),
+        ...(Array.isArray(normalizedArgs.todos) ? normalizedArgs.todos : []).map((todo) => encodeBytesField(2, encodeAgentTodoItem(todo))),
+        encodeOptionalStringField(3, normalizedArgs.overview),
+        encodeOptionalStringField(4, normalizedArgs.name),
       ]);
     case 'AskQuestion':
       return concatBytes([
-        encodeBytesField(1, concatBytes([
-          encodeOptionalStringField(1, normalizedArgs.title),
-          ...(Array.isArray(normalizedArgs.questions) ? normalizedArgs.questions : []).map((question) => encodeBytesField(2, encodeAskQuestionQuestion(question))),
-        ])),
-        encodeOptionalStringField(2, toolCallId),
+        encodeOptionalStringField(1, normalizedArgs.title),
+        ...(Array.isArray(normalizedArgs.questions) ? normalizedArgs.questions : []).map((question) => encodeBytesField(2, encodeAskQuestionQuestion(question))),
       ]);
     case 'WebFetch':
       return concatBytes([
@@ -2550,12 +2554,10 @@ function encodeAgentToolResultPayload(toolName, args = {}, execution = null, too
           ]),
         }]);
       }
-      return encodeMessage([{
-        field: 1,
-        value: concatBytes([
-          encodeOptionalStringField(3, execution.planPath || ''),
-        ]),
-      }]);
+      return concatBytes([
+        encodeBytesField(1, Buffer.alloc(0)),
+        encodeOptionalStringField(3, execution.planPath || execution.planUri || ''),
+      ]);
     }
     case 'Task': {
       if (!execution.ok) {
@@ -2584,9 +2586,14 @@ function encodeAgentToolResultPayload(toolName, args = {}, execution = null, too
           ]),
         }]);
       }
+      const answers = Array.isArray(execution.answers) ? execution.answers : [];
       return encodeMessage([{
-        field: 4,
-        value: Buffer.alloc(0),
+        field: 1,
+        value: concatBytes(answers.map((answer) => encodeBytesField(1, concatBytes([
+          encodeOptionalStringField(1, answer.questionId || answer.question_id),
+          encodeRepeatedStringField(2, answer.selectedOptionIds || answer.selected_option_ids),
+          encodeOptionalStringField(3, answer.freeformText || answer.freeform_text),
+        ])))),
       }]);
     }
     case 'WebSearch': {

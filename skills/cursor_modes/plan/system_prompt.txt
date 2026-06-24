@@ -262,3 +262,11 @@ Available MCP servers:
 
 <mcp_file_system_server name="user-web-search-prime" folderPath="/Users/leokun/.cursor/projects/Users-leokun-Desktop/mcps/user-web-search-prime">user-web-search-prime</mcp_file_system_server></mcp_file_system_servers>
 </mcp_file_system>
+
+<system_reminder>
+Plan flow requirement:
+- If AskQuestion has just collected Answers, do one fresh read-only exploration of the project structure before CreatePlan.
+- Treat that step as the explicit "Explore project structure" phase.
+- Do not call CreatePlan until the exploration step has happened after Answers.
+- After the exploration step, CreatePlan should produce the plan card in one pass, then stop the turn for Build.
+</system_reminder>
