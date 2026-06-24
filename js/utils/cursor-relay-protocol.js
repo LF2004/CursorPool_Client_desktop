@@ -445,6 +445,22 @@ function summarizeCreatePlanArgsPayload(payload) {
   };
 }
 
+function summarizeTaskArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const subagentTypeFields = parseFields(getFieldBytes(argsFields, 3) || Buffer.alloc(0));
+  const subagentType = {};
+  if (getFieldBytes(subagentTypeFields, 1)) {
+    subagentType.explore = decodeUtf8(getFieldBytes(subagentTypeFields, 1) || Buffer.alloc(0)).trim() || 'explore';
+  }
+  return {
+    description: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    prompt: decodeUtf8(getFieldBytes(argsFields, 2) || Buffer.alloc(0)).trim(),
+    subagentType,
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
 function summarizeAskQuestionInteractionResponsePayload(payload) {
   const fields = parseFields(payload || Buffer.alloc(0));
   const resultFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
@@ -511,17 +527,21 @@ function summarizeInteractionQuery(payload) {
   const askPayload = getFieldBytes(fields, 3);
   const createPlanPayload = getFieldBytes(fields, 7);
   const webSearchPayload = getFieldBytes(fields, 2);
+  const taskPayload = getFieldBytes(fields, 19);
   return {
     id: getFieldVarint(fields, 1) ?? null,
     kind: askPayload
       ? 'ask_question_interaction_query'
       : createPlanPayload
         ? 'create_plan_request_query'
+        : taskPayload
+          ? 'task_tool_query'
         : webSearchPayload
           ? 'web_search_request_query'
           : '',
     askQuestion: askPayload ? summarizeAskQuestionArgsPayload(askPayload) : null,
     createPlan: createPlanPayload ? summarizeCreatePlanArgsPayload(createPlanPayload) : null,
+    task: taskPayload ? summarizeTaskArgsPayload(taskPayload) : null,
     webSearch: webSearchPayload
       ? {
           searchTerm: decodeUtf8(getFieldBytes(parseFields(webSearchPayload), 1) || Buffer.alloc(0)).trim(),
@@ -2275,6 +2295,30 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
       },
     };
   }
+  if (normalized === 'task') {
+    const description = String(safeArgs.description || '').trim();
+    const prompt = String(safeArgs.prompt || '').trim();
+    const subagentType = safeArgs.subagent_type || safeArgs.subagentType || {};
+    return {
+      taskToolCall: {
+        args: {
+          description,
+          prompt,
+          subagentType,
+          toolCallId: callId || undefined,
+        },
+        result: execution.ok === false
+          ? { error: { errorMessage: execution.resultText || 'Task failed' } }
+          : {
+            success: {
+              agentId: String(execution.agentId || '').trim(),
+              isBackground: execution.isBackground === true,
+              durationMs: Number(execution.durationMs) || 0,
+            },
+          },
+      },
+    };
+  }
   return null;
 }
 
@@ -2385,6 +2429,22 @@ function encodeAgentToolArgsPayload(toolName, args = {}, toolCallId = '') {
         encodeOptionalStringField(1, normalizedArgs.url),
         encodeOptionalStringField(2, toolCallId),
       ]);
+    case 'Task': {
+      const subagentType = normalizedArgs.subagent_type || normalizedArgs.subagentType || {};
+      const exploreValue = typeof subagentType === 'object' && subagentType
+        ? String(subagentType.explore || '').trim()
+        : /explore/i.test(String(subagentType || '')) ? 'explore' : '';
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.description),
+        encodeOptionalStringField(2, normalizedArgs.prompt),
+        exploreValue
+          ? encodeBytesField(3, concatBytes([
+            encodeOptionalStringField(1, exploreValue),
+          ]))
+          : Buffer.alloc(0),
+        encodeOptionalStringField(4, toolCallId),
+      ]);
+    }
     default:
       return Buffer.alloc(0);
   }

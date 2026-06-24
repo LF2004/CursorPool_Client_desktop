@@ -1178,6 +1178,39 @@ body.theme-light .log-detail { color: #374151; }
 .usage-page[data-usage-view="compact"] .usage-request {
   display: none;
 }
+.usage-page[data-usage-view="compact"] .usage-token-content {
+  gap: calc(3px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-token-row {
+  gap: calc(3px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-cost-main {
+  gap: calc(3px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-info-btn {
+  width: calc(18px * var(--app-font-scale, 1));
+  height: calc(18px * var(--app-font-scale, 1));
+  font-size: calc(11px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-th-help {
+  margin-left: 2px;
+  font-size: calc(11px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table.record-table th {
+  padding: calc(6px * var(--app-font-scale, 1)) calc(6px * var(--app-font-scale, 1));
+  font-size: calc(12px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table.record-table td {
+  padding: calc(4px * var(--app-font-scale, 1)) calc(6px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table th:nth-child(4) {
+  padding-left: calc(1px * var(--app-font-scale, 1));
+  padding-right: calc(2px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table th:nth-child(6) {
+  width: calc(150px * var(--app-font-scale, 1));
+  min-width: calc(150px * var(--app-font-scale, 1));
+}
 .usage-mode-cell {
   white-space: nowrap;
 }

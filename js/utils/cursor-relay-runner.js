@@ -1187,6 +1187,12 @@ function readRecentWorkspaceRoot() {
   }
 }
 
+function isCursorWorkspaceStorageRoot(root = '') {
+  const normalized = normalizeWorkspacePath(root).replace(/\//g, '\\');
+  if (!normalized) return false;
+  return /\\AppData\\Roaming\\Cursor\\User\\workspaceStorage\\[^\\]+(?:\\|$)/i.test(normalized);
+}
+
 function isInternalRelayWorkspaceRoot(root = '') {
   const normalized = normalizeWorkspacePath(root).replace(/\//g, '\\');
   if (!normalized) return false;
@@ -1194,26 +1200,57 @@ function isInternalRelayWorkspaceRoot(root = '') {
     || /\\\.cursorpool(?:\\|$)/i.test(normalized);
 }
 
+function isUntrustedWorkspaceRoot(root = '') {
+  return isInternalRelayWorkspaceRoot(root) || isCursorWorkspaceStorageRoot(root);
+}
+
+function writeRecentWorkspaceRoot(root = '', logger = null, source = '') {
+  const normalized = normalizeWorkspaceRoot(root || '');
+  if (!normalized || isUntrustedWorkspaceRoot(normalized)) return false;
+  try {
+    fs.mkdirSync(path.dirname(RECENT_EXECUTION_WORKSPACE_PATH), { recursive: true });
+    fs.writeFileSync(RECENT_EXECUTION_WORKSPACE_PATH, JSON.stringify({
+      root: normalized,
+      workspaceRoot: normalized,
+      updatedAt: new Date().toISOString(),
+      source: String(source || '').trim(),
+    }, null, 2));
+    return true;
+  } catch (error) {
+    logger?.warn?.(`agent local relay failed to persist recent workspace root=${JSON.stringify(normalized)} source=${JSON.stringify(String(source || '').trim())}: ${error.message}`);
+    return false;
+  }
+}
+
 function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = null, requestId = '-') {
   const decodedRoot = normalizeWorkspaceRoot(decodedWorkspaceRoot || '');
   const recentRoot = readRecentWorkspaceRoot();
-  if (decodedRoot && isInternalRelayWorkspaceRoot(decodedRoot) && recentRoot && !isInternalRelayWorkspaceRoot(recentRoot)) {
+  const cwdRoot = normalizeWorkspaceRoot(process.cwd());
+  const trustedDecodedRoot = decodedRoot && !isUntrustedWorkspaceRoot(decodedRoot) ? decodedRoot : '';
+  const trustedRecentRoot = recentRoot && !isUntrustedWorkspaceRoot(recentRoot) ? recentRoot : '';
+  if (decodedRoot && !trustedDecodedRoot && trustedRecentRoot) {
     logger?.warn?.(
       `agent local relay ignored internal decoded workspace requestId=${requestId || '-'} decoded=${JSON.stringify(decodedRoot)} recent=${JSON.stringify(recentRoot)}`,
     );
-    return recentRoot;
   }
-  if (decodedRoot) return decodedRoot;
-  return recentRoot;
+  if (decodedRoot && !trustedDecodedRoot && !trustedRecentRoot) {
+    logger?.warn?.(
+      `agent local relay ignored untrusted decoded workspace requestId=${requestId || '-'} decoded=${JSON.stringify(decodedRoot)} fallback=${JSON.stringify(cwdRoot)}`,
+    );
+  }
+  const selectedRoot = trustedDecodedRoot || trustedRecentRoot || cwdRoot;
+  if (selectedRoot) writeRecentWorkspaceRoot(selectedRoot, logger, `user_message:${requestId || '-'}`);
+  return selectedRoot;
 }
 
 function getSessionWorkspaceRoot(session = {}) {
   const direct = normalizeWorkspaceRoot(session.workspaceRoot || session.lastUserMessageCapture?.workspaceRoot || '');
   const recent = readRecentWorkspaceRoot();
-  if (direct && isInternalRelayWorkspaceRoot(direct) && recent && !isInternalRelayWorkspaceRoot(recent)) return recent;
+  const cwdRoot = normalizeWorkspaceRoot(process.cwd());
+  if (direct && isUntrustedWorkspaceRoot(direct) && recent && !isUntrustedWorkspaceRoot(recent)) return recent;
   if (direct) return direct;
   if (recent) return recent;
-  return process.cwd();
+  return cwdRoot || process.cwd();
 }
 
 function resolveWorkspacePath(inputPath, session = {}) {
@@ -5139,7 +5176,6 @@ function textLooksLikeSubstantiveFinalAnswer(text = '') {
   if (compact.length >= 160 || countWordsAndCjkChars(value) >= 40) return true;
   if (/\n\s*(?:[-*]|\d+[.)])\s+\S/.test(value)) return true;
   if (/```/.test(value)) return true;
-  if (/(?:^|\n)\s*(?:summary|result|done|completed|analysis|findings|conclusion|next steps|总结|结论|分析|结果|完成|已完成|问题|建议|发现)\s*[:：]/i.test(value)) return true;
   return false;
 }
 
@@ -5150,9 +5186,14 @@ function looksLikeReadOnlyExplorationStillInProgress(session = {}, finalText = '
   const mutationCount = summaries.filter((entry) => isMutationToolName(entry?.tool)).length;
   const continuationTargetPath = getReadOnlyContinuationTargetPath(session);
   const value = String(finalText || '').trim();
+  const sawReliableCompletion = options.lastStreamSawDone === true;
+  const stopReason = String(options.lastStreamStopReason || '').trim();
+  if (!sawReliableCompletion && (stopReason === 'local_stop_after_text' || stopReason === 'local_timeout' || stopReason === 'usage_without_done' || stopReason === 'stream_end')) {
+    return readOnlyCount > 0 && mutationCount === 0;
+  }
+  if (sawReliableCompletion) return false;
   if (!value) return readOnlyCount > 0 && mutationCount === 0;
   if (isPlaceholderFinalText(value)) return true;
-  if (textLooksLikeSubstantiveFinalAnswer(value)) return false;
   const compact = stripCjkAndAsciiPunctuation(value);
   if (!compact) return true;
   if (continuationTargetPath && readOnlyCount >= 1 && mutationCount === 0) {
@@ -6139,6 +6180,7 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
   let upstreamUsage = null;
   let durationMs = 0;
   let eventTypes = '';
+  let stopReason = '';
   session.logger?.info?.(`agent local relay upstream stream start requestId=${session.requestId || '-'} phase=${phase}`);
   try {
     session.currentUpstreamToolState = toolState;
@@ -6202,9 +6244,19 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
       signal: session.abortController?.signal || null,
       extendMaxDurationOnActivity: options.extendMaxDurationOnActivity === true,
       shouldStop: () => {
-        if (upstreamUsage) return true;
+        if (sawDone) {
+          stopReason = 'upstream_done';
+          return true;
+        }
+        if (upstreamUsage) {
+          stopReason = 'usage_without_done';
+          return true;
+        }
         if (stopOnToolCall && normalizeCollectedToolCalls(toolState).length > 0) return false;
-        if (stopAfterTextMs > 0 && lastTextAt > 0 && Date.now() - lastTextAt >= stopAfterTextMs) return true;
+        if (stopAfterTextMs > 0 && lastTextAt > 0 && Date.now() - lastTextAt >= stopAfterTextMs) {
+          stopReason = 'local_stop_after_text';
+          return true;
+        }
         if (
           reasoningOnlyMaxMs > 0
           && firstReasoningAt > 0
@@ -6213,6 +6265,7 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
           && Date.now() - firstReasoningAt >= reasoningOnlyMaxMs
         ) {
           upstreamError = `上游模型持续只输出 Thought/思考内容超过 ${Math.round(reasoningOnlyMaxMs / 1000)} 秒，本地 Relay 已停止等待以避免空转。`;
+          stopReason = 'local_reasoning_timeout';
           session.logger?.warn?.(
             `agent local relay upstream stream reasoning-only stop requestId=${session.requestId || '-'} phase=${phase} maxMs=${reasoningOnlyMaxMs} reasoningLen=${reasoningParts.join('').length}`,
           );
@@ -6235,6 +6288,12 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
       writeAgentFrame(session, buildAgentThinkingCompletedFrame(Date.now() - thinkingStartedAt));
     }
     if (session.currentUpstreamToolState === toolState) session.currentUpstreamToolState = null;
+    if (!stopReason) {
+      if (sawDone) stopReason = 'upstream_done';
+      else if (isRecoverableStreamError(upstreamError)) stopReason = 'local_timeout';
+      else if (upstreamError) stopReason = 'upstream_error';
+      else stopReason = 'stream_end';
+    }
     eventTypes = Array.from(eventTypeCounts.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 12)
@@ -6242,7 +6301,7 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
       .join(',');
     durationMs = Date.now() - startedAt;
     session.logger?.info?.(
-      `agent local relay upstream stream end requestId=${session.requestId || '-'} phase=${phase} deltaCount=${deltaCount} textLen=${textParts.join('').length} reasoningLen=${reasoningParts.join('').length} toolCalls=${normalizeCollectedToolCalls(toolState).length} eventTypes=${JSON.stringify(eventTypes)} error=${JSON.stringify(upstreamError)} durationMs=${durationMs}`,
+      `agent local relay upstream stream end requestId=${session.requestId || '-'} phase=${phase} deltaCount=${deltaCount} textLen=${textParts.join('').length} reasoningLen=${reasoningParts.join('').length} toolCalls=${normalizeCollectedToolCalls(toolState).length} sawDone=${sawDone ? '1' : '0'} stopReason=${stopReason} eventTypes=${JSON.stringify(eventTypes)} error=${JSON.stringify(upstreamError)} durationMs=${durationMs}`,
     );
     if (options.emit !== false && textParts.join('').trim() && !shouldSuppressVisiblePlanText(session, options)) {
       flushAgentTextToHistory(session);
@@ -6257,6 +6316,8 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
     durationMs,
     deltaCount,
     eventTypes,
+    sawDone,
+    stopReason,
   };
 }
 
@@ -6639,6 +6700,8 @@ async function continueAgentStreamLoop(session, options = {}) {
   let pendingNativeMutation = false;
   let completionVerificationCount = 0;
   let incompletePostMutationContinuationCount = 0;
+  let lastStreamSawDone = initialStreamed?.sawDone === true;
+  let lastStreamStopReason = String(initialStreamed?.stopReason || '').trim();
   const maxToolRounds = getMaxLocalToolRounds(config);
 
   while (session.active && !session.aborted) {
@@ -6825,6 +6888,8 @@ async function continueAgentStreamLoop(session, options = {}) {
             finalText = streamed.text;
             finalReasoning = streamed.reasoning;
             upstreamError = streamed.upstreamError;
+            lastStreamSawDone = streamed.sawDone === true;
+            lastStreamStopReason = String(streamed.stopReason || '').trim();
             toolCalls = attachDefaultMutationTarget(
               streamed.toolCalls.slice(0, maxToolCallsPerRound),
               session,
@@ -6953,6 +7018,8 @@ async function continueAgentStreamLoop(session, options = {}) {
             finalText = streamed.text;
             finalReasoning = streamed.reasoning;
             upstreamError = streamed.upstreamError;
+            lastStreamSawDone = streamed.sawDone === true;
+            lastStreamStopReason = String(streamed.stopReason || '').trim();
             toolCalls = attachDefaultMutationTarget(
               streamed.toolCalls.slice(0, maxToolCallsPerRound),
               session,
@@ -6994,12 +7061,23 @@ async function continueAgentStreamLoop(session, options = {}) {
 
     while (session.active
       && !session.aborted
-      && shouldContinueIncompleteWorkByMode(session, finalText, toolCalls, upstreamError, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool })) {
+      && shouldContinueIncompleteWorkByMode(session, finalText, toolCalls, upstreamError, incompletePostMutationContinuationCount, {
+        sawMutationTool,
+        sawReadOnlyTool,
+        lastStreamSawDone,
+        lastStreamStopReason,
+      })) {
       const continuationPhase = `incomplete_continuation_${incompletePostMutationContinuationCount + 1}`;
       const maxIncompleteContinuations = getMaxContinuationCountByMode(session, { sawMutationTool, sawReadOnlyTool });
       const incompleteTodosForContinuation = getIncompleteTodos(session);
-      const forceReadOnlyContinuationTool = shouldForceReadOnlyContinuationToolCall(session, finalText, { sawMutationTool, sawReadOnlyTool });
-      const forceToolForContinuation = shouldForceContinuationToolChoiceByMode(session, finalText, { sawMutationTool, sawReadOnlyTool });
+      const continuationOptions = {
+        sawMutationTool,
+        sawReadOnlyTool,
+        lastStreamSawDone,
+        lastStreamStopReason,
+      };
+      const forceReadOnlyContinuationTool = shouldForceReadOnlyContinuationToolCall(session, finalText, continuationOptions);
+      const forceToolForContinuation = shouldForceContinuationToolChoiceByMode(session, finalText, continuationOptions);
       const readOnlyContinuationTarget = forceReadOnlyContinuationTool
         ? (toWorkspaceRelativePath(getReadOnlyContinuationTargetPath(session), getSessionWorkspaceRoot(session)) || getReadOnlyContinuationTargetPath(session))
         : '';
@@ -7073,6 +7151,8 @@ async function continueAgentStreamLoop(session, options = {}) {
           finalText = streamed.text;
           finalReasoning = streamed.reasoning;
           upstreamError = streamed.upstreamError;
+          lastStreamSawDone = streamed.sawDone === true;
+          lastStreamStopReason = String(streamed.stopReason || '').trim();
           toolCalls = attachDefaultMutationTarget(
             streamed.toolCalls.slice(0, maxToolCallsPerRound),
             session,
@@ -7119,7 +7199,12 @@ async function continueAgentStreamLoop(session, options = {}) {
     finalText,
     toolCalls,
     upstreamError,
-    { sawMutationTool, sawReadOnlyTool },
+    {
+      sawMutationTool,
+      sawReadOnlyTool,
+      lastStreamSawDone,
+      lastStreamStopReason,
+    },
   );
   if (incompleteWorkAtEnd) {
     session.unfinishedWorkAtEnd = true;

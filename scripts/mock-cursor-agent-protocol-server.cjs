@@ -63,7 +63,7 @@ function parseArgs(argv) {
 function printHelp() {
   console.log([
     'Usage:',
-    '  node scripts/mock-cursor-agent-protocol-server.cjs [--port 17888] [--scenario all-tools|edit-stream|file-ops|complex-multifile|minimal|plan-full] [--delay 180] [--native-exec] [--dry-run] [--self-test]',
+    '  node scripts/mock-cursor-agent-protocol-server.cjs [--port 17888] [--scenario all-tools|edit-stream|file-ops|complex-multifile|minimal|plan-full|plan-explore-task] [--delay 180] [--native-exec] [--dry-run] [--self-test]',
     '',
     'What it does:',
     '  Starts a temporary HTTP CONNECT proxy that intercepts Cursor Agent RunSSE/BidiAppend',
@@ -171,7 +171,10 @@ function buildPlanFullScenario() {
   const workspaceRoot = 'E:\\project\\h5-test';
   const askIds = toolIds('ask_question');
   const lsIds = toolIds('ls');
-  const globIds = toolIds('glob');
+  const globPackageIds = toolIds('glob_package');
+  const globIndexIds = toolIds('glob_index');
+  const globSrcIds = toolIds('glob_src');
+  const globReadmeIds = toolIds('glob_readme');
   const planIds = toolIds('create_plan');
   const todos = [
     { id: 'todo_html', content: 'Create index.html shell', status: 'pending' },
@@ -244,9 +247,9 @@ function buildPlanFullScenario() {
     },
     { label: 'step_completed_1', frame: buildAgentStepCompletedFrame(1, 120) },
     { label: 'step_started_2', frame: buildAgentStepStartedFrame(2) },
-    { label: 'thinking_explore', frame: buildAgentThinkingDeltaFrame('Mock plan flow: Explore project structure after answers.') },
-    { label: 'partial_ls', frame: buildAgentPartialToolCallFrame('LS', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
-    { label: 'started_ls', frame: buildAgentToolCallStartedFrame('LS', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
+    { label: 'thinking_explore', frame: buildAgentThinkingDeltaFrame('Mock plan flow: inspect project structure with real read-only tools before CreatePlan.') },
+    { label: 'partial_ls', frame: buildAgentPartialToolCallFrame('Ls', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
+    { label: 'started_ls', frame: buildAgentToolCallStartedFrame('Ls', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
     {
       label: 'exec_ls',
       frame: buildAgentExecLsFrame({
@@ -260,43 +263,139 @@ function buildPlanFullScenario() {
     },
     {
       label: 'completed_ls',
-      frame: buildCompleted('LS', { path: workspaceRoot }, {
+      frame: buildCompleted('Ls', { path: workspaceRoot }, {
         ok: true,
-        tool: 'LS',
+        tool: 'Ls',
         args: { path: workspaceRoot },
-        resultText: `ls success path=${workspaceRoot} files=0`,
+        resultText: [
+          `ls success path=${workspaceRoot} files=2`,
+          '[dir] src',
+          '[file] package.json',
+        ].join('\n'),
         durationMs: 1,
       }, lsIds),
     },
     {
-      label: 'partial_glob',
+      label: 'partial_glob_package',
       frame: buildAgentPartialToolCallFrame('Glob', {
         target_directory: workspaceRoot,
-        glob_pattern: '**/*',
-      }, globIds.callId, globIds.modelCallId),
+        glob_pattern: 'package.json',
+      }, globPackageIds.callId, globPackageIds.modelCallId),
     },
     {
-      label: 'started_glob',
+      label: 'started_glob_package',
       frame: buildAgentToolCallStartedFrame('Glob', {
         target_directory: workspaceRoot,
-        glob_pattern: '**/*',
-      }, globIds.callId, globIds.modelCallId),
+        glob_pattern: 'package.json',
+      }, globPackageIds.callId, globPackageIds.modelCallId),
     },
     {
-      label: 'completed_glob',
+      label: 'completed_glob_package',
       frame: buildCompleted('Glob', {
         target_directory: workspaceRoot,
-        glob_pattern: '**/*',
+        glob_pattern: 'package.json',
       }, {
         ok: true,
         tool: 'Glob',
         args: {
           target_directory: workspaceRoot,
-          glob_pattern: '**/*',
+          glob_pattern: 'package.json',
         },
-        resultText: 'index.html\ncss/style.css\njs/app.js\njs/data.json',
+        resultText: 'package.json',
         durationMs: 1,
-      }, globIds),
+      }, globPackageIds),
+    },
+    {
+      label: 'partial_glob_index',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'index.html',
+      }, globIndexIds.callId, globIndexIds.modelCallId),
+    },
+    {
+      label: 'started_glob_index',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'index.html',
+      }, globIndexIds.callId, globIndexIds.modelCallId),
+    },
+    {
+      label: 'completed_glob_index',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'index.html',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: 'index.html',
+        },
+        resultText: 'No files matched "index.html" under E:\\project\\h5-test.',
+        noMatches: true,
+        durationMs: 1,
+      }, globIndexIds),
+    },
+    {
+      label: 'partial_glob_src',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'src/**',
+      }, globSrcIds.callId, globSrcIds.modelCallId),
+    },
+    {
+      label: 'started_glob_src',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'src/**',
+      }, globSrcIds.callId, globSrcIds.modelCallId),
+    },
+    {
+      label: 'completed_glob_src',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'src/**',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: 'src/**',
+        },
+        resultText: 'src/app.js\nsrc/data.js',
+        durationMs: 1,
+      }, globSrcIds),
+    },
+    {
+      label: 'partial_glob_readme',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'README*',
+      }, globReadmeIds.callId, globReadmeIds.modelCallId),
+    },
+    {
+      label: 'started_glob_readme',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'README*',
+      }, globReadmeIds.callId, globReadmeIds.modelCallId),
+    },
+    {
+      label: 'completed_glob_readme',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'README*',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: 'README*',
+        },
+        resultText: 'No files matched "README*" under E:\\project\\h5-test.',
+        noMatches: true,
+        durationMs: 1,
+      }, globReadmeIds),
     },
     { label: 'step_completed_2', frame: buildAgentStepCompletedFrame(2, 180) },
     { label: 'step_started_3', frame: buildAgentStepStartedFrame(3) },
@@ -342,6 +441,75 @@ function buildPlanFullScenario() {
     { label: 'step_completed_3', frame: buildAgentStepCompletedFrame(3, 220) },
     { label: 'turn_end', frame: buildAgentTurnEndedFrame() },
     { label: 'connect_end', frame: buildConnectEndFrame({ mock: true, scenario: 'plan-full' }) },
+  ];
+}
+
+function buildPlanExploreTaskScenario() {
+  const workspaceRoot = 'E:\\project\\h5-test';
+  const frames = buildPlanFullScenario();
+  const taskIds = toolIds('task_explore');
+  const exploreFrames = [
+    {
+      label: 'partial_task_explore',
+      frame: buildAgentPartialToolCallFrame('Task', {
+        description: 'Explore project structure',
+        prompt: 'Inspect the workspace structure and summarize the key files relevant to the requested landing page plan.',
+        subagent_type: { explore: 'explore' },
+      }, taskIds.callId, taskIds.modelCallId),
+    },
+    {
+      label: 'started_task_explore',
+      frame: buildAgentToolCallStartedFrame('Task', {
+        description: 'Explore project structure',
+        prompt: 'Inspect the workspace structure and summarize the key files relevant to the requested landing page plan.',
+        subagent_type: { explore: 'explore' },
+      }, taskIds.callId, taskIds.modelCallId),
+    },
+    {
+      label: 'completed_task_explore',
+      frame: buildCompleted('Task', {
+        description: 'Explore project structure',
+        prompt: 'Inspect the workspace structure and summarize the key files relevant to the requested landing page plan.',
+        subagent_type: { explore: 'explore' },
+      }, {
+        ok: true,
+        tool: 'Task',
+        args: {
+          description: 'Explore project structure',
+          prompt: 'Inspect the workspace structure and summarize the key files relevant to the requested landing page plan.',
+          subagent_type: { explore: 'explore' },
+        },
+        resultText: 'Explore task completed: Explore project structure.\nFound package.json and src/ modules relevant to the landing page plan.',
+        conversationSteps: [
+          {
+            assistant_message: {
+              text: 'Inspected the workspace and identified the files most relevant to planning: package.json plus src/app.js and src/data.js.',
+            },
+          },
+        ],
+        agentId: `explore-${Date.now().toString(36)}`,
+        isBackground: false,
+        durationMs: 1,
+      }, taskIds),
+    },
+    {
+      label: 'checkpoint_explore_task',
+      frame: buildAgentConversationCheckpointFrame({
+        workspaceRoot,
+        readPaths: [
+          `${workspaceRoot}\\package.json`,
+          `${workspaceRoot}\\src\\app.js`,
+          `${workspaceRoot}\\src\\data.js`,
+        ],
+      }),
+    },
+  ];
+  const insertAt = frames.findIndex((entry) => entry.label === 'partial_ls');
+  if (insertAt < 0) return frames;
+  return [
+    ...frames.slice(0, insertAt),
+    ...exploreFrames,
+    ...frames.slice(insertAt),
   ];
 }
 
@@ -776,6 +944,7 @@ function buildScenario(name, options = {}) {
   const scenario = String(name || '').trim().toLowerCase();
   if (scenario === 'minimal') return buildMinimalScenario(options);
   if (scenario === 'plan-full') return buildPlanFullScenario(options);
+  if (scenario === 'plan-explore-task') return buildPlanExploreTaskScenario(options);
   if (scenario === 'edit-stream') return buildEditStreamScenario(options);
   if (scenario === 'file-ops') return buildFileOpsScenario(options);
   if (scenario === 'complex-multifile') return buildComplexMultifileScenario(options);

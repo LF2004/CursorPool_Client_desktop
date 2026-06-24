@@ -1298,7 +1298,7 @@ async function enablePlanUiMock() {
   }
 
   const ok = await showConfirm(
-    '将启动固定 `plan-full` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是验证前端是否能完整渲染 Ask -> Explore project structure -> Plan -> Build 卡片，不依赖真实模型与真实调度。\n\n继续？',
+    '将启动固定 `plan-full` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是验证前端是否能完整渲染 Ask -> 只读探索（通常会显示为 `Explored 1 directory, 4 searches`）-> Plan -> Build 卡片，不依赖真实模型与真实调度。\n\n继续？',
     { title: 'Plan UI Mock', tone: 'info', confirmText: '启动 Mock' },
   );
   if (!ok) return;
@@ -1319,7 +1319,7 @@ async function enablePlanUiMock() {
           result?.summary || 'Plan UI Mock 已启动。',
           '',
           '下一步请在 Cursor Agent 中发送任意一条消息。',
-          '如果前端仍然没有出现 Explore project structure 或 Build 卡片，就基本可以确定是 UI 帧兼容/渲染链路问题。',
+          '如果前端仍然没有出现只读探索汇总卡片或 Build 卡片，就基本可以确定是 UI 帧兼容/渲染链路问题。',
         ].filter(Boolean).join('\n'),
         { title: 'Plan UI Mock 已就绪', tone: 'success' },
       );
@@ -1336,7 +1336,7 @@ async function enablePlanUiMock() {
 function describeUserStatusHint(local, localState = null) {
   if (local?.mockProxy?.active) {
     const proxyServer = String(local?.mockProxy?.proxyServer || '').trim();
-    return `Plan UI Mock 已接管当前 Cursor 代理${proxyServer ? `（${proxyServer}）` : ''}。现在请直接在 Cursor Agent 里发送一条消息，观察 Ask -> Explore project structure -> Plan -> Build UI 是否完整出现。`;
+    return `Plan UI Mock 已接管当前 Cursor 代理${proxyServer ? `（${proxyServer}）` : ''}。现在请直接在 Cursor Agent 里发送一条消息，观察 Ask -> 只读探索汇总 -> Plan -> Build UI 是否完整出现。`;
   }
   if (localState && !localState.cursorLoggedIn) {
     return 'Cursor 尚未登录。启用 Relay 时会自动检测，并从 desktop/js/utils/users.json 写入本地免登账号。';
