@@ -6,11 +6,13 @@ const https = require('https');
 const net = require('net');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
+const responseCache = require('./relay-response-cache');
 
 const {
   decodeCursorChatRequest,
   decodeRunSseRequestId,
   decodeBidiAppendRequest,
+  extractAgentModeFromPayload,
   summarizeConnectFrames,
   summarizeAgentServerStream,
   buildAgentKvSetBlobFrame,
@@ -44,6 +46,7 @@ const {
   beginTurn: beginAgentHistoryTurn,
   appendHistoryItem: appendAgentHistoryItem,
   completeTurn: completeAgentHistoryTurn,
+  updateConversationState: updateAgentHistoryConversationState,
   updateUsage: updateAgentHistoryUsage,
 } = require('./cursor-relay-agent-history');
 const {
@@ -53,7 +56,36 @@ const {
   compactRelayMessagesForContext,
 } = require('./cursor-relay-context-manager');
 const {
+  normalizeAgentModeName,
+  getCursorModeDirectory,
+  getSessionAgentMode,
+} = require('../mode/registry');
+const {
+  getModeHandler,
+  buildToolDefinitionsForChatByMode,
+  buildToolDefinitionsForResponsesByMode,
+  buildLocalRelayMessagesForMode,
+  shouldUseNativeExecForModeTool,
+  getUpstreamRequestOptionsForMode,
+} = require('../mode');
+const {
+  isTodoToolName,
+} = require('../mode/common/policy');
+const {
+  PLAN_WORKFLOW_PHASES,
+  getDefaultPlanWorkflowState: getDefaultPlanWorkflowStateBase,
+  clonePlanWorkflowState: clonePlanWorkflowStateBase,
+  getPlanWorkflowPhaseFromState,
+  isPlanCheckpointVisiblePhase: isPlanCheckpointVisiblePhaseBase,
+  buildPlanWorkflowStateUpdate,
+  buildPlanWorkflowUpdateForToolExecution,
+  buildPlanWorkflowUpdateForInteractionResponse,
+  shouldAllowFreshPlanExploreDespiteDuplicate: shouldAllowFreshPlanExploreDespiteDuplicateState,
+  buildPlanWorkflowUpdateForConversationAction,
+} = require('../mode/plan-workflow');
+const {
   recordRelayUsage,
+  appendRelayUsageMeta,
   updateRelayUsageBilledPoints,
   updateRelayUsageStatusForRequest,
 } = require('./cursor-relay-usage-store');
@@ -83,6 +115,7 @@ const MAX_COMPLETION_VERIFICATION_ROUNDS = 0;
 const DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS = 16;
 const DEFAULT_MAX_INCOMPLETE_TODO_CONTINUATIONS = 0;
 const DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS = 6;
+const WEB_SEARCH_FETCH_TIMEOUT_MS = 4500;
 const POST_MUTATION_STOP_AFTER_TEXT_MS = 2500;
 const FORCE_MUTATION_AFTER_READ_ONLY_ROUNDS = 2;
 const DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS = 12000;
@@ -96,8 +129,7 @@ const EDIT_STREAM_FRAME_CHARS = 2048;
 const MAX_EDIT_STREAM_CONTENT_CHARS = 1400;
 const EXEC_CLIENT_WAIT_TIMEOUT_MS = 8000;
 const RECENT_EXECUTION_WORKSPACE_PATH = path.join(process.env.USERPROFILE || process.cwd(), '.cursorpool', 'relay', 'recent-execution-workspace.json');
-const AGENT_MODE_SYSTEM_PROMPT_PATH = path.join(process.cwd(), 'skills', 'cursor_modes', 'agent', 'system_prompt.txt');
-const AGENT_MODE_TOOLS_PATH = path.join(process.cwd(), 'skills', 'cursor_modes', 'agent', 'tools.json');
+const DEFAULT_RELAY_SCAN_IGNORE = Object.freeze(['node_modules', '.git', 'dist', 'build']);
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
@@ -441,7 +473,10 @@ function toChatMessages(messages = [], options = {}) {
   });
 }
 
-function prefersResponsesApi(upstream = {}) {
+function prefersResponsesApi(upstream = {}, options = {}) {
+  const preferred = String(options.preferredEndpointMode || '').trim().toLowerCase();
+  if (preferred === 'chat') return false;
+  if (preferred === 'responses') return true;
   const providerId = String(upstream.providerId || '').trim().toLowerCase();
   if (providerId.includes('gemini') || isMimoProvider(upstream)) return false;
   return String(upstream.endpointMode || 'responses').trim().toLowerCase() !== 'chat';
@@ -454,62 +489,6 @@ function readOptionalTextFile(filePath, maxChars = 24000) {
   } catch {
     return '';
   }
-}
-
-function loadAgentModeToolDefinitionsForChat() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(AGENT_MODE_TOOLS_PATH, 'utf8').replace(/^\uFEFF/, ''));
-    const supported = new Set(['Read', 'Grep', 'Write', 'StrReplace', 'Delete', 'Glob', 'Shell', 'ReadLints', 'TodoWrite', 'WebSearch', 'WebFetch']);
-    return (Array.isArray(parsed) ? parsed : [])
-      .filter((tool) => tool?.type === 'function' && supported.has(String(tool.function?.name || '')))
-      .map((tool) => ({
-        type: 'function',
-        function: {
-          name: String(tool.function.name),
-          description: String(tool.function.description || ''),
-          parameters: tool.function.parameters && typeof tool.function.parameters === 'object'
-            ? tool.function.parameters
-            : { type: 'object', properties: {} },
-        },
-      }));
-  } catch {
-    return [];
-  }
-}
-
-function enhanceRelayToolDefinition(tool) {
-  const name = String(tool?.function?.name || '');
-  const clone = {
-    type: 'function',
-    function: {
-      name,
-      description: String(tool?.function?.description || ''),
-      parameters: tool?.function?.parameters && typeof tool.function.parameters === 'object'
-        ? tool.function.parameters
-        : { type: 'object', properties: {} },
-    },
-  };
-  if (name === 'Write') {
-    clone.function.description = `${clone.function.description}\n\nUse mainly for new files or true full-file rewrites. For modifying existing files, prefer PatchEdit or StrReplace with exact old_string/new_string.`;
-  } else if (name === 'StrReplace') {
-    clone.function.description = `${clone.function.description}\n\nPrefer this over full-file Write when an exact old_string can be identified. Set new_string to an empty string to delete the exact old_string.`;
-  } else if (name === 'PatchEdit') {
-    clone.function.description = `${clone.function.description}\n\nSet new_string to an empty string to delete the exact old_string.`;
-  }
-  return clone;
-}
-
-function mergeAgentModeToolDefinitions(fallbackTools = []) {
-  const merged = new Map();
-  fallbackTools.forEach((tool) => {
-    const name = String(tool?.function?.name || '');
-    if (name) merged.set(name, enhanceRelayToolDefinition(tool));
-  });
-  loadAgentModeToolDefinitionsForChat().forEach((tool) => {
-    const name = String(tool?.function?.name || '');
-    if (name && merged.has(name)) merged.set(name, enhanceRelayToolDefinition(tool));
-  });
-  return Array.from(merged.values());
 }
 
 function normalizeToolNameSet(names = null) {
@@ -541,248 +520,16 @@ function filterRelayTools(tools = [], allowedNames = null) {
 }
 
 function buildRelayToolDefinitionsForChat(options = {}) {
-  const fallbackTools = [
-    {
-      type: 'function',
-      function: {
-        name: 'Read',
-        description: 'Read a local file.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            limit: { type: 'integer' },
-          },
-          required: ['path'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Grep',
-        description: 'Search file contents under a path using ripgrep.',
-        parameters: {
-          type: 'object',
-          properties: {
-            pattern: { type: 'string' },
-            path: { type: 'string' },
-            glob: { type: 'string' },
-            output_mode: { type: 'string', enum: ['content', 'files_with_matches'] },
-            head_limit: { type: 'integer' },
-          },
-          required: ['pattern'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Write',
-        description: 'Write the full contents of a local file. Use this mainly for new files or full-file rewrites. For modifying an existing file, prefer PatchEdit or StrReplace with exact old_string/new_string.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            contents: { type: 'string' },
-          },
-          required: ['path', 'contents'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'PatchEdit',
-        description: 'Edit an existing local file by replacing exact old_string with new_string. Set new_string to an empty string to delete the exact old_string. Prefer this for page beautification and normal edits because it is faster and produces smaller native review diffs than full-file Write.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            old_string: { type: 'string' },
-            new_string: { type: 'string' },
-            replace_all: { type: 'boolean' },
-          },
-          required: ['path', 'old_string', 'new_string'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Edit',
-        description: 'Replace a local file with the full updated contents. Prefer PatchEdit when you can identify an exact old_string.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            contents: { type: 'string' },
-          },
-          required: ['path', 'contents'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'StrReplace',
-        description: 'Replace exact text in an existing local file. Set new_string to an empty string to delete the exact old_string. Prefer this over full-file Write when an exact old_string can be identified.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            old_string: { type: 'string' },
-            new_string: { type: 'string' },
-          },
-          required: ['path', 'old_string', 'new_string'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Delete',
-        description: 'Delete a local file.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-          },
-          required: ['path'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Glob',
-        description: 'Find files by glob pattern.',
-        parameters: {
-          type: 'object',
-          properties: {
-            target_directory: { type: 'string' },
-            glob_pattern: { type: 'string' },
-            path: { type: 'string' },
-            pattern: { type: 'string' },
-          },
-          required: ['glob_pattern'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'LS',
-        description: 'List files and directories under a local path.',
-        parameters: {
-          type: 'object',
-          properties: {
-            path: { type: 'string' },
-            ignore: { type: 'array', items: { type: 'string' } },
-          },
-          required: ['path'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'ReadLints',
-        description: 'Read diagnostics or lint results for one or more local files after edits.',
-        parameters: {
-          type: 'object',
-          properties: {
-            paths: { type: 'array', items: { type: 'string' } },
-          },
-          required: ['paths'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'Shell',
-        description: 'Run a PowerShell command for verification, package scripts, git, dev servers, and other terminal operations. Use block_until_ms: 0 for background processes and read the returned terminal log path to monitor output.',
-        parameters: {
-          type: 'object',
-          properties: {
-            command: { type: 'string' },
-            working_directory: { type: 'string' },
-            timeout_ms: { type: 'integer' },
-            block_until_ms: { type: 'integer' },
-            description: { type: 'string' },
-          },
-          required: ['command'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'TodoWrite',
-        description: 'Create or update a structured todo list for complex multi-step coding tasks. Use one in_progress item at a time and mark items completed as soon as they are finished.',
-        parameters: {
-          type: 'object',
-          properties: {
-            merge: { type: 'boolean' },
-            todos: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  id: { type: 'string' },
-                  content: { type: 'string' },
-                  status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'cancelled'] },
-                },
-                required: ['id', 'content', 'status'],
-              },
-              minItems: 1,
-            },
-          },
-          required: ['todos', 'merge'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'WebFetch',
-        description: 'Fetch content from a specified URL and return its contents in a readable markdown format. Use this for public webpages, not binary files or private/local URLs.',
-        parameters: {
-          type: 'object',
-          properties: {
-            url: { type: 'string', description: 'The fully-qualified URL to fetch.' },
-          },
-          required: ['url'],
-        },
-      },
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'WebSearch',
-        description: 'Search the web for real-time information. Returns summarized search results and relevant URLs.',
-        parameters: {
-          type: 'object',
-          properties: {
-            search_term: { type: 'string', description: 'The search query.' },
-            explanation: { type: 'string', description: 'Why this search is useful.' },
-          },
-          required: ['search_term'],
-        },
-      },
-    },
-  ];
-  return filterRelayTools(mergeAgentModeToolDefinitions(fallbackTools), options.allowedToolNames || null);
+  const modeName = normalizeAgentModeName(options.mode || 'AGENT_MODE_AGENT');
+  return filterRelayTools(
+    buildToolDefinitionsForChatByMode({ ...options, mode: modeName }),
+    options.allowedToolNames || null,
+  );
 }
 
 function buildRelayToolDefinitionsForResponses(options = {}) {
-  return buildRelayToolDefinitionsForChat(options).map((tool) => ({
-    type: 'function',
-    name: tool.function.name,
-    description: tool.function.description,
-    parameters: tool.function.parameters,
-  }));
+  const modeName = normalizeAgentModeName(options.mode || 'AGENT_MODE_AGENT');
+  return buildToolDefinitionsForResponsesByMode({ ...options, mode: modeName });
 }
 
 function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
@@ -815,6 +562,7 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
         model: modelName,
         messages: toChatMessages(messages, contentOptions),
         stream: true,
+        ...(options.mode ? { metadata: { agent_mode: options.mode } } : {}),
         ...streamUsageOptions,
         ...(openAiReasoning ? { reasoning: openAiReasoning } : {}),
         ...(deepSeekThinking ? { thinking: deepSeekThinking } : {}),
@@ -835,6 +583,7 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
         ...(responseInput.instructions ? { instructions: responseInput.instructions } : {}),
         input: responseInput.input.length ? responseInput.input : 'ping',
         stream: true,
+        ...(options.mode ? { metadata: { agent_mode: options.mode } } : {}),
         ...(openAiReasoning ? { reasoning: openAiReasoning } : {}),
         ...(deepSeekThinking ? { thinking: deepSeekThinking } : {}),
         ...(mimoThinking ? { thinking: mimoThinking } : {}),
@@ -843,7 +592,7 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
       }),
     },
   };
-  return prefersResponsesApi(upstream) ? [responsesAttempt, chatAttempt] : [chatAttempt, responsesAttempt];
+  return prefersResponsesApi(upstream, options) ? [responsesAttempt, chatAttempt] : [chatAttempt, responsesAttempt];
 }
 
 function shouldRetryAlternateEndpoint(status, bodyText = '') {
@@ -975,27 +724,52 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
     const status = String(details.status || '');
     const requestId = session.requestId || '';
     const platformBilling = isPlatformBillingEnabled(config);
+    const isCacheHit = !!session._cacheHit;
+    // 缓存命中：status 标记为 cache_hit，费用/token 归零，上游无消耗
+    const effectiveStatus = isCacheHit
+      ? 'cache_hit'
+      : (status === 'success' ? (platformBilling ? 'paid' : 'success') : status);
+    // 构建基础 meta
+    let meta = details.meta || null;
+    if (isCacheHit) {
+      const cacheMeta = { ...meta, cacheHit: { layer: session._cacheHit.layer, cachedAt: session._cacheHit.cachedAt } };
+      meta = cacheMeta;
+      session._cacheHit = null; // 用完清除，避免重复写入
+    }
     const recorded = recordRelayUsage(getConfigCustomRoot(config), {
       requestId,
       conversationId: session.conversationId || '',
+      mode: getSessionAgentMode(session),
       phase: details.phase || '',
       endpointMode: details.endpointMode || config.upstream?.endpointMode || '',
       model: details.model || config.upstream?.modelName || '',
-      status: status === 'success' ? (platformBilling ? 'paid' : 'success') : status,
-      httpStatus: details.httpStatus || 0,
-      error: details.error || '',
-      usage,
+      status: effectiveStatus,
+      httpStatus: isCacheHit ? 0 : (details.httpStatus || 0),
+      error: isCacheHit ? '' : (details.error || ''),
+      usage: isCacheHit ? {} : usage,
       durationMs: details.durationMs || 0,
       promptChars: details.promptChars || 0,
       responseTextChars: details.responseTextChars || 0,
       reasoningChars: details.reasoningChars || 0,
       toolCalls: details.toolCalls || 0,
       upstreamBaseUrl: config.upstream?.baseUrl || '',
-      meta: details.meta || null,
+      meta,
       cursorAgentAccount: resolveCurrentCursorAgentAccount(),
       reasoningEffort: details.reasoningEffort || config.upstream?.reasoningEffort || '',
       platformBilling,
     });
+    // 缓存命中的 meta 已在写入时内嵌（上面的 meta 对象），不需要二次 append
+    // 非缓存命中但有 _cacheHit 残留的兜底路径
+    if (!isCacheHit && session._cacheHit && recorded?.id) {
+      try {
+        appendRelayUsageMeta(
+          getConfigCustomRoot(config),
+          recorded.id,
+          { cacheHit: { layer: session._cacheHit.layer, cachedAt: session._cacheHit.cachedAt } },
+        );
+        session._cacheHit = null;
+      } catch { /* ignore */ }
+    }
     if (platformBilling && status === 'success' && hasPositiveUsageTokens(usage)) {
       reportAdvancedModelUsage(config, {
         requestId,
@@ -1041,6 +815,19 @@ function markUpstreamUsageCompleted(session, config, status = 'success', error =
 
 async function fetchUpstreamCompletion(upstream, modelName, messages, logger, options = {}) {
   const attempts = buildUpstreamAttempts(upstream, modelName, messages, options);
+
+  // ---- 响应缓存：查询（命中则直接回放，跳过上游请求） ----
+  const cacheKeys = responseCache.buildCacheKeys(modelName, messages, options);
+  if (cacheKeys && !(options.signal && options.signal.aborted)) {
+    const hit = responseCache.get(cacheKeys);
+    if (hit) {
+      logger?.info?.(
+        `agent local relay cache HIT requestId=${requestId} phase=${phase} layer=${hit.layer} hits=${hit.entry.hits || 0}`,
+      );
+      return { response: responseCache.buildCachedResponse(hit.entry), mode: 'cache' };
+    }
+  }
+
   let lastError = null;
   let lastResponse = null;
   const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : UPSTREAM_FETCH_TIMEOUT_MS;
@@ -1081,7 +868,12 @@ async function fetchUpstreamCompletion(upstream, modelName, messages, logger, op
       logger?.info?.(
         `agent local relay upstream fetch headers requestId=${requestId} phase=${phase} mode=${attempt.label} status=${response.status} ok=${response.ok ? '1' : '0'} contentType=${String(response.headers.get('content-type') || '-')}`,
       );
-      if (response.ok) return { response, mode: attempt.label };
+      if (response.ok) {
+        if (cacheKeys && response && typeof response === 'object') {
+          response._cacheKeys = cacheKeys;
+        }
+        return { response, mode: attempt.label };
+      }
 
       const bodyText = await response.text().catch(() => '');
       lastResponse = { status: response.status, text: bodyText, mode: attempt.label };
@@ -1364,9 +1156,9 @@ function buildLocalRelayMessages(userText, session = {}) {
   const requestId = String(session.requestId || '');
   const workspaceRoot = String(session.workspaceRoot || '').trim();
   const user = String(userText || '');
+  const agentMode = getSessionAgentMode(session);
   const recentEditedFile = getRecentEditedFilePath(session);
   const unfinishedContinuation = getUnfinishedAgentContinuation(session, user);
-  const cursorAgentPrompt = readOptionalTextFile(AGENT_MODE_SYSTEM_PROMPT_PATH);
   const deepSeekGuidance = isDeepSeekModel(session.config)
     ? 'For this DeepSeek upstream, keep hidden reasoning brief. Start the answer or call the required tool quickly; do not loop in Thought/reasoning text.'
     : '';
@@ -1376,35 +1168,16 @@ function buildLocalRelayMessages(userText, session = {}) {
     recentEditedFile,
   });
   const imageParts = buildUpstreamImageParts(session);
-  const userContent = imageParts.length
-    ? [{ type: 'input_text', text: user }, ...imageParts]
-    : user;
-  return [
-    {
-      role: 'system',
-      content: [
-        cursorAgentPrompt,
-        'You are powering a Cursor-style coding agent relay.',
-        'Respond naturally and directly to the user.',
-        'Do not claim local file edits or command execution unless a tool result was provided.',
-        'For complex coding tasks with several dependent steps, use TodoWrite early to create a concise checklist, keep exactly one item in_progress, and update items as soon as they are completed.',
-        'Prefer Grep, Glob, Read, LS, and Shell tools to inspect and verify the workspace instead of guessing from memory.',
-        deepSeekGuidance,
-        conversationMemory ? `<conversation_memory>\n${conversationMemory}\n</conversation_memory>` : '',
-        recentEditedFile ? `Continuation context: the most recent successfully edited file in this conversation is "${recentEditedFile}". If the user's request omits a file path but asks to continue changing styling, colors, layout, copy, or the prior page, treat this as the target file.` : '',
-        unfinishedContinuation ? [
-          'Unfinished agent continuation context:',
-          `Original user request: ${unfinishedContinuation.userText || ''}`,
-          unfinishedContinuation.latestAssistantText ? `Latest assistant text before interruption: ${unfinishedContinuation.latestAssistantText}` : '',
-          Array.isArray(unfinishedContinuation.toolResults) && unfinishedContinuation.toolResults.length ? `Recent tool results:\n${unfinishedContinuation.toolResults.map((line) => `- ${line}`).join('\n')}` : '',
-          'Continue that unfinished task now. Do not ask the user to send another continue message.',
-        ].filter(Boolean).join('\n') : '',
-        workspaceRoot ? `Current workspace root: ${workspaceRoot}. Resolve relative file paths inside this directory.` : '',
-        requestId ? `Relay request id: ${requestId}.` : '',
-      ].filter(Boolean).join('\n'),
-    },
-    { role: 'user', content: userContent },
-  ];
+  return buildLocalRelayMessagesForMode(agentMode, {
+    userText: user,
+    requestId,
+    workspaceRoot,
+    recentEditedFile,
+    unfinishedContinuation,
+    deepSeekGuidance,
+    conversationMemory,
+    imageParts,
+  });
 }
 
 function normalizeWorkspacePath(value) {
@@ -1458,6 +1231,12 @@ function readRecentWorkspaceRoot() {
   }
 }
 
+function isCursorWorkspaceStorageRoot(root = '') {
+  const normalized = normalizeWorkspacePath(root).replace(/\//g, '\\');
+  if (!normalized) return false;
+  return /\\AppData\\Roaming\\Cursor\\User\\workspaceStorage\\[^\\]+(?:\\|$)/i.test(normalized);
+}
+
 function isInternalRelayWorkspaceRoot(root = '') {
   const normalized = normalizeWorkspacePath(root).replace(/\//g, '\\');
   if (!normalized) return false;
@@ -1465,26 +1244,57 @@ function isInternalRelayWorkspaceRoot(root = '') {
     || /\\\.cursorpool(?:\\|$)/i.test(normalized);
 }
 
+function isUntrustedWorkspaceRoot(root = '') {
+  return isInternalRelayWorkspaceRoot(root) || isCursorWorkspaceStorageRoot(root);
+}
+
+function writeRecentWorkspaceRoot(root = '', logger = null, source = '') {
+  const normalized = normalizeWorkspaceRoot(root || '');
+  if (!normalized || isUntrustedWorkspaceRoot(normalized)) return false;
+  try {
+    fs.mkdirSync(path.dirname(RECENT_EXECUTION_WORKSPACE_PATH), { recursive: true });
+    fs.writeFileSync(RECENT_EXECUTION_WORKSPACE_PATH, JSON.stringify({
+      root: normalized,
+      workspaceRoot: normalized,
+      updatedAt: new Date().toISOString(),
+      source: String(source || '').trim(),
+    }, null, 2));
+    return true;
+  } catch (error) {
+    logger?.warn?.(`agent local relay failed to persist recent workspace root=${JSON.stringify(normalized)} source=${JSON.stringify(String(source || '').trim())}: ${error.message}`);
+    return false;
+  }
+}
+
 function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = null, requestId = '-') {
   const decodedRoot = normalizeWorkspaceRoot(decodedWorkspaceRoot || '');
   const recentRoot = readRecentWorkspaceRoot();
-  if (decodedRoot && isInternalRelayWorkspaceRoot(decodedRoot) && recentRoot && !isInternalRelayWorkspaceRoot(recentRoot)) {
+  const cwdRoot = normalizeWorkspaceRoot(process.cwd());
+  const trustedDecodedRoot = decodedRoot && !isUntrustedWorkspaceRoot(decodedRoot) ? decodedRoot : '';
+  const trustedRecentRoot = recentRoot && !isUntrustedWorkspaceRoot(recentRoot) ? recentRoot : '';
+  if (decodedRoot && !trustedDecodedRoot && trustedRecentRoot) {
     logger?.warn?.(
       `agent local relay ignored internal decoded workspace requestId=${requestId || '-'} decoded=${JSON.stringify(decodedRoot)} recent=${JSON.stringify(recentRoot)}`,
     );
-    return recentRoot;
   }
-  if (decodedRoot) return decodedRoot;
-  return recentRoot;
+  if (decodedRoot && !trustedDecodedRoot && !trustedRecentRoot) {
+    logger?.warn?.(
+      `agent local relay ignored untrusted decoded workspace requestId=${requestId || '-'} decoded=${JSON.stringify(decodedRoot)} fallback=${JSON.stringify(cwdRoot)}`,
+    );
+  }
+  const selectedRoot = trustedDecodedRoot || trustedRecentRoot || cwdRoot;
+  if (selectedRoot) writeRecentWorkspaceRoot(selectedRoot, logger, `user_message:${requestId || '-'}`);
+  return selectedRoot;
 }
 
 function getSessionWorkspaceRoot(session = {}) {
   const direct = normalizeWorkspaceRoot(session.workspaceRoot || session.lastUserMessageCapture?.workspaceRoot || '');
   const recent = readRecentWorkspaceRoot();
-  if (direct && isInternalRelayWorkspaceRoot(direct) && recent && !isInternalRelayWorkspaceRoot(recent)) return recent;
+  const cwdRoot = normalizeWorkspaceRoot(process.cwd());
+  if (direct && isUntrustedWorkspaceRoot(direct) && recent && !isUntrustedWorkspaceRoot(recent)) return recent;
   if (direct) return direct;
   if (recent) return recent;
-  return process.cwd();
+  return cwdRoot || process.cwd();
 }
 
 function resolveWorkspacePath(inputPath, session = {}) {
@@ -1672,6 +1482,668 @@ function hashRelayText(value) {
   return crypto.createHash('sha1').update(String(value || '')).digest('hex');
 }
 
+function getSessionStableConversationId(session = {}) {
+  return extractStableConversationId(session.lastUserMessageCapture?.debug || null)
+    || String(session.lastUserMessageCapture?.stableConversationId || '').trim()
+    || String(session.requestId || '').trim();
+}
+
+function getCurrentConversationActionKind(session = {}) {
+  const actionKind = String(
+    session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.action?.kind
+    || ''
+  ).trim();
+  return actionKind;
+}
+
+function isPlanExecutionActionKind(actionKind = '') {
+  const normalized = String(actionKind || '').trim();
+  return normalized === 'execute_plan_action' || normalized === 'start_plan_action';
+}
+
+function shouldTreatPlanTurnAsFreshRequest(session = {}) {
+  if (!isPlanModeSession(session)) return false;
+  if (session?.waitingForInteraction) return false;
+  return !isPlanExecutionActionKind(getCurrentConversationActionKind(session));
+}
+
+function normalizeRelayUserTextForMatch(value = '') {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function isSameWaitingSessionUserMessage(session = {}, userText = '') {
+  const nextText = normalizeRelayUserTextForMatch(userText);
+  const currentText = normalizeRelayUserTextForMatch(session?.lastUserMessageCapture?.userText || '');
+  return Boolean(nextText) && Boolean(currentText) && nextText === currentText;
+}
+
+function shouldReuseWaitingSessionForSameUserText(session = {}) {
+  if (!session?.waitingForInteraction) return false;
+  return !isPlanCheckpointVisiblePhase(getPlanWorkflowPhase(session));
+}
+
+function shouldReuseWaitingSessionForPendingCapture(session = {}, pendingCapture = null) {
+  if (!session?.waitingForInteraction) return false;
+  const actionKind = String(
+    pendingCapture?.debug?.agentClientMessage?.runRequest?.action?.kind
+    || ''
+  ).trim();
+  if (isPlanExecutionActionKind(actionKind)) return true;
+  const pendingText = String(pendingCapture?.userText || '').trim();
+  if (!pendingText) return false;
+  if (!shouldReuseWaitingSessionForSameUserText(session)) return false;
+  return isSameWaitingSessionUserMessage(session, pendingText);
+}
+
+function shouldReuseWaitingSessionForRunRequest(session = {}, decoded = {}) {
+  if (!session?.waitingForInteraction) return false;
+  const actionKind = String(
+    decoded?.debug?.agentClientMessage?.runRequest?.action?.kind
+    || ''
+  ).trim();
+  return isPlanExecutionActionKind(actionKind);
+}
+
+function clearSessionPlanPresentationState(session = {}, options = {}) {
+  if (!session || typeof session !== 'object') return null;
+  const clearTodos = options.clearTodos !== false;
+  session.latestPlanState = null;
+  session.suppressedPlanText = '';
+  session.lastPlanResumeMessages = [];
+  session.planTurnHandoff = '';
+  session.deferredInteractionResponse = null;
+  session.planWorkflow = clonePlanWorkflowState();
+  if (clearTodos) {
+    session.todos = [];
+  }
+  const patch = {
+    plan_workflow: clonePlanWorkflowState(),
+    waiting_for_interaction: null,
+    plan: null,
+    current_plan_text: '',
+    current_plans: {},
+    current_todos: [],
+  };
+  if (session.agentHistory) {
+    updateSessionHistoryState(session, patch);
+  }
+  return patch;
+}
+
+function getDefaultRelayIgnoreNames(extra = []) {
+  return Array.from(new Set([
+    ...DEFAULT_RELAY_SCAN_IGNORE,
+    ...(Array.isArray(extra) ? extra : []),
+  ].map((item) => String(item || '').trim()).filter(Boolean)));
+}
+
+function getSessionScanIgnoreNames(session = {}, extra = []) {
+  const merged = [...(Array.isArray(extra) ? extra : [])];
+  if (isPlanModeSession(session)) {
+    merged.push('.cursor');
+  }
+  return getDefaultRelayIgnoreNames(merged);
+}
+
+function getDefaultPlanWorkflowState() {
+  return getDefaultPlanWorkflowStateBase();
+}
+
+function clonePlanWorkflowState(state = null) {
+  return clonePlanWorkflowStateBase(state);
+}
+
+function ensurePlanWorkflowState(session = {}) {
+  if (!session || typeof session !== 'object') return getDefaultPlanWorkflowState();
+  session.planWorkflow = clonePlanWorkflowState(session.planWorkflow);
+  return session.planWorkflow;
+}
+
+function getPlanWorkflowPhase(session = {}) {
+  return getPlanWorkflowPhaseFromState(ensurePlanWorkflowState(session));
+}
+
+function isPlanModeSession(session = {}) {
+  return getSessionAgentMode(session) === 'AGENT_MODE_PLAN';
+}
+
+function isPlanCheckpointVisiblePhase(phase = '') {
+  return isPlanCheckpointVisiblePhaseBase(phase);
+}
+
+function getVisiblePlanState(session = {}) {
+  if (!isPlanCheckpointVisiblePhase(getPlanWorkflowPhase(session))) return null;
+  return getLatestSessionPlanState(session);
+}
+
+function syncPlanWorkflowState(session = {}) {
+  if (!session) return null;
+  const snapshot = clonePlanWorkflowState(session.planWorkflow);
+  session.planWorkflow = snapshot;
+  if (session.agentHistory) {
+    updateSessionHistoryState(session, {
+      plan_workflow: snapshot,
+    });
+  }
+  return snapshot;
+}
+
+function setPlanWorkflowPhase(session = {}, phase = PLAN_WORKFLOW_PHASES.IDLE, extra = {}) {
+  if (!session) return null;
+  session.planWorkflow = buildPlanWorkflowStateUpdate(
+    ensurePlanWorkflowState(session),
+    phase,
+    extra,
+    String(session.requestId || '').trim(),
+  );
+  return syncPlanWorkflowState(session);
+}
+
+function updatePlanWorkflowForToolExecution(session = {}, toolCall = {}, execution = {}) {
+  if (!isPlanModeSession(session)) return null;
+  const next = buildPlanWorkflowUpdateForToolExecution({
+    state: ensurePlanWorkflowState(session),
+    toolName: toolCall?.name || execution?.tool || '',
+    execution,
+    requestId: String(session.requestId || '').trim(),
+    canonicalToolName,
+    isReadOnlyContextToolName,
+  });
+  if (!next) return null;
+  session.planWorkflow = next;
+  return syncPlanWorkflowState(session);
+}
+
+function updatePlanWorkflowForInteractionResponse(session = {}, interactionResponse = {}, pendingInteraction = {}) {
+  if (!isPlanModeSession(session)) return null;
+  const next = buildPlanWorkflowUpdateForInteractionResponse({
+    state: ensurePlanWorkflowState(session),
+    interactionResponse,
+    pendingInteraction,
+    requestId: String(session.requestId || '').trim(),
+  });
+  if (!next) return null;
+  session.planWorkflow = next;
+  return syncPlanWorkflowState(session);
+}
+
+function shouldAllowFreshPlanExploreDespiteDuplicate(session = {}, toolCall = {}) {
+  if (!isPlanModeSession(session)) return false;
+  return shouldAllowFreshPlanExploreDespiteDuplicateState({
+    state: ensurePlanWorkflowState(session),
+    toolName: toolCall?.name || '',
+    isReadOnlyContextToolName,
+  });
+}
+
+function updatePlanWorkflowForConversationAction(session = {}, actionKind = '', action = {}) {
+  if (!isPlanModeSession(session)) return null;
+  const next = buildPlanWorkflowUpdateForConversationAction({
+    state: ensurePlanWorkflowState(session),
+    actionKind,
+    action,
+    requestId: String(session.requestId || '').trim(),
+  });
+  if (!next) return null;
+  session.planWorkflow = next;
+  return syncPlanWorkflowState(session);
+}
+
+function emitPresentedPlanCheckpoint(session = {}, logger = null, options = {}) {
+  if (!session?.active) return 0;
+  const workflow = ensurePlanWorkflowState(session);
+  if (!isPlanCheckpointVisiblePhase(workflow.phase)) return 0;
+  const planState = getLatestSessionPlanState(session);
+  const planText = String(planState?.plan_text || planState?.plan || '').trim();
+  if (!planText) return 0;
+  const checkpointKey = String(
+    workflow.presentedPlanUri
+    || planState?.plan_uri
+    || workflow.draftPlanPath
+    || `inline:${planText.length}`
+  ).trim();
+  if (!options.force && checkpointKey && workflow.checkpointEmittedForPlanUri === checkpointKey) return 0;
+  const workspaceRoot = getSessionWorkspaceRoot(session);
+  const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
+  try {
+    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
+      workspaceRoot,
+      rootPromptMessagesJson: session.rootPromptMessagesJson,
+      readPaths,
+      pendingToolCalls: [],
+      plan: planText,
+      todos: Array.isArray(planState?.todos) ? planState.todos : [],
+    }));
+    setPlanWorkflowPhase(session, workflow.phase, {
+      checkpointEmittedForPlanUri: checkpointKey,
+    });
+    logger?.info?.(
+      `agent local relay emitted presented plan checkpoint requestId=${session.requestId || '-'} phase=${workflow.phase} planChars=${planText.length} planUri=${JSON.stringify(String(planState?.plan_uri || workflow.presentedPlanUri || ''))}`
+    );
+    return 1;
+  } catch (error) {
+    logger?.warn?.(
+      `agent local relay failed to emit presented plan checkpoint requestId=${session.requestId || '-'}: ${error.message}`
+    );
+    return 0;
+  }
+}
+
+function findWaitingSessionByStableConversationId(agentSessions, stableConversationId = '', excludeRequestId = '') {
+  const target = String(stableConversationId || '').trim();
+  if (!target || !agentSessions?.size) return null;
+  for (const session of agentSessions.values()) {
+    if (!session || session.aborted || !session.waitingForInteraction) continue;
+    if (excludeRequestId && String(session.requestId || '').trim() === String(excludeRequestId || '').trim()) continue;
+    if (getSessionStableConversationId(session) === target) return session;
+  }
+  return null;
+}
+
+function getPendingInteractionEntriesForSession(session = {}) {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  if (!pendingAgentInteractions?.size) return [];
+  const stableConversationId = getSessionStableConversationId(session);
+  const requestId = String(session.requestId || '').trim();
+  return Array.from(pendingAgentInteractions.values())
+    .filter((entry) => {
+      const entryStableConversationId = String(entry?.stableConversationId || '').trim();
+      const entryRequestId = String(entry?.requestId || '').trim();
+      if (stableConversationId && entryStableConversationId === stableConversationId) return true;
+      return Boolean(requestId) && entryRequestId === requestId;
+    })
+    .sort((a, b) => String(a?.createdAt || '').localeCompare(String(b?.createdAt || '')));
+}
+
+function clearPendingInteractionEntriesForSession(session = {}) {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  if (!pendingAgentInteractions?.size) return 0;
+  const entries = getPendingInteractionEntriesForSession(session);
+  let cleared = 0;
+  for (const entry of entries) {
+    const key = String(entry?.key || '').trim();
+    if (!key) continue;
+    if (pendingAgentInteractions.delete(key)) cleared += 1;
+  }
+  return cleared;
+}
+
+function rebindSessionPendingInteractionRequestIds(session = {}, previousRequestId = '', nextRequestId = '') {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  const fromRequestId = String(previousRequestId || '').trim();
+  const toRequestId = String(nextRequestId || '').trim();
+  if (!pendingAgentInteractions?.size || !fromRequestId || !toRequestId || fromRequestId === toRequestId) return 0;
+  let rebound = 0;
+  for (const [key, entry] of pendingAgentInteractions.entries()) {
+    if (!entry || String(entry.requestId || '').trim() !== fromRequestId) continue;
+    const updated = {
+      ...entry,
+      requestId: toRequestId,
+      key: `${toRequestId}:${Number(entry.queryId) || 0}:${String(entry.kind || '').trim()}`,
+    };
+    pendingAgentInteractions.delete(key);
+    pendingAgentInteractions.set(updated.key, updated);
+    rebound += 1;
+  }
+  return rebound;
+}
+
+function rebindWaitingSessionRequestId(session = {}, nextRequestId = '', logger = null) {
+  const previousRequestId = String(session.requestId || '').trim();
+  const normalizedNextRequestId = String(nextRequestId || '').trim();
+  if (!session || !normalizedNextRequestId || previousRequestId === normalizedNextRequestId) return 0;
+  if (previousRequestId) session.agentSessions?.delete(previousRequestId);
+  session.requestId = normalizedNextRequestId;
+  session.agentSessions?.set(normalizedNextRequestId, session);
+  if (session.agentHistory?.state) {
+    const currentTurnSeq = Number(session.agentTurnSeq || session.agentHistory.state.current_turn_seq || 1) || 1;
+    updateSessionHistoryState(session, {
+      current_request_id: normalizedNextRequestId,
+      current_loop_id: `${currentTurnSeq}:${normalizedNextRequestId}`,
+    });
+  }
+  if (session.planWorkflow && typeof session.planWorkflow === 'object') {
+    setPlanWorkflowPhase(session, getPlanWorkflowPhase(session), {
+      currentRequestId: normalizedNextRequestId,
+    });
+  }
+  const rebound = rebindSessionPendingInteractionRequestIds(session, previousRequestId, normalizedNextRequestId);
+  logger?.info?.(
+    `agent local relay rebound waiting session requestId=${previousRequestId || '-'} -> ${normalizedNextRequestId} pendingInteractions=${rebound}`
+  );
+  return rebound;
+}
+
+function replayPendingInteractionQueries(session = {}, logger = null) {
+  const pendingEntries = getPendingInteractionEntriesForSession(session);
+  if (!pendingEntries.length) return 0;
+  let replayed = 0;
+  for (const pendingInteraction of pendingEntries) {
+    replayed += replayPendingInteractionQuery(session, pendingInteraction, logger);
+  }
+  return replayed;
+}
+
+function replayWaitingSessionPlanCheckpoint(session = {}, logger = null) {
+  return emitPresentedPlanCheckpoint(session, logger, { force: true });
+}
+
+function maybeHandleRunRequestConversationAction(session, decoded, config, logger, stats, pendingAgentInteractions, ack) {
+  const action = decoded?.debug?.agentClientMessage?.runRequest?.action || null;
+  const actionKind = String(action?.kind || '').trim();
+  if (!session || !actionKind) return false;
+  const isExecutePlan = actionKind === 'execute_plan_action';
+  const isStartPlan = actionKind === 'start_plan_action';
+  if (!isExecutePlan && !isStartPlan) return false;
+  logger?.info?.(
+    `agent local relay run_request embedded action requestId=${decoded?.requestId || '-'} actionKind=${actionKind} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'}`
+  );
+  if (isStartPlan) {
+    ensureOpenSessionHistoryTurn(session, config, {
+      includeUserMessage: false,
+      includeRequestContext: false,
+      includeModePromptContexts: false,
+    });
+    const planState = {
+      plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
+      plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+      plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+      todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+    };
+    rememberSessionPlanState(session, planState);
+    updatePlanWorkflowForConversationAction(session, actionKind, action);
+    session.waitingForInteraction = true;
+    session.planTurnHandoff = 'create_plan';
+    syncOfficialPlanState(session, { appendPromptContext: false });
+    updateSessionHistoryState(session, {
+      current_loop_status: 'waiting_for_interaction',
+      waiting_for_interaction: {
+        handoff: 'create_plan',
+        pending_count: 1,
+        since: new Date().toISOString(),
+      },
+      plan: planState,
+    });
+    emitPresentedPlanCheckpoint(session, logger, { force: true });
+    ack();
+    return true;
+  }
+  const planState = {
+    plan: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan || '').trim(),
+    plan_text: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+    plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+    todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+  };
+  rememberSessionPlanState(session, planState);
+  updatePlanWorkflowForConversationAction(session, actionKind, action);
+  syncOfficialPlanState(session, { appendPromptContext: false });
+  ensureOpenSessionHistoryTurn(session, config, {
+    includeUserMessage: false,
+    includeRequestContext: false,
+    includeModePromptContexts: false,
+  });
+  if (String(action.executionMode || '').trim()) {
+    session.agentMode = normalizeAgentModeName(action.executionMode);
+  } else if (getSessionAgentMode(session) === 'AGENT_MODE_PLAN') {
+    session.agentMode = 'AGENT_MODE_AGENT';
+  }
+  session.relaying = false;
+  session.waitingForInteraction = false;
+  session.planTurnHandoff = '';
+  session.deferredInteractionResponse = null;
+  const interactionResponse = buildSyntheticPlanExecutionResponse(session, action);
+  const pendingInteraction = clonePendingInteractionSnapshot(
+    findPendingInteractionQuery(pendingAgentInteractions, decoded.requestId, interactionResponse)
+    || buildFallbackPendingPlanExecution(session),
+  );
+  removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
+  if (pendingInteraction?.resumeState) {
+    const executionUserText = String(
+      session.lastUserMessageCapture?.userText
+      || pendingInteraction.resumeState.userText
+      || '',
+    ).trim();
+    pendingInteraction.resumeState = {
+      ...pendingInteraction.resumeState,
+      plan: planState,
+      userText: executionUserText,
+      upstreamMessages: buildLocalRelayMessages(executionUserText, session),
+    };
+    session.lastPlanResumeMessages = pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }));
+  }
+  updateSessionHistoryState(session, {
+    current_loop_status: 'running',
+    waiting_for_interaction: null,
+    plan: planState,
+  });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'metadata',
+    payload: {
+      type: 'mode',
+      value: {
+        explicit: true,
+        mode: 'agent',
+        source: 'execute_plan_action',
+      },
+    },
+  });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'metadata',
+    payload: {
+      type: 'run_request',
+      value: {
+        model_id: String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim(),
+        model_name: String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim(),
+        prewarm: false,
+      },
+    },
+  });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'prompt_context',
+    payload: {
+      source: 'mode_change',
+      role: 'user',
+      content: '<system_reminder>\nAt this point, the active mode changed to agent; follow later mode reminders if present.\n</system_reminder>',
+    },
+  });
+  syncOfficialPlanState(session, { appendPromptContext: true });
+  appendSessionHistory(session, {
+    role: 'system',
+    kind: 'prompt_context',
+    payload: {
+      source: 'active_mode_contract',
+      role: 'user',
+      content: '<system_reminder>\nFor the turn that contains this reminder, the active mode is agent. CreatePlan is not available in this mode; do not call CreatePlan. If the user explicitly asks to create or revise a plan, call SwitchMode to return to plan mode first. If there is an accepted or current plan, execute or continue the implementation using the available agent-mode tools.\n</system_reminder>',
+    },
+  });
+  ack();
+  if (session.active && !session.aborted) {
+    resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+      .catch((error) => failAgentRelaySession(session, logger, error, 'run_request_execute_plan'));
+  }
+  return true;
+}
+
+function replayPendingInteractionQuery(session = {}, pendingInteraction = {}, logger = null) {
+  if (!pendingInteraction?.queryId || !pendingInteraction?.kind) return 0;
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildInteractionQuery !== 'function') return 0;
+  const replay = handler.buildInteractionQuery(
+    session,
+    {
+      name: pendingInteraction.toolName,
+      arguments: pendingInteraction.arguments || {},
+    },
+    pendingInteraction.toolCallId || '',
+    Number(pendingInteraction.queryId) || 0,
+    helpers,
+  );
+  if (!replay?.frame) return 0;
+  writeAgentFrame(session, replay.frame);
+  logger?.info?.(
+    `agent local relay replayed interaction_query requestId=${session.requestId || '-'} queryId=${pendingInteraction.queryId} kind=${pendingInteraction.kind} tool=${pendingInteraction.toolName || '-'}`
+  );
+  return 1;
+}
+
+function removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction = null) {
+  const key = String(pendingInteraction?.key || '').trim();
+  if (!pendingAgentInteractions?.size || !key) return false;
+  return pendingAgentInteractions.delete(key);
+}
+
+function shouldKeepWaitingForInteractionResponse(pendingInteraction = {}, interactionResponse = {}) {
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (pendingKind === 'create_plan' && responseKind === 'create_plan_request_response') {
+    const status = String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase();
+    const planText = String(
+      interactionResponse?.createPlan?.plan
+      || pendingInteraction?.arguments?.plan
+      || pendingInteraction?.resumeState?.plan?.plan_text
+      || pendingInteraction?.resumeState?.plan?.plan
+      || ''
+    ).trim();
+    const planUri = String(
+      interactionResponse?.createPlan?.planUri
+      || pendingInteraction?.arguments?.planUri
+      || pendingInteraction?.resumeState?.plan?.plan_uri
+      || ''
+    ).trim();
+    if (status === 'success' && (planText || planUri)) return false;
+    if (status === 'rejected') return false;
+    if (status === 'error') return false;
+    if (planText || planUri) return false;
+    return true;
+  }
+  if (pendingKind !== 'ask_question' || responseKind !== 'ask_question_interaction_response') return false;
+  const askQuestion = interactionResponse?.askQuestion || {};
+  const status = String(askQuestion.kind || '').trim().toLowerCase();
+  const answers = Array.isArray(askQuestion.answers) ? askQuestion.answers : [];
+  const hasAnswers = answers.some((answer) => {
+    const selected = Array.isArray(answer?.selectedOptionIds) ? answer.selectedOptionIds.filter(Boolean) : [];
+    const freeform = String(answer?.freeformText || '').trim();
+    return selected.length > 0 || Boolean(freeform);
+  });
+  if (status === 'success' && hasAnswers) return false;
+  if (status === 'rejected') return true;
+  if (status === 'error') return true;
+  if (!hasAnswers) return true;
+  return false;
+}
+
+function syncPlanWorkflowAfterToolExecution(session = {}, toolCall = {}, execution = {}) {
+  if (!session || !execution) return null;
+  return updatePlanWorkflowForToolExecution(session, toolCall, execution);
+}
+
+function syncPresentedPlanStateFromInteractionResponse(session = {}, interactionResponse = {}, pendingInteraction = {}) {
+  if (!session) return null;
+  if (String(interactionResponse?.kind || '').trim() !== 'create_plan_request_response') return null;
+  const latestPlanState = getLatestSessionPlanState(session) || {};
+  const planText = String(
+    interactionResponse?.createPlan?.plan
+    || pendingInteraction?.arguments?.plan
+    || pendingInteraction?.resumeState?.plan?.plan_text
+    || pendingInteraction?.resumeState?.plan?.plan
+    || latestPlanState.plan_text
+    || latestPlanState.plan
+    || session.suppressedPlanText
+    || ''
+  ).trim();
+  const planUri = String(
+    interactionResponse?.createPlan?.planUri
+    || pendingInteraction?.arguments?.planUri
+    || pendingInteraction?.resumeState?.plan?.plan_uri
+    || latestPlanState.plan_uri
+    || ''
+  ).trim();
+  const todos = Array.isArray(latestPlanState.todos)
+    ? latestPlanState.todos
+    : (Array.isArray(session.todos) ? session.todos : []);
+  if (!planText && !planUri) return null;
+  return rememberSessionPlanState(session, {
+    plan: planText || planUri,
+    plan_text: planText,
+    plan_uri: planUri,
+    todos,
+  });
+}
+
+function shouldReplayPendingInteractionAfterResponse(pendingInteraction = {}, interactionResponse = {}) {
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (pendingKind === 'create_plan' && responseKind === 'create_plan_request_response') {
+    return false;
+  }
+  return shouldKeepWaitingForInteractionResponse(pendingInteraction, interactionResponse);
+}
+
+function isPlaceholderRunSseSession(session = {}) {
+  return Boolean(
+    session
+    && session.active
+    && !session.aborted
+    && !session.completed
+    && !session.relaying
+    && !session.waitingForInteraction
+    && !session.streamDetached
+    && !session.agentHistory
+    && !session.lastUserMessageCapture
+  );
+}
+
+function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logger) {
+  if (!waitingSession || !placeholderSession || waitingSession === placeholderSession) return null;
+  clearInterval(placeholderSession.heartbeat);
+  placeholderSession.heartbeat = null;
+  waitingSession.req = placeholderSession.req;
+  waitingSession.res = placeholderSession.res;
+  waitingSession.rawBody = placeholderSession.rawBody;
+  const preservedChunks = Array.isArray(waitingSession.generatedChunks)
+    ? waitingSession.generatedChunks.slice()
+    : [];
+  const placeholderChunks = Array.isArray(placeholderSession.generatedChunks)
+    ? placeholderSession.generatedChunks.slice()
+    : [];
+  waitingSession.generatedChunks = preservedChunks.concat(placeholderChunks);
+  waitingSession.turnEnded = false;
+  waitingSession.connectEnded = false;
+  waitingSession.completed = false;
+  waitingSession.intercepted = true;
+  waitingSession.streamDetached = false;
+  waitingSession.relaying = false;
+  waitingSession.active = true;
+  waitingSession.aborted = false;
+  waitingSession.historyCompleted = false;
+  startAgentHeartbeat(waitingSession);
+
+  placeholderSession.req = null;
+  placeholderSession.res = null;
+  placeholderSession.rawBody = null;
+  placeholderSession.generatedChunks = [];
+  placeholderSession.active = false;
+  placeholderSession.completed = true;
+  placeholderSession.intercepted = false;
+  placeholderSession.waitingForInteraction = false;
+  placeholderSession.relaying = false;
+  if (placeholderSession.requestId) placeholderSession.agentSessions?.delete(placeholderSession.requestId);
+  if (placeholderSession.requestId) {
+    rebindWaitingSessionRequestId(waitingSession, placeholderSession.requestId, logger);
+  }
+
+  logger?.info?.(
+    `agent local relay adopted placeholder RunSSE requestId=${placeholderSession.requestId || '-'} into waiting session requestId=${waitingSession.requestId || '-'}`
+  );
+  replayWaitingSessionPlanCheckpoint(waitingSession, logger);
+  replayPendingInteractionQueries(waitingSession, logger);
+  return waitingSession;
+}
+
 function getAgentTurnScopeKey(requestId, userText, workspaceRoot = '', debug = null) {
   const textHash = hashRelayText(userText);
   const normalizedWorkspace = normalizeWorkspaceRoot(workspaceRoot || '') || '';
@@ -1855,9 +2327,15 @@ function clearTimer(timer) {
   }
 }
 
-function beginInterceptedAgentSession(session, logger) {
+function beginInterceptedAgentSession(session, logger, options = {}) {
   if (!session?.active || session.intercepted) return;
   session.intercepted = true;
+  try {
+    if (typeof session.res?.socket?.setNoDelay === 'function') session.res.socket.setNoDelay(true);
+    if (typeof session.res?.socket?.setKeepAlive === 'function') session.res.socket.setKeepAlive(true, 1000);
+  } catch {
+    /* ignore socket tuning failures */
+  }
   session.res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -1865,17 +2343,54 @@ function beginInterceptedAgentSession(session, logger) {
     'X-Accel-Buffering': 'no',
   });
   if (typeof session.res.flushHeaders === 'function') session.res.flushHeaders();
-  sendAgentRunSseBootstrap(session, logger);
+  if (options.bootstrap !== false) {
+    sendAgentRunSseBootstrap(session, logger);
+  }
   startAgentHeartbeat(session);
+}
+
+function replayAgentGeneratedChunks(session, chunks = [], logger = null) {
+  if (!session?.active || !session?.res || !Array.isArray(chunks) || !chunks.length) return 0;
+  let replayed = 0;
+  for (const chunk of chunks) {
+    const buffer = Buffer.from(chunk || []);
+    if (!buffer.length) continue;
+    try {
+      session.res.write(buffer);
+      replayed += 1;
+    } catch (error) {
+      logger?.warn?.(`agent local relay replay generated chunk failed requestId=${session.requestId || '-'}: ${error.message}`);
+      break;
+    }
+  }
+  if (replayed > 0 && typeof session.res.flush === 'function') {
+    try {
+      session.res.flush();
+    } catch {
+      /* ignore flush failures */
+    }
+  }
+  logger?.info?.(`agent local relay replayed generated chunks requestId=${session.requestId || '-'} count=${replayed}`);
+  return replayed;
 }
 
 function completeSessionHistory(session, status = 'completed', modelCallId = '') {
   if (!session?.agentHistory || session.historyCompleted) return;
   session.historyCompleted = true;
   try {
+    const statePatch = session.waitingForInteraction
+      ? {
+        current_loop_status: 'waiting_for_interaction',
+      }
+      : {
+        current_loop_status: status || 'completed',
+        waiting_for_interaction: null,
+      };
+    updateSessionHistoryState(session, statePatch);
     completeAgentHistoryTurn(session.agentHistory, {
       status,
       modelCallId: modelCallId || `relay-${session.requestId || Date.now().toString(36)}`,
+      preserveWaitingForInteraction: Boolean(session.waitingForInteraction),
     });
     updateAgentHistoryUsage(session.config || {}, { turns_completed: status === 'completed' ? 1 : 0 });
   } catch (error) {
@@ -1885,23 +2400,48 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
 
 function abortAgentSession(session, logger, reason = 'aborted') {
   if (!session || session.aborted) return;
+  if (session.waitingForInteraction && reason === 'runsse_closed') {
+    detachWaitingInteractionSession(session, logger, reason);
+    return;
+  }
+  if (!session.turnEnded && session.lastUserMessageCapture?.userText) {
+    const latestAssistantText = String(session.agentTextFrameText || '').trim();
+    rememberUnfinishedAgentTask(session, session.lastUserMessageCapture.userText, latestAssistantText || reason);
+  }
   session.aborted = true;
   session.active = false;
   session.relaying = false;
+  session.waitingForInteraction = false;
+  session.waitingInteractionSince = 0;
+  session.planTurnHandoff = '';
+  session.modeTurnHandoff = '';
+  session.streamDetached = false;
+  session.deferredInteractionResponse = null;
   clearInterval(session.heartbeat);
   session.heartbeat = null;
+  const clearedPendingInteractions = clearPendingInteractionEntriesForSession(session);
   try {
     session.abortController?.abort(new Error(reason));
   } catch {
     /* ignore */
   }
+  if (session.activeUpstreamResponse && typeof session.activeUpstreamResponse.destroy === 'function') {
+    try {
+      session.activeUpstreamResponse.destroy(new Error(reason));
+    } catch {
+      /* ignore */
+    }
+  }
+  session.activeUpstreamResponse = null;
   if (session.requestId) session.agentSessions?.delete(session.requestId);
   if (session.agentHistory) {
     const status = session.hadError ? 'failed' : (session.turnEnded ? 'completed' : 'aborted');
     completeSessionHistory(session, status, `abort-${session.requestId || ''}`);
   }
   markUpstreamUsageCompleted(session, session.config, 'stop', reason);
-  logger?.info?.(`agent local relay session aborted requestId=${session.requestId || '-'} reason=${reason}`);
+  logger?.info?.(
+    `agent local relay session aborted requestId=${session.requestId || '-'} reason=${reason} clearedPendingInteractions=${clearedPendingInteractions}`
+  );
 }
 
 function finalizeInterceptedAgentSession(session) {
@@ -1909,6 +2449,7 @@ function finalizeInterceptedAgentSession(session) {
   session.completed = true;
   session.active = false;
   session.relaying = false;
+  session.activeUpstreamResponse = null;
   clearInterval(session.heartbeat);
   session.heartbeat = null;
   try {
@@ -1933,24 +2474,128 @@ function finalizeInterceptedAgentSession(session) {
   }
 }
 
+function detachWaitingInteractionSession(session, logger, reason = 'runsse_closed') {
+  if (!session || session.aborted || session.completed) return false;
+  if (session.activeUpstreamResponse && typeof session.activeUpstreamResponse.destroy === 'function') {
+    try {
+      session.activeUpstreamResponse.destroy(new Error(reason));
+    } catch {
+      /* ignore */
+    }
+  }
+  session.activeUpstreamResponse = null;
+  clearInterval(session.heartbeat);
+  session.heartbeat = null;
+  session.streamDetached = true;
+  session.intercepted = false;
+  session.relaying = false;
+  session.req = null;
+  session.res = null;
+  logger?.info?.(`agent local relay waiting session detached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} reason=${reason}`);
+  return true;
+}
+
+function finalizeWaitingInteractionSessionStream(session, logger, reason = 'interaction_completed') {
+  if (!session || session.aborted || session.completed) return false;
+  session.ignoreNextRunsseClose = true;
+  try {
+    if (session.active && session.res) {
+      if (!session.turnEnded) {
+        writeAgentFrame(session, buildAgentTurnEndedFrame());
+        session.turnEnded = true;
+      }
+      if (!session.connectEnded) {
+        writeAgentFrame(session, buildConnectEndFrame());
+        session.connectEnded = true;
+      }
+      persistGeneratedAgentRunSseResponse(session, session.logger || logger);
+      session.res.end();
+    }
+  } catch (error) {
+    logger?.warn?.(`agent local relay waiting session visible finalize failed requestId=${session.requestId || '-'}: ${error.message}`);
+  }
+  clearInterval(session.heartbeat);
+  session.heartbeat = null;
+  session.streamDetached = true;
+  session.intercepted = false;
+  session.relaying = false;
+  session.req = null;
+  session.res = null;
+  logger?.info?.(`agent local relay waiting session finalized requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} reason=${reason}`);
+  return true;
+}
+
+function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
+  if (!session) return null;
+  const preservedChunks = cloneAgentGeneratedChunks(session.generatedChunks || []);
+  session.ignoreNextRunsseClose = false;
+  session.req = req;
+  session.res = res;
+  session.rawBody = rawBody;
+  session.generatedChunks = preservedChunks;
+  session.turnEnded = false;
+  session.connectEnded = false;
+  session.completed = false;
+  session.intercepted = false;
+  session.streamDetached = false;
+  session.relaying = false;
+  beginInterceptedAgentSession(session, logger, { bootstrap: preservedChunks.length === 0 });
+  if (preservedChunks.length > 0) {
+    replayAgentGeneratedChunks(session, preservedChunks, logger);
+  } else {
+    replayWaitingSessionPlanCheckpoint(session, logger);
+    replayPendingInteractionQueries(session, logger);
+  }
+  logger?.info?.(`agent local relay waiting session reattached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} deferred=${session.deferredInteractionResponse?.interactionResponse ? '1' : '0'}`);
+  return session;
+}
+
 function failAgentRelaySession(session, logger, error, label = 'async') {
   if (!session || !session.active) return;
   const message = error?.message || String(error || 'Unknown relay error');
   const requestId = session.requestId || '-';
   session.hadError = true;
+  session.activeUpstreamResponse = null;
   logger?.error?.(`agent local relay ${label} failed requestId=${requestId}: ${error?.stack || message}`);
   try {
-    const userVisible = `Relay failed: ${message}`;
+    // Decide whether this is an interruption of in-progress work (→ unfinished,
+    // context preserved, client can resume) or a genuine hard failure (→ failed).
+    // Use ONLY hard structural signals — no natural-language intent guessing:
+    //   - tools actually executed this turn (toolResultSummaries non-empty)
+    //   - pending tool calls never dispatched
+    //   - structured todo state with incomplete items
+    //   - the error itself is a recoverable transient network/gateway error
+    const toolResultCount = Array.isArray(session.toolResultSummaries) ? session.toolResultSummaries.length : 0;
+    const pendingToolCount = Array.isArray(session.pendingToolCalls) ? session.pendingToolCalls.length : 0;
+    const incompleteTodoCount = getIncompleteTodos(session).length;
+    const hadWorkInProgress = toolResultCount > 0
+      || pendingToolCount > 0
+      || incompleteTodoCount > 0
+      || Boolean(session.unfinishedWorkAtEnd);
+    const recoverable = isRecoverableStreamError(message) || isRecoverableStreamError(summarizeFetchError(error));
+    const treatAsUnfinished = hadWorkInProgress || recoverable;
+    const userVisible = treatAsUnfinished
+      ? `上游连接中断（${message}）。本轮已进行的工作已保留，任务未确认完成，可继续。`
+      : `Relay failed: ${message}`;
     appendSessionHistory(session, {
       role: 'assistant',
       kind: 'assistant_text',
-      payload: { text: userVisible, error: true },
+      payload: { text: userVisible, error: !treatAsUnfinished, interrupted: treatAsUnfinished },
     });
     writeAgentTextFrame(session, userVisible);
     writeAgentFrame(session, buildAgentTurnEndedFrame());
     session.turnEnded = true;
-    markUpstreamUsageCompleted(session, session.config, 'failed', message);
-    completeSessionHistory(session, 'failed', `error-${session.requestId || ''}`);
+    if (treatAsUnfinished) {
+      session.unfinishedWorkAtEnd = true;
+      const userText = String(session.lastUserMessageCapture?.userText || '').trim();
+      if (userText) rememberUnfinishedAgentTask(session, userText, message);
+      markUpstreamUsageCompleted(session, session.config, 'unfinished', message);
+      completeSessionHistory(session, 'unfinished', `interrupted-${session.requestId || ''}`);
+      logger?.warn?.(`agent local relay ${label} interrupted-as-unfinished requestId=${requestId} toolResults=${toolResultCount} pendingTools=${pendingToolCount} incompleteTodos=${incompleteTodoCount} recoverable=${recoverable ? 1 : 0} message=${message}`);
+    } else {
+      markUpstreamUsageCompleted(session, session.config, 'failed', message);
+      completeSessionHistory(session, 'failed', `error-${session.requestId || ''}`);
+    }
   } catch (innerError) {
     logger?.error?.(`agent local relay failure finalization failed requestId=${requestId}: ${innerError?.stack || innerError?.message || String(innerError)}`);
   }
@@ -2414,6 +3059,259 @@ function flushAgentTextToHistory(session) {
   });
 }
 
+function shouldSuppressVisiblePlanText(session = {}, options = {}) {
+  if (getSessionAgentMode(session) !== 'AGENT_MODE_PLAN') return false;
+  const phase = String(options.phase || '').trim();
+  return phase !== 'post_mutation_summary';
+}
+
+function stashSuppressedPlanText(session = {}, text = '') {
+  const value = String(text || '');
+  if (!value) return;
+  session.suppressedPlanText = `${session.suppressedPlanText || ''}${value}`;
+}
+
+function clearSuppressedPlanText(session = {}) {
+  session.suppressedPlanText = '';
+}
+
+function getPlanCheckpointText(session = {}, execution = null) {
+  const markdown = String(execution?.markdown || '').trim();
+  if (markdown) return markdown;
+  return String(session?.suppressedPlanText || '').trim();
+}
+
+function getPlanCheckpointTodos(session = {}, execution = null) {
+  const todos = Array.isArray(execution?.args?.todos)
+    ? execution.args.todos
+    : Array.isArray(session?.todos)
+      ? session.todos
+      : [];
+  return todos;
+}
+
+function emitPlanConversationCheckpointFrames(session, toolCall, execution, logger) {
+  if (!session?.active || !execution?.ok) return;
+  const planText = String(execution?.markdown || execution?.resultText || session?.suppressedPlanText || '').trim();
+  const planTodos = getPlanCheckpointTodos(session, execution);
+  if (!planText) return;
+  const workspaceRoot = getSessionWorkspaceRoot(session);
+  const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
+  try {
+    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
+      workspaceRoot,
+      rootPromptMessagesJson: session.rootPromptMessagesJson,
+      readPaths,
+      pendingToolCalls: [buildToolCallCheckpointJson(toolCall, execution, 'pending')],
+      plan: planText,
+      todos: planTodos,
+    }));
+    writeAgentFrame(session, buildAgentConversationCheckpointFrame({
+      workspaceRoot,
+      rootPromptMessagesJson: session.rootPromptMessagesJson,
+      readPaths,
+      pendingToolCalls: [],
+      plan: planText,
+      todos: planTodos,
+    }));
+    logger?.info?.(`agent local relay plan checkpoint emitted requestId=${session.requestId || '-'} planChars=${planText.length} planPath=${JSON.stringify(execution?.planPath || '')}`);
+  } catch (error) {
+    logger?.error?.(`agent local relay plan checkpoint emit failed requestId=${session?.requestId || '-'}: ${error.message}`);
+  }
+}
+
+function buildPlanStateFromExecution(session = {}, execution = {}) {
+  const planText = String(execution?.markdown || execution?.resultText || session?.suppressedPlanText || '').trim();
+  const planUri = String(execution?.planPath || '').trim();
+  const todos = getPlanCheckpointTodos(session, execution);
+  return planText || planUri
+    ? {
+      plan: planText || planUri,
+      plan_text: planText || '',
+      plan_uri: planUri,
+      todos,
+    }
+    : null;
+}
+
+function clonePendingInteractionSnapshot(pendingInteraction = null) {
+  if (!pendingInteraction || typeof pendingInteraction !== 'object') return null;
+  return {
+    ...pendingInteraction,
+    arguments: pendingInteraction.arguments && typeof pendingInteraction.arguments === 'object'
+      ? { ...pendingInteraction.arguments }
+      : {},
+    execution: pendingInteraction.execution && typeof pendingInteraction.execution === 'object'
+      ? { ...pendingInteraction.execution }
+      : pendingInteraction.execution || null,
+    resumeState: pendingInteraction.resumeState && typeof pendingInteraction.resumeState === 'object'
+      ? {
+          ...pendingInteraction.resumeState,
+          upstreamMessages: Array.isArray(pendingInteraction.resumeState.upstreamMessages)
+            ? pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }))
+            : [],
+        }
+      : null,
+  };
+}
+
+function rememberSessionPlanState(session = {}, planState = null) {
+  if (!session) return null;
+  session.latestPlanState = planState && typeof planState === 'object'
+    ? {
+        ...planState,
+        todos: Array.isArray(planState.todos) ? planState.todos.map((todo) => ({ ...todo })) : [],
+      }
+    : null;
+  if (session.latestPlanState && Array.isArray(session.latestPlanState.todos)) {
+    updateSessionTodos(session, session.latestPlanState.todos, false);
+  }
+  return session.latestPlanState;
+}
+
+function getLatestSessionPlanState(session = {}) {
+  return session?.latestPlanState && typeof session.latestPlanState === 'object'
+    ? session.latestPlanState
+    : null;
+}
+
+function mapTodoStatusToOfficial(todo = {}) {
+  const normalized = normalizeTodoStatus(todo?.status);
+  if (normalized === 'in_progress') return 'TODO_STATUS_IN_PROGRESS';
+  if (normalized === 'completed') return 'TODO_STATUS_COMPLETED';
+  if (normalized === 'cancelled') return 'TODO_STATUS_CANCELLED';
+  return 'TODO_STATUS_PENDING';
+}
+
+function buildOfficialCurrentTodos(session = {}) {
+  return normalizeTodoItems(session.todos || getLatestSessionPlanState(session)?.todos || [])
+    .map((todo) => ({
+      id: todo.id,
+      content: todo.content,
+      status: mapTodoStatusToOfficial(todo),
+    }));
+}
+
+function formatOfficialTodoListPrompt(session = {}) {
+  const todos = normalizeTodoItems(session.todos || getLatestSessionPlanState(session)?.todos || []);
+  if (!todos.length) return '<todo_list>\n</todo_list>';
+  const lines = todos.map((todo) => `- [${todo.status}] ${todo.id}: ${todo.content}`);
+  return `<todo_list>\n${lines.join('\n')}\n</todo_list>`;
+}
+
+function syncOfficialPlanState(session = {}, options = {}) {
+  if (!session?.agentHistory?.state) return null;
+  const planState = getLatestSessionPlanState(session);
+  if (!planState) return null;
+  const planText = String(planState.plan_text || planState.plan || '').trim();
+  const planUri = String(planState.plan_uri || '').trim();
+  const currentTodos = buildOfficialCurrentTodos(session);
+  const currentPlans = planUri
+    ? {
+        current: {
+          id: 'current',
+          path: planUri,
+        },
+      }
+    : {};
+  const patch = {
+    current_plan_text: planText,
+    current_plans: currentPlans,
+    current_todos: currentTodos,
+  };
+  updateSessionHistoryState(session, patch);
+  if (options.appendPromptContext) {
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'structured_state/current_plan',
+        role: 'user',
+        content: `<current_plan>\n${planText}\n</current_plan>`,
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'structured_state/todo_list',
+        role: 'user',
+        content: formatOfficialTodoListPrompt(session),
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'structured_state/todo_reminder',
+        role: 'user',
+        content: '<system_reminder>\nYou are currently under the todo section, be sure to track tasks and do not forget to update.\n</system_reminder>',
+      },
+    });
+  }
+  return patch;
+}
+
+function buildFallbackPendingPlanExecution(session = {}) {
+  const userText = String(session?.lastUserMessageCapture?.userText || '').trim();
+  if (!userText) return null;
+  const planState = getLatestSessionPlanState(session);
+  const existingResumeMessages = Array.isArray(session?.lastPlanResumeMessages)
+    ? session.lastPlanResumeMessages.map((message) => ({ ...message }))
+    : [];
+  return {
+    requestId: String(session.requestId || '').trim(),
+    queryId: 0,
+    kind: 'create_plan',
+    toolName: 'CreatePlan',
+    toolCallId: '',
+    arguments: {
+      plan: String(planState?.plan_text || planState?.plan || '').trim(),
+      todos: Array.isArray(planState?.todos) ? planState.todos : [],
+      planUri: String(planState?.plan_uri || '').trim(),
+    },
+    resumeState: {
+      userText,
+      upstreamMessages: existingResumeMessages.length
+        ? existingResumeMessages
+        : buildLocalRelayMessages(userText, session),
+      capturedAt: new Date().toISOString(),
+      stableConversationId: getSessionStableConversationId(session),
+      requestId: String(session.requestId || '').trim(),
+    },
+  };
+}
+
+function buildSyntheticPlanExecutionResponse(session = {}, conversationAction = {}) {
+  const latestPlanState = getLatestSessionPlanState(session) || {};
+  const actionPlanText = String(
+    conversationAction?.planFileContent
+    || conversationAction?.plan
+    || latestPlanState.plan_text
+    || ''
+  ).trim();
+  const actionPlanUri = String(
+    conversationAction?.planFileUri
+    || latestPlanState.plan_uri
+    || ''
+  ).trim();
+  return {
+    id: 0,
+    kind: 'execute_plan_action',
+    createPlan: {
+      kind: 'success',
+      planUri: actionPlanUri,
+      plan: actionPlanText,
+      error: '',
+    },
+    executePlan: {
+      executionMode: String(conversationAction?.executionMode || '').trim(),
+      planUri: actionPlanUri,
+      plan: actionPlanText,
+    },
+  };
+}
+
 function writeAgentTextFrame(session, text, { tokenDelta = true, recordHistory = false } = {}) {
   const value = String(text || '');
   if (!value || !session?.active) return;
@@ -2426,14 +3324,14 @@ function writeAgentTextFrame(session, text, { tokenDelta = true, recordHistory =
 }
 
 function emitUpstreamToolStartedFrame(session, payload) {
-  if (!session?.active || !payload || payload.type !== 'response.output_item.added') return;
+  if (!session?.active || !payload || payload.type !== 'response.output_item.added') return false;
   const item = payload.item || {};
-  if (item.type !== 'function_call') return;
+  if (item.type !== 'function_call') return false;
   const toolName = String(item.name || '').trim();
-  if (!toolName) return;
+  if (!toolName) return false;
   const toolCallId = String(item.call_id || item.id || `tool_${Date.now().toString(36)}`);
   session.upstreamToolStarted = session.upstreamToolStarted || new Set();
-  if (session.upstreamToolStarted.has(toolCallId)) return;
+  if (session.upstreamToolStarted.has(toolCallId)) return false;
   session.upstreamToolStarted.add(toolCallId);
   session.upstreamToolItemIds = session.upstreamToolItemIds || new Map();
   if (item.id) session.upstreamToolItemIds.set(String(item.id), toolCallId);
@@ -2445,15 +3343,17 @@ function emitUpstreamToolStartedFrame(session, payload) {
   const modelCallId = `model_${toolCallId}`;
   const args = parseJsonObject(item.arguments || '{}');
   const leanArgs = isEditLikeToolName(toolName) ? buildLeanEditToolArguments(args) : args;
-  if (!hasRequiredToolArguments({ name: toolName, arguments: leanArgs })) return;
+  if (!hasRequiredToolArguments({ name: toolName, arguments: leanArgs })) return false;
   writeAgentFrame(session, buildAgentPartialToolCallFrame(toolName, leanArgs, toolCallId, modelCallId));
   if (!isEditLikeToolName(toolName)) {
     writeAgentFrame(session, buildAgentToolCallStartedFrame(toolName, leanArgs, toolCallId, modelCallId));
   }
+  return true;
 }
 
 function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
-  if (!session?.active || !payload) return;
+  if (!session?.active || !payload) return false;
+  let emitted = false;
   const chatCalls = payload.choices?.[0]?.delta?.tool_calls;
   if (Array.isArray(chatCalls) && chatCalls.length) {
     chatCalls.forEach((call, index) => {
@@ -2470,19 +3370,19 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
       }
       const delta = String(call.function?.arguments || '');
       if (!delta) return;
-      emitUpstreamToolArgumentProgress(session, {
+      emitted = emitUpstreamToolArgumentProgress(session, {
         type: 'response.function_call_arguments.delta',
         item_id: indexKey,
         call_id: toolCallId,
         delta,
-      }, userText);
+      }, userText) || emitted;
     });
-    return;
+    return emitted;
   }
-  if (!String(payload.type || '').startsWith('response.function_call_arguments.')) return;
+  if (!String(payload.type || '').startsWith('response.function_call_arguments.')) return false;
   const rawKey = String(payload.item_id || payload.call_id || '');
   const key = session.upstreamToolItemIds?.get(rawKey) || String(payload.call_id || rawKey || '');
-  if (!key) return;
+  if (!key) return false;
   session.upstreamToolArgumentStreams = session.upstreamToolArgumentStreams || new Map();
   const existing = session.upstreamToolArgumentStreams.get(key) || {
     id: String(payload.call_id || key),
@@ -2508,7 +3408,7 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
   if (collected?.name) existing.name = String(collected.name || existing.name || '');
   if (!isEditLikeToolName(existing.name)) {
     session.upstreamToolArgumentStreams.set(key, existing);
-    return;
+    return false;
   }
   const toolCallId = existing.id;
   const modelCallId = `model_${toolCallId}`;
@@ -2521,9 +3421,11 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
     existing.emittedPath = targetPath;
     const leanArgs = { path: targetPath };
     writeAgentFrame(session, buildAgentPartialToolCallFrame(existing.name, leanArgs, toolCallId, modelCallId));
+    emitted = true;
     if (!existing.completedStarted) {
       writeAgentFrame(session, buildAgentToolCallStartedFrame(existing.name, leanArgs, toolCallId, modelCallId));
       existing.completedStarted = true;
+      emitted = true;
     }
   }
   const content = getStreamingEditContentFromArgumentsText(existing.argumentsText);
@@ -2545,6 +3447,7 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
     const chunkSize = EDIT_STREAM_FRAME_CHARS;
     for (let offset = 0; offset < pendingContentDelta.length; offset += chunkSize) {
       writeAgentFrame(session, buildAgentEditToolCallDeltaFrame(pendingContentDelta.slice(offset, offset + chunkSize), toolCallId, modelCallId));
+      emitted = true;
     }
     existing.pendingContentDelta = '';
     existing.lastContentFlushAt = Date.now();
@@ -2555,8 +3458,10 @@ function emitUpstreamToolArgumentProgress(session, payload, userText = '') {
     if (targetPath && !leanArgs.path) leanArgs.path = targetPath;
     writeAgentFrame(session, buildAgentToolCallStartedFrame(existing.name, leanArgs, toolCallId, modelCallId));
     existing.completedStarted = true;
+    emitted = true;
   }
   session.upstreamToolArgumentStreams.set(key, existing);
+  return emitted;
 }
 
 function completeDuplicateAgentSession(session, logger, reason = 'duplicate_user_message', completedTurn = null) {
@@ -2613,6 +3518,144 @@ function appendSessionHistory(session, item) {
   }
 }
 
+function beginSessionHistoryTurn(session, config, options = {}) {
+  const {
+    userText = '',
+    includeUserMessage = false,
+    includeRequestContext = false,
+    includeModePromptContexts = false,
+  } = options;
+  const { conversation, turnSeq } = beginAgentHistoryTurn(
+    config,
+    session?.requestId || '',
+    getSessionWorkspaceRoot(session),
+    session?.lastUserMessageCapture || null,
+  );
+  session.agentHistory = conversation;
+  session.agentTurnSeq = turnSeq;
+  session.historyCompleted = false;
+  if (
+    shouldTreatPlanTurnAsFreshRequest(session)
+    && !isPlanExecutionActionKind(getCurrentConversationActionKind(session))
+  ) {
+    clearSessionPlanPresentationState(session, { clearTodos: true });
+  }
+  const agentModeForHistory = getSessionAgentMode(session);
+  const requestedModelId = String(
+    session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
+  ).trim();
+  if (session.agentHistory?.state) session.agentHistory.state.mode = getCursorModeDirectory(agentModeForHistory);
+  if (includeRequestContext) {
+    appendSessionHistory(session, {
+      role: 'user',
+      kind: 'request_context',
+      payload: {
+        env: {
+          osVersion: `${process.platform} ${process.getSystemVersion ? process.getSystemVersion() : ''}`.trim(),
+          workspacePaths: [getSessionWorkspaceRoot(session)],
+          shell: 'powershell',
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+        },
+        fileContents: {},
+        readLintsEnabled: true,
+        mcpInfoComplete: true,
+        envInfoComplete: true,
+      },
+    });
+  }
+  if (includeUserMessage) {
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'metadata',
+      payload: {
+        type: 'mode',
+        value: {
+          explicit: true,
+          mode: getCursorModeDirectory(agentModeForHistory),
+          source: 'user_message',
+        },
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'metadata',
+      payload: {
+        type: 'run_request',
+        value: {
+          model_id: requestedModelId,
+          model_name: requestedModelId,
+          prewarm: false,
+        },
+      },
+    });
+    appendSessionHistory(session, {
+      role: 'user',
+      kind: 'user_message',
+      payload: {
+        text: String(userText || ''),
+        mode: agentModeForHistory,
+      },
+    });
+  }
+  if (includeModePromptContexts) {
+    const handler = getModeHandlerForSession(session);
+    const helpers = buildModeRuntimeHelpers(session);
+    const promptContexts = typeof handler.buildPlanInitialPromptContexts === 'function'
+      ? handler.buildPlanInitialPromptContexts({
+        session,
+        userText: String(userText || ''),
+      }, helpers)
+      : [];
+    for (const promptContext of promptContexts) {
+      appendSessionHistory(session, {
+        role: 'system',
+        kind: 'prompt_context',
+        payload: {
+          source: String(promptContext?.source || '').trim() || 'mode_context',
+          role: String(promptContext?.role || 'user'),
+          content: String(promptContext?.content || ''),
+        },
+      });
+    }
+  }
+  if (includeUserMessage) {
+    appendSessionHistory(session, {
+      role: 'system',
+      kind: 'prompt_context',
+      payload: {
+        source: 'current_user_request',
+        role: 'user',
+        content: `<current_user_request>\n${String(userText || '')}\n</current_user_request>`,
+      },
+    });
+  }
+  return conversation;
+}
+
+function ensureOpenSessionHistoryTurn(session, config, options = {}) {
+  if (session?.agentHistory && !session.historyCompleted) return false;
+  beginSessionHistoryTurn(session, config, options);
+  return true;
+}
+
+function updateSessionHistoryState(session, patch = {}) {
+  try {
+    updateAgentHistoryConversationState(getHistory(session), patch);
+  } catch (error) {
+    session?.logger?.warn?.(`agent history state update failed requestId=${session?.requestId || '-'}: ${error.message}`);
+  }
+}
+
+function appendInteractionQueryToHistory(session = {}, pendingInteraction = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  const item = typeof handler.buildInteractionQueryHistoryItem === 'function'
+    ? handler.buildInteractionQueryHistoryItem(pendingInteraction, helpers)
+    : null;
+  if (!item) return;
+  appendSessionHistory(session, item);
+}
+
 function appendLatestEditReminder(session, filePath) {
   if (!filePath) return;
   appendSessionHistory(session, {
@@ -2643,6 +3686,7 @@ function canonicalToolName(name) {
   if (lower === 'patchedit' || lower === 'strreplace') return 'PatchEdit';
   if (lower === 'readlints' || lower === 'diagnostics') return 'ReadLints';
   if (isTodoToolName(lower)) return 'TodoWrite';
+  if (lower === 'ls') return 'Ls';
   if (lower === 'websearch' || lower === 'web_search') return 'WebSearch';
   if (lower === 'webfetch' || lower === 'web_fetch' || lower === 'fetch') return 'WebFetch';
   if (lower === 'write' || lower === 'edit') return 'PatchEdit';
@@ -2651,11 +3695,6 @@ function canonicalToolName(name) {
 
 function isEditLikeToolName(name) {
   return ['write', 'edit', 'strreplace', 'patchedit'].includes(String(name || '').trim().toLowerCase());
-}
-
-function isTodoToolName(name) {
-  const lower = String(name || '').trim().toLowerCase();
-  return lower === 'todowrite' || lower === 'todo_write' || lower === 'updatetodo' || lower === 'updatetodos';
 }
 
 function buildLeanEditToolCompletionExecution(execution = {}) {
@@ -2825,23 +3864,7 @@ function canUseNativePatchEditForTool(toolCall, session) {
 }
 
 function shouldUseNativeExecForTool(session, toolCall) {
-  const lower = String(toolCall?.name || '').trim().toLowerCase();
-  if (isTodoToolName(lower)) return false;
-  if (lower === 'shell') return false;
-  if (lower === 'patchedit' || lower === 'strreplace') return canUseNativePatchEditForTool(toolCall, session);
-  if (session?.config?.emitAgentExecServerFrames === true) return true;
-  if (session?.config?.nativeMutationTools === false) return false;
-  return [
-    'write',
-    'edit',
-    'delete',
-    'read',
-    'grep',
-    'ls',
-    'shell',
-    'readlints',
-    'diagnostics',
-  ].includes(lower);
+  return shouldUseNativeExecForModeTool(session, toolCall, { canUseNativePatchEditForTool });
 }
 
 function normalizeToolCallPathsForWorkspace(toolCall, session) {
@@ -2883,6 +3906,7 @@ function getToolCallSignature(toolCall, session) {
   if (name === 'shell') return `shell:${normalizeWorkspacePath(args.cwd || args.working_directory || '')}:${String(args.command || '')}`;
   if (name === 'readlints') return `readlints:${(Array.isArray(args.paths) ? args.paths : [args.path].filter(Boolean)).map(normalizeWorkspacePath).join('|')}`;
   if (name === 'todowrite') return '';
+  if (name === 'websearch') return `websearch:${normalizeSearchTermForSignature(args.search_term || args.searchTerm || args.query || '')}`;
   return `${name}:${JSON.stringify(args)}`;
 }
 
@@ -3101,6 +4125,249 @@ function buildExecServerFrameForTool(toolName, args = {}, toolCallId = '', numer
   return null;
 }
 
+function nextInteractionQueryId(session = {}) {
+  session.nextInteractionQueryId = (Number(session.nextInteractionQueryId) || 0) + 1;
+  return session.nextInteractionQueryId;
+}
+
+function shouldDispatchInteractionQueryForTool(session = {}, toolCall = {}, execution = null) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldDispatchInteractionQuery !== 'function') return false;
+  return Boolean(handler.shouldDispatchInteractionQuery(session, toolCall, execution, helpers));
+}
+
+function buildInteractionQueryFrameForTool(session = {}, toolCall = {}, toolCallId = '') {
+  const queryId = nextInteractionQueryId(session);
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildInteractionQuery !== 'function') return null;
+  return handler.buildInteractionQuery(session, toolCall, toolCallId, queryId, helpers);
+}
+
+function getInteractionPendingKindFromResponseByMode(session = {}, interactionResponse = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.getInteractionPendingKindFromResponse === 'function') {
+    const resolved = handler.getInteractionPendingKindFromResponse(interactionResponse, helpers);
+    if (resolved) return String(resolved).trim();
+  }
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  if (responseKind === 'create_plan_request_response') return 'create_plan';
+  if (responseKind === 'ask_question_interaction_response') return 'ask_question';
+  if (responseKind === 'web_search_request_response') return 'web_search';
+  return '';
+}
+
+function registerPendingInteractionQuery(session = {}, payload = {}) {
+  const requestId = String(session.requestId || '').trim();
+  const queryId = Number(payload.queryId) || 0;
+  const kind = String(payload.kind || '').trim();
+  if (!requestId || !queryId || !kind) return;
+  session.pendingAgentInteractions = session.pendingAgentInteractions || new Map();
+  const key = `${requestId}:${queryId}:${kind}`;
+  session.pendingAgentInteractions.set(key, {
+    key,
+    requestId,
+    queryId,
+    kind,
+    toolCallId: String(payload.toolCallId || '').trim(),
+    toolName: String(payload.toolName || '').trim(),
+    arguments: payload.arguments || {},
+    execution: payload.execution || null,
+    modeName: normalizeAgentModeName(payload.modeName || getSessionAgentMode(session)),
+    stableConversationId: String(payload.stableConversationId || '').trim(),
+    workspaceRoot: String(payload.workspaceRoot || '').trim(),
+    resumeState: payload.resumeState || null,
+    createdAt: payload.createdAt || new Date().toISOString(),
+  });
+}
+
+function findPendingInteractionQuery(pendingAgentInteractions, requestId = '', interactionResponse = {}) {
+  if (!pendingAgentInteractions?.size || !requestId) return null;
+  const responseId = Number(interactionResponse?.id) || 0;
+  const stableConversationId = String(
+    interactionResponse?.stableConversationId
+    || interactionResponse?.conversationId
+    || ''
+  ).trim();
+  const candidates = Array.from(pendingAgentInteractions.values())
+    .filter((entry) => entry?.requestId === requestId || (stableConversationId && entry?.stableConversationId === stableConversationId))
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  if (!candidates.length) return null;
+  const modeSession = {
+    agentMode: normalizeAgentModeName(candidates[0]?.modeName || agentSessions.get(requestId)?.agentMode || 'AGENT_MODE_AGENT'),
+  };
+  const responseKind = getInteractionPendingKindFromResponseByMode(modeSession, interactionResponse);
+  if (responseId > 0) {
+    const exact = candidates.find((entry) => Number(entry.queryId) === responseId && (!responseKind || entry.kind === responseKind));
+    if (exact) return exact;
+  }
+  if (responseKind) {
+    const sameKind = candidates.find((entry) => entry.kind === responseKind);
+    if (sameKind) return sameKind;
+  }
+  return candidates[0];
+}
+
+function findPendingInteractionQueryByExecution(session = {}, executionEntry = {}) {
+  const pendingAgentInteractions = session?.pendingAgentInteractions;
+  const interactionQueryId = Number(executionEntry?.execution?.interactionQueryId) || 0;
+  const interactionQueryKind = String(executionEntry?.execution?.interactionQueryKind || '').trim();
+  const toolCallId = String(executionEntry?.toolCall?.id || '').trim();
+  if (!pendingAgentInteractions?.size) return null;
+  const candidates = Array.from(pendingAgentInteractions.values())
+    .filter((entry) => entry?.requestId === String(session.requestId || '').trim());
+  if (!candidates.length) return null;
+  if (interactionQueryId > 0) {
+    const exact = candidates.find((entry) => Number(entry.queryId) === interactionQueryId && (!interactionQueryKind || entry.kind === interactionQueryKind));
+    if (exact) return exact;
+  }
+  if (toolCallId) {
+    const byToolCall = candidates.find((entry) => String(entry.toolCallId || '').trim() === toolCallId && (!interactionQueryKind || entry.kind === interactionQueryKind));
+    if (byToolCall) return byToolCall;
+  }
+  if (interactionQueryKind) {
+    const byKind = candidates.find((entry) => entry.kind === interactionQueryKind);
+    if (byKind) return byKind;
+  }
+  return candidates[0];
+}
+
+function buildInteractionContinuationPrompt(pendingInteraction = {}, interactionResponse = {}) {
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  if (responseKind === 'web_search_request_response' || pendingKind === 'web_search') {
+    return [
+      'The pending WebSearch interaction has completed.',
+      `Approval: ${interactionResponse?.webSearchApproved ? 'approved' : 'not approved'}.`,
+      'Continue the same turn and use the approved web search path if it is still needed.',
+    ].join('\n');
+  }
+  return [
+    'A pending plan interaction has completed.',
+    `Interaction payload: ${JSON.stringify(interactionResponse || {})}`,
+    'Continue the same turn from this interaction result without restarting from scratch.',
+  ].join('\n');
+}
+
+function buildPendingInteractionResumeMessages(session = {}, pendingInteraction = {}, interactionResponse = {}) {
+  const resumeState = pendingInteraction?.resumeState || {};
+  const baseMessages = Array.isArray(resumeState.upstreamMessages)
+    ? resumeState.upstreamMessages.map((message) => ({ ...message }))
+    : buildLocalRelayMessages(resumeState.userText || session.lastUserMessageCapture?.userText || '', session);
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  const resumeMessage = typeof handler.buildInteractionResumeMessage === 'function'
+    ? handler.buildInteractionResumeMessage(pendingInteraction, interactionResponse, helpers)
+    : null;
+  return [
+    ...baseMessages,
+    resumeMessage || {
+      role: 'user',
+      content: [
+        buildInteractionContinuationPrompt(pendingInteraction, interactionResponse),
+        'Do not restart or restate the original task. Continue strictly from the preserved turn context, prior assistant output, and prior tool results above.',
+      ].join('\n'),
+    },
+  ];
+}
+
+function appendInteractionResponseToHistory(session = {}, pendingInteraction = {}, interactionResponse = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  const item = typeof handler.buildInteractionResponseHistoryItem === 'function'
+    ? handler.buildInteractionResponseHistoryItem(pendingInteraction, interactionResponse, helpers)
+    : null;
+  if (!item) return;
+  appendSessionHistory(session, item);
+  const responseKind = String(interactionResponse?.kind || '').trim();
+  const pendingKind = String(pendingInteraction?.kind || '').trim();
+  const toolName = String(pendingInteraction?.toolName || '').trim();
+  const toolCallId = String(pendingInteraction?.toolCallId || '').trim();
+  const interactionResult = responseKind === 'ask_question_interaction_response'
+    ? {
+        ok: String(interactionResponse?.askQuestion?.kind || '').trim().toLowerCase() === 'success',
+        answers: Array.isArray(interactionResponse?.askQuestion?.answers) ? interactionResponse.askQuestion.answers : [],
+        resultText: String(interactionResponse?.askQuestion?.kind || '').trim().toLowerCase() === 'success'
+          ? `ask question answers=${Array.isArray(interactionResponse?.askQuestion?.answers) ? interactionResponse.askQuestion.answers.length : 0}`
+          : String(interactionResponse?.askQuestion?.error || interactionResponse?.askQuestion?.rejectedReason || 'AskQuestion failed'),
+      }
+    : responseKind === 'create_plan_request_response'
+      ? {
+          ok: String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase() === 'success',
+          planPath: String(interactionResponse?.createPlan?.planUri || pendingInteraction?.arguments?.planUri || '').trim(),
+          resultText: String(interactionResponse?.createPlan?.kind || '').trim().toLowerCase() === 'success'
+            ? `create plan success uri=${String(interactionResponse?.createPlan?.planUri || pendingInteraction?.arguments?.planUri || '').trim()}`
+            : String(interactionResponse?.createPlan?.error || 'CreatePlan failed'),
+        }
+      : null;
+  if (!interactionResult || !toolName || !toolCallId) return;
+  const existingItems = Array.isArray(session?.agentHistory?.context?.items) ? session.agentHistory.context.items : [];
+  if (existingItems.some((entry) => (
+    entry?.role === 'tool'
+    && entry?.kind === 'tool_result'
+    && String(entry?.tool_call_id || '').trim() === toolCallId
+  ))) {
+    return;
+  }
+  const structuredToolCall = buildStructuredToolCallSnapshot(toolName, pendingInteraction?.arguments || {}, interactionResult, toolCallId);
+  appendSessionHistory(session, {
+    role: 'tool',
+    kind: 'tool_result',
+    tool_call_id: toolCallId,
+    payload: {
+      tool_call_id: toolCallId,
+      tool_name: toolName,
+      arguments: JSON.stringify(pendingInteraction?.arguments || {}),
+      result_text: interactionResult.resultText || '',
+      ok: Boolean(interactionResult.ok),
+      duration_ms: 0,
+      ...(structuredToolCall ? { tool_call: structuredToolCall } : {}),
+    },
+  });
+}
+
+function updatePendingInteractionResumeState(session = {}, executions = [], upstreamMessages = [], toolResultMessages = [], streamedText = '', userText = '') {
+  const waitingExecutions = (Array.isArray(executions) ? executions : [])
+    .filter((entry) => entry?.execution?.awaitingInteractionResponse);
+  if (!waitingExecutions.length) return 0;
+  const resumeMessages = [
+    ...(Array.isArray(upstreamMessages) ? upstreamMessages.map((message) => ({ ...message })) : []),
+    { role: 'assistant', content: String(streamedText || '').trim() || `Called ${waitingExecutions.length} tool(s).` },
+    ...(Array.isArray(toolResultMessages) ? toolResultMessages.map((message) => ({ ...message })) : []),
+  ];
+  session.lastPlanResumeMessages = resumeMessages.map((message) => ({ ...message }));
+  let updated = 0;
+  for (const executionEntry of waitingExecutions) {
+    const pendingInteraction = findPendingInteractionQueryByExecution(session, executionEntry);
+    if (!pendingInteraction) continue;
+    pendingInteraction.resumeState = buildPendingInteractionResumeStateByMode(session, pendingInteraction, {
+      userText,
+      upstreamMessages: resumeMessages,
+      capturedAt: new Date().toISOString(),
+      stableConversationId: getSessionStableConversationId(session),
+      requestId: String(session.requestId || '').trim(),
+      executionEntry,
+    });
+    updated += 1;
+  }
+  return updated;
+}
+
+function triggerDeferredInteractionResume(session, config, logger, stats, source = 'deferred') {
+  if (!session?.active || session.aborted || session.relaying) return false;
+  const deferred = session.deferredInteractionResponse || null;
+  if (!deferred?.interactionResponse) return false;
+  session.deferredInteractionResponse = null;
+  logger?.info?.(
+    `agent local relay deferred interaction resume requestId=${session.requestId || '-'} source=${source} interactionKind=${deferred.interactionResponse?.kind || '-'} pendingKind=${deferred.pendingInteraction?.kind || '-'} pendingTool=${deferred.pendingInteraction?.toolName || '-'}`
+  );
+  resumeAgentAfterInteractionResponse(session, deferred.interactionResponse, config, logger, stats, deferred.pendingInteraction || null)
+    .catch((error) => failAgentRelaySession(session, logger, error, `deferred_interaction_resume:${source}`));
+  return true;
+}
+
 function parseJsonObject(value) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
   if (typeof value !== 'string') return {};
@@ -3273,6 +4540,15 @@ function hasRequiredToolArguments(toolCall) {
   }
   if (name === 'readlints' || name === 'diagnostics') {
     return Boolean((Array.isArray(args.paths) && args.paths.length) || args.path);
+  }
+  if (name === 'semanticsearch') {
+    return Boolean(String(args.query || '').trim());
+  }
+  if (name === 'askquestion') {
+    return Array.isArray(args.questions) && args.questions.length > 0;
+  }
+  if (name === 'createplan') {
+    return Boolean(String(args.plan || '').trim() || String(args.overview || '').trim());
   }
   return true;
 }
@@ -3490,6 +4766,7 @@ async function collectPostMutationSummary({
   if (!session?.active || session.aborted) return fallback;
   const changedPaths = getSuccessfulMutationPaths(session);
   const activeUpstream = resolveUpstreamForModel(config, configuredModel);
+  const agentMode = getSessionAgentMode(session);
   const summaryPrompt = [
     'The file mutation has already succeeded through Cursor native tools.',
     changedPaths.length ? `Changed file(s): ${changedPaths.join(', ')}` : '',
@@ -3507,15 +4784,16 @@ async function collectPostMutationSummary({
       configuredModel,
       compacted.messages,
       logger,
-      {
+      buildFetchUpstreamOptionsForSession(session, {
         enableTools: false,
         signal: session.abortController?.signal || null,
         timeoutMs: POST_MUTATION_SUMMARY_TIMEOUT_MS,
         requestId,
         phase: 'post_mutation_summary',
+        mode: agentMode,
         outboundProxy: config.outboundProxy || null,
         localProxyPort: config.port,
-      },
+      }, { phase: 'post_mutation_summary', agentMode }),
     );
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
@@ -3652,7 +4930,7 @@ function matchesGlobPath(filePath, rootPath, matchers = []) {
 
 function walkFiles(root, options = {}) {
   const out = [];
-  const ignore = new Set(['node_modules', '.git', 'dist', 'build', ...(options.ignore || [])].map((item) => String(item).toLowerCase()));
+  const ignore = new Set(getDefaultRelayIgnoreNames(options.ignore).map((item) => String(item).toLowerCase()));
   const max = Number(options.max) || 500;
   function walk(dir) {
     if (out.length >= max) return;
@@ -3679,7 +4957,7 @@ function walkFiles(root, options = {}) {
 
 function shouldIgnoreLsEntry(name = '', ignore = []) {
   const normalized = String(name || '').toLowerCase();
-  const patterns = Array.isArray(ignore) ? ignore : [];
+  const patterns = getDefaultRelayIgnoreNames(ignore);
   return patterns.some((pattern) => {
     const value = String(pattern || '').trim().toLowerCase();
     if (!value) return false;
@@ -3789,7 +5067,7 @@ function buildReadOutput(filePath, args = {}) {
 }
 
 function isLocalContextToolName(toolName = '') {
-  return ['read', 'grep', 'ls', 'glob'].includes(String(toolName || '').trim().toLowerCase());
+  return ['read', 'grep', 'ls', 'glob', 'semanticsearch'].includes(String(toolName || '').trim().toLowerCase());
 }
 
 function isReadOnlyContextToolName(toolName = '') {
@@ -3942,9 +5220,39 @@ function getIncompleteTodos(session = {}) {
 }
 
 function looksLikeIncompleteContinuationText(text = '') {
+  // NOTE: We intentionally do NOT guess "continuation intent" from natural
+  // language (Chinese / English / Japanese / Korean / Russian ...). Text-based
+  // intent matching is fragile and unscalable across languages. Instead, turn
+  // completeness is decided from hard protocol/state signals only:
+  //   - toolCalls emitted this round (pending tool frames)
+  //   - toolResultSummaries (tools actually executed this turn)
+  //   - session.todos (incomplete todo items — structured state)
+  //   - stream sawDone / stopReason (protocol-level completion signal)
+  // The only text-based check kept here is the structural "placeholder final
+  // text" marker emitted by the relay itself (e.g. "Called N tool(s)."), which
+  // is a machine-generated protocol string, not model natural language.
   const value = String(text || '').trim();
   if (!value) return false;
   return isPlaceholderFinalText(value);
+}
+
+// Hard, language-agnostic signal: the upstream stream ended without a reliable
+// `done` flag and without emitting a tool call. This means the turn did not
+// reach a proper completion point from the protocol's perspective — regardless
+// of what natural-language text was produced. Returns true only when there is
+// concrete structural evidence the turn was interrupted mid-flight.
+function streamEndedWithoutReliableCompletion(options = {}) {
+  const sawDone = options.lastStreamSawDone === true;
+  if (sawDone) return false;
+  const stopReason = String(options.lastStreamStopReason || '').trim();
+  // stream_end / usage_without_done / local_stop_after_text all mean the stream
+  // closed without the model signalling a clean turn boundary.
+  if (stopReason !== 'stream_end'
+    && stopReason !== 'usage_without_done'
+    && stopReason !== 'local_stop_after_text') {
+    return false;
+  }
+  return true;
 }
 
 function stripCjkAndAsciiPunctuation(text = '') {
@@ -3969,7 +5277,6 @@ function textLooksLikeSubstantiveFinalAnswer(text = '') {
   if (compact.length >= 160 || countWordsAndCjkChars(value) >= 40) return true;
   if (/\n\s*(?:[-*]|\d+[.)])\s+\S/.test(value)) return true;
   if (/```/.test(value)) return true;
-  if (/(?:^|\n)\s*(?:summary|result|done|completed|analysis|findings|conclusion|next steps|总结|结论|分析|结果|完成|已完成|问题|建议|发现)\s*[:：]/i.test(value)) return true;
   return false;
 }
 
@@ -3980,9 +5287,14 @@ function looksLikeReadOnlyExplorationStillInProgress(session = {}, finalText = '
   const mutationCount = summaries.filter((entry) => isMutationToolName(entry?.tool)).length;
   const continuationTargetPath = getReadOnlyContinuationTargetPath(session);
   const value = String(finalText || '').trim();
+  const sawReliableCompletion = options.lastStreamSawDone === true;
+  const stopReason = String(options.lastStreamStopReason || '').trim();
+  if (!sawReliableCompletion && (stopReason === 'local_stop_after_text' || stopReason === 'local_timeout' || stopReason === 'usage_without_done' || stopReason === 'stream_end')) {
+    return readOnlyCount > 0 && mutationCount === 0;
+  }
+  if (sawReliableCompletion) return false;
   if (!value) return readOnlyCount > 0 && mutationCount === 0;
   if (isPlaceholderFinalText(value)) return true;
-  if (textLooksLikeSubstantiveFinalAnswer(value)) return false;
   const compact = stripCjkAndAsciiPunctuation(value);
   if (!compact) return true;
   if (continuationTargetPath && readOnlyCount >= 1 && mutationCount === 0) {
@@ -4019,6 +5331,11 @@ function shouldContinueIncompleteWork(session = {}, finalText = '', toolCalls = 
   if (maxContinuations > 0 && continuationCount >= maxContinuations) return false;
   const incompleteTodos = getIncompleteTodos(session);
   if (incompleteTodos.length > 0) return true;
+  // Trigger a continuation nudge when the stream ended without a reliable
+  // `done` signal and without emitting a tool call — a hard protocol-level
+  // gap, not a text-intent guess. This handles the case where the model
+  // produces text but the turn boundary was never properly signalled.
+  if (streamEndedWithoutReliableCompletion(options)) return true;
   const incompleteText = looksLikeIncompleteContinuationText(finalText);
   if (incompleteText) return true;
   if (looksLikeReadOnlyExplorationStillInProgress(session, finalText, options)) return true;
@@ -4067,6 +5384,187 @@ function buildIncompleteContinuationMessage(session = {}, finalText = '', contin
 
 function formatContinuationLimitForLog(limit) {
   return Number(limit) > 0 ? String(Math.floor(Number(limit))) : 'unlimited';
+}
+
+function buildModeRuntimeHelpers(session = {}) {
+  return {
+    getIncompleteTodos,
+    looksLikeIncompleteContinuationText,
+    streamEndedWithoutReliableCompletion,
+    looksLikeReadOnlyExplorationStillInProgress,
+    getMaxReadOnlyExplorationContinuationCount,
+    getMaxIncompleteContinuationCount,
+    getReadOnlyContinuationTargetPath,
+    toWorkspaceRelativePath,
+    getSessionWorkspaceRoot,
+    getRecentToolResultContext,
+    formatContinuationLimitForLog,
+    textLooksLikeSubstantiveFinalAnswer,
+    isMutationToolName,
+    isReadOnlyContextToolName,
+    canonicalToolName,
+    session,
+  };
+}
+
+function getModeHandlerForSession(session = {}) {
+  return getModeHandler(getSessionAgentMode(session));
+}
+
+function getUpstreamRequestOptionsByMode(session = {}, context = {}) {
+  return getUpstreamRequestOptionsForMode(getSessionAgentMode(session), {
+    ...context,
+    session,
+  });
+}
+
+function buildFetchUpstreamOptionsForSession(session = {}, baseOptions = {}, context = {}) {
+  const planWorkflowPhase = getPlanWorkflowPhase(session);
+  const mergedContext = {
+    ...context,
+    planWorkflowPhase,
+    planPhase: planWorkflowPhase,
+  };
+  return {
+    ...getUpstreamRequestOptionsByMode(session, mergedContext),
+    planWorkflowPhase,
+    planPhase: planWorkflowPhase,
+    ...baseOptions,
+  };
+}
+
+function interceptToolExecutionByMode(session = {}, toolCall = {}, context = {}) {
+  const handler = getModeHandlerForSession(session);
+  if (typeof handler.interceptToolExecution !== 'function') return null;
+  return handler.interceptToolExecution(session, toolCall, {
+    ...context,
+    planWorkflowPhase: getPlanWorkflowPhase(session),
+    planPhase: getPlanWorkflowPhase(session),
+  }, buildModeRuntimeHelpers(session));
+}
+
+function getMaxContinuationCountByMode(session = {}, options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.getMaxContinuationCount === 'function') {
+    return handler.getMaxContinuationCount(session, options, helpers);
+  }
+  return options.sawReadOnlyTool && !options.sawMutationTool
+    ? getMaxReadOnlyExplorationContinuationCount(session)
+    : getMaxIncompleteContinuationCount(session);
+}
+
+function shouldContinueIncompleteWorkByMode(session = {}, finalText = '', toolCalls = [], upstreamError = '', continuationCount = 0, options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldContinueIncompleteWork === 'function') {
+    return handler.shouldContinueIncompleteWork(session, finalText, toolCalls, upstreamError, continuationCount, options, helpers);
+  }
+  return shouldContinueIncompleteWork(session, finalText, toolCalls, upstreamError, continuationCount, options);
+}
+
+function shouldForceContinuationToolChoiceByMode(session = {}, finalText = '', options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldForceContinuationToolChoice === 'function') {
+    return handler.shouldForceContinuationToolChoice(session, finalText, options, helpers);
+  }
+  return shouldForceReadOnlyContinuationToolCall(session, finalText, options)
+    || !options.sawReadOnlyTool
+    || options.sawMutationTool
+    || getIncompleteTodos(session).length > 0;
+}
+
+function buildIncompleteContinuationMessageByMode(session = {}, finalText = '', continuationCount = 0, options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildIncompleteContinuationMessage === 'function') {
+    return handler.buildIncompleteContinuationMessage(session, finalText, continuationCount, options, helpers);
+  }
+  return buildIncompleteContinuationMessage(session, finalText, continuationCount);
+}
+
+function getPostToolTurnActionByMode(session = {}, executions = [], context = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.getPostToolTurnAction !== 'function') return null;
+  return handler.getPostToolTurnAction(session, executions, context, helpers);
+}
+
+function buildPendingInteractionResumeStateByMode(session = {}, pendingInteraction = {}, context = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildPendingInteractionResumeState === 'function') {
+    return handler.buildPendingInteractionResumeState(session, {
+      ...context,
+      pendingInteraction,
+    }, helpers);
+  }
+  return {
+    userText: String(context.userText || '').trim(),
+    upstreamMessages: Array.isArray(context.upstreamMessages)
+      ? context.upstreamMessages.map((message) => ({ ...message }))
+      : [],
+    capturedAt: context.capturedAt || new Date().toISOString(),
+    stableConversationId: String(context.stableConversationId || '').trim(),
+    requestId: String(context.requestId || session.requestId || '').trim(),
+  };
+}
+
+function shouldFinalizeInteractionResponseTurnByMode(session = {}, interactionResponse = {}, pendingInteraction = null) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldFinalizeInteractionResponseTurn === 'function') {
+    return Boolean(handler.shouldFinalizeInteractionResponseTurn(session, interactionResponse, pendingInteraction, helpers));
+  }
+  return false;
+}
+
+function buildCompletedInteractionStatePatchByMode(session = {}, interactionResponse = {}, pendingInteraction = null) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.buildCompletedInteractionStatePatch === 'function') {
+    return handler.buildCompletedInteractionStatePatch(session, interactionResponse, pendingInteraction, helpers);
+  }
+  if (session?.waitingForInteraction) {
+    return {
+      current_loop_status: 'waiting_for_interaction',
+    };
+  }
+  return {
+    current_loop_status: 'completed',
+    waiting_for_interaction: null,
+  };
+}
+
+function hasIncompleteWorkAtEndByMode(session = {}, finalText = '', toolCalls = [], upstreamError = '', options = {}) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.hasIncompleteWorkAtEnd === 'function') {
+    return handler.hasIncompleteWorkAtEnd(session, finalText, toolCalls, upstreamError, options, helpers);
+  }
+  const incompleteTodos = getIncompleteTodos(session);
+  const streamIncomplete = streamEndedWithoutReliableCompletion(options);
+  // When the upstream errored mid-turn, the work was interrupted, not failed.
+  // Treat it as unfinished whenever there is concrete structural evidence the
+  // task was still in progress: executed mutation/read-only tools, pending tool
+  // calls, incomplete todos. No natural-language intent guessing.
+  if (upstreamError) {
+    return Boolean(toolCalls.length)
+      || Boolean(options.sawMutationTool)
+      || Boolean(options.sawReadOnlyTool)
+      || incompleteTodos.length > 0
+      || looksLikeReadOnlyExplorationStillInProgress(session, finalText, options);
+  }
+  // No error path: the turn is unfinished only when there are pending tool
+  // calls, incomplete todos, OR the stream ended without a reliable completion
+  // signal and without emitting a tool call (protocol-level structural gap).
+  return !toolCalls.length
+    && (
+      incompleteTodos.length > 0
+      || streamIncomplete
+      || looksLikeReadOnlyExplorationStillInProgress(session, finalText, options)
+    );
 }
 
 function decodeHtmlEntities(text = '') {
@@ -4145,40 +5643,6 @@ async function fetchPublicText(url, options = {}) {
   }
 }
 
-function normalizeDuckDuckGoUrl(value = '') {
-  const decoded = decodeHtmlEntities(String(value || ''));
-  try {
-    const parsed = new URL(decoded, 'https://duckduckgo.com');
-    const uddg = parsed.searchParams.get('uddg');
-    if (uddg) return decodeURIComponent(uddg);
-    return parsed.href;
-  } catch {
-    return decoded;
-  }
-}
-
-function parseDuckDuckGoResults(html = '') {
-  const results = [];
-  const blockRegex = /<div[^>]+class="[^"]*result[^"]*"[\s\S]*?(?=<div[^>]+class="[^"]*result[^"]*"|<\/body>|$)/gi;
-  const blocks = String(html || '').match(blockRegex) || [];
-  for (const block of blocks) {
-    const linkMatch = block.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
-      || block.match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
-    if (!linkMatch) continue;
-    const url = normalizeDuckDuckGoUrl(linkMatch[1]);
-    if (!/^https?:\/\//i.test(url)) continue;
-    const title = htmlToReadableText(linkMatch[2]).replace(/\s+/g, ' ').trim();
-    const snippetMatch = block.match(/<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/i)
-      || block.match(/<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    const snippet = snippetMatch ? htmlToReadableText(snippetMatch[1]).replace(/\s+/g, ' ').trim() : '';
-    if (title && !results.some((item) => item.url === url)) {
-      results.push({ title, url, snippet });
-    }
-    if (results.length >= 8) break;
-  }
-  return results;
-}
-
 function buildWebSearchReferences(searchTerm, results = []) {
   const links = results.map((item, index) => `${index + 1}. [${item.title}](${item.url})`).join('\n');
   const highlights = results.map((item, index) => [
@@ -4210,26 +5674,81 @@ function buildWebSearchReferences(searchTerm, results = []) {
   ];
 }
 
-async function executeWebSearchTool(args = {}) {
+function buildWebSearchResults(searchTerm, results = []) {
+  return results.map((item, index) => ({
+    id: String(index + 1),
+    title: String(item?.title || '').trim(),
+    url: String(item?.url || '').trim(),
+    snippet: String(item?.snippet || '').trim(),
+    query: String(searchTerm || '').trim(),
+    rank: index + 1,
+  })).filter((item) => item.title && item.url);
+}
+
+function normalizeSearchTermForSignature(value = '') {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function parseBingRssResults(xml = '') {
+  const results = [];
+  const items = String(xml || '').match(/<item>[\s\S]*?<\/item>/gi) || [];
+  for (const itemXml of items.slice(0, 8)) {
+    const title = decodeHtmlEntities((itemXml.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || '')).replace(/\s+/g, ' ').trim();
+    const url = decodeHtmlEntities((itemXml.match(/<link>([\s\S]*?)<\/link>/i)?.[1] || '')).replace(/\s+/g, ' ').trim();
+    const snippet = decodeHtmlEntities((itemXml.match(/<description>([\s\S]*?)<\/description>/i)?.[1] || '')).replace(/\s+/g, ' ').trim();
+    if (title && /^https?:\/\//i.test(url) && !results.some((entry) => entry.url === url)) {
+      results.push({ title, url, snippet });
+    }
+  }
+  return results;
+}
+
+async function executeWebSearchTool(args = {}, session = null) {
   const searchTerm = String(args.search_term || args.searchTerm || args.query || '').trim();
-  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(searchTerm)}`;
-  const fetched = await fetchPublicText(url, { timeoutMs: 25000, accept: 'text/html,*/*;q=0.8' });
-  if (!fetched.ok) {
+  if (!searchTerm) {
+    return {
+      ok: false,
+      tool: 'WebSearch',
+      args: { ...args, search_term: searchTerm, query: searchTerm },
+      resultText: 'Web search failed: empty search term.',
+      results: [],
+      references: [{
+        title: 'Web search error',
+        chunk: 'Search term is empty.',
+      }],
+      durationMs: 0,
+    };
+  }
+  const bingUrl = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(searchTerm)}`;
+  const bingFetched = await fetchPublicText(bingUrl, {
+    timeoutMs: WEB_SEARCH_FETCH_TIMEOUT_MS,
+    accept: 'application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8',
+  });
+  if (!bingFetched?.ok) {
     return {
       ok: false,
       tool: 'WebSearch',
       args: { ...args, search_term: searchTerm },
-      resultText: `Web search failed: ${fetched.error || `HTTP ${fetched.status}`}`,
+      resultText: `Web search failed: ${bingFetched?.error || `HTTP ${bingFetched?.status || 0}`}`,
+      results: [],
+      references: [{
+        title: 'Web search error',
+        chunk: `Search term: ${searchTerm}\nStatus: ${bingFetched?.status || 0}\nError: ${bingFetched?.error || 'Unknown error'}`,
+      }],
       durationMs: 0,
     };
   }
-  const results = parseDuckDuckGoResults(fetched.text);
-  const references = buildWebSearchReferences(searchTerm, results);
+  const normalizedResults = buildWebSearchResults(searchTerm, parseBingRssResults(bingFetched.text));
+  const references = buildWebSearchReferences(searchTerm, normalizedResults);
+  const resultText = normalizedResults.length > 0
+    ? (references[0]?.chunk || `No useful web results were found for "${searchTerm}".`)
+    : `No web results were found for "${searchTerm}".`;
   return {
-    ok: true,
+    ok: normalizedResults.length > 0,
     tool: 'WebSearch',
-    args: { ...args, search_term: searchTerm },
-    resultText: references[0]?.chunk || '',
+    args: { ...args, search_term: searchTerm, query: searchTerm, provider: 'bing_rss' },
+    resultText,
+    results: normalizedResults,
     references,
     durationMs: 0,
   };
@@ -4405,7 +5924,9 @@ async function executeRelayTool(toolCall, session, logger) {
       const noMatch = !result.ok && Number(result.code) === 1;
       if (!result.ok && !noMatch && /access is denied|EPERM|ENOENT|not recognized/i.test(`${output}\n${result.error}`)) {
         fallbackUsed = true;
-        const files = fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory() ? walkFiles(targetPath, { max: 500 }) : [targetPath];
+        const files = fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()
+          ? walkFiles(targetPath, { max: 500, ignore: getSessionScanIgnoreNames(session) })
+          : [targetPath];
         const globMatchers = args.glob ? buildGlobMatchers(args.glob) : [];
         const matches = [];
         let regex = null;
@@ -4451,7 +5972,7 @@ async function executeRelayTool(toolCall, session, logger) {
       const targetPath = resolveWorkspacePath(args.target_directory || args.path || '', session);
       const pattern = String(args.glob_pattern || args.pattern || '*').trim() || '*';
       const globMatchers = buildGlobMatchers(pattern);
-      const files = walkFiles(targetPath, { max: 1000 })
+      const files = walkFiles(targetPath, { max: 1000, ignore: getSessionScanIgnoreNames(session) })
         .filter((file) => matchesGlobPath(file, targetPath, globMatchers))
         .slice(0, 200);
       const resultText = files.length
@@ -4461,15 +5982,16 @@ async function executeRelayTool(toolCall, session, logger) {
     }
     if (lower === 'ls') {
       const targetPath = resolveWorkspacePath(args.path || '', session);
-      const directoryTree = buildLsDirectoryTreeNode(targetPath, args.ignore);
+      const lsIgnore = getSessionScanIgnoreNames(session, args.ignore);
+      const directoryTree = buildLsDirectoryTreeNode(targetPath, lsIgnore);
       const fileCount = countFilesInDirectoryTree(directoryTree);
-      const listing = listDirectory(targetPath, args.ignore);
+      const listing = listDirectory(targetPath, lsIgnore);
       const resultText = listing
         ? `ls success path=${targetPath} files=${fileCount}\n${listing}`
         : `ls success path=${targetPath} files=0`;
       return {
         ok: true,
-        tool: 'LS',
+        tool: 'Ls',
         args: { ...args, path: targetPath, workspaceRoot },
         resultText,
         directoryTree,
@@ -4477,7 +5999,7 @@ async function executeRelayTool(toolCall, session, logger) {
       };
     }
     if (lower === 'websearch' || lower === 'web_search') {
-      const execution = await executeWebSearchTool(args);
+      const execution = await executeWebSearchTool(args, session);
       return {
         ...execution,
         durationMs: Date.now() - startedAt,
@@ -4485,6 +6007,13 @@ async function executeRelayTool(toolCall, session, logger) {
     }
     if (lower === 'webfetch' || lower === 'web_fetch' || lower === 'fetch') {
       const execution = await executeWebFetchTool(args);
+      return {
+        ...execution,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (lower === 'semanticsearch') {
+      const execution = await executeSemanticSearchTool(args, session);
       return {
         ...execution,
         durationMs: Date.now() - startedAt,
@@ -4522,6 +6051,50 @@ async function executeRelayTool(toolCall, session, logger) {
         tool: 'TodoWrite',
         args: { merge, todos },
         resultText,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (lower === 'askquestion') {
+      const questions = Array.isArray(args.questions) ? args.questions : [];
+      const title = String(args.title || '').trim();
+      const resultText = JSON.stringify({ title, questions }, null, 2);
+      return {
+        ok: true,
+        tool: 'AskQuestion',
+        args: { title, questions },
+        resultText: trimToolOutput(resultText),
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (lower === 'createplan') {
+      const markdown = formatPlanMarkdown(args);
+      const conversationId = String(getSessionStableConversationId(session) || 'plan').trim();
+      const planRoot = getRelayPlanRoot(session.config || {});
+      const planDir = path.join(planRoot, conversationId);
+      fs.mkdirSync(planDir, { recursive: true });
+      const fileName = `${sanitizePlanFilename(args.name || 'plan')}.md`;
+      const planPath = path.join(planDir, fileName);
+      fs.writeFileSync(planPath, markdown, 'utf8');
+      const todos = updateSessionTodos(session, args.todos || [], false);
+      return {
+        ok: true,
+        tool: 'CreatePlan',
+        args: {
+          name: String(args.name || '').trim(),
+          overview: String(args.overview || '').trim(),
+          plan: String(args.plan || '').trim(),
+          todos,
+        },
+        resultText: `Plan created at ${planPath}`,
+        planPath,
+        markdown,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (lower === 'task') {
+      const execution = await executeTaskTool(args, session);
+      return {
+        ...execution,
         durationMs: Date.now() - startedAt,
       };
     }
@@ -4572,9 +6145,138 @@ function toToolResultMessage(toolCall, execution) {
         ok: execution.ok,
         args: execution.args,
         output: execution.resultText,
+        results: Array.isArray(execution.results) ? execution.results : undefined,
+        references: Array.isArray(execution.references) ? execution.references : undefined,
         durationMs: execution.durationMs,
       }, null, 2),
     ].join('\n'),
+  };
+}
+
+function sanitizePlanFilename(value = '') {
+  const text = String(value || '').trim().replace(/[\\/:*?"<>|]+/g, '-');
+  return text ? text.slice(0, 80) : `plan-${Date.now().toString(36)}`;
+}
+
+function getRelayPlanRoot(config = {}) {
+  return path.join(String(config.historyRoot || process.env.CURSOR_RELAY_HISTORY_ROOT || path.join(process.env.USERPROFILE || process.cwd(), '.cursorpool', 'relay', 'history')), 'plans');
+}
+
+function formatPlanMarkdown(args = {}) {
+  const title = String(args.name || 'Plan').trim() || 'Plan';
+  const overview = String(args.overview || '').trim();
+  const planBody = String(args.plan || '').trim();
+  const todos = Array.isArray(args.todos) ? args.todos : [];
+  const lines = [`# ${title}`];
+  if (overview) {
+    lines.push('', overview);
+  }
+  if (planBody) {
+    lines.push('', planBody);
+  }
+  if (todos.length) {
+    lines.push('', '## Todos');
+    todos.forEach((todo) => {
+      const id = String(todo?.id || '').trim();
+      const content = String(todo?.content || '').trim();
+      if (id && content) lines.push(`- [ ] ${id}: ${content}`);
+    });
+  }
+  return `${lines.join('\n').trim()}\n`;
+}
+
+async function executeSemanticSearchTool(args = {}, session = {}) {
+  const query = String(args.query || '').trim();
+  const requestedTargets = Array.isArray(args.target_directories) ? args.target_directories : [];
+  const workspaceRoot = getSessionWorkspaceRoot(session);
+  const roots = requestedTargets.length
+    ? requestedTargets.map((item) => resolveWorkspacePath(item, session)).filter(Boolean)
+    : [workspaceRoot];
+  const words = query.split(/\s+/).map((item) => item.trim()).filter((item) => item.length >= 2).slice(0, 6);
+  const files = [];
+  roots.forEach((root) => {
+    walkFiles(root, { max: 300, ignore: getSessionScanIgnoreNames(session) }).forEach((file) => {
+      if (!files.includes(file)) files.push(file);
+    });
+  });
+  const matches = [];
+  for (const file of files) {
+    let text = '';
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    const haystack = text.toLowerCase();
+    const score = words.reduce((count, word) => count + (haystack.includes(word.toLowerCase()) ? 1 : 0), 0);
+    if (!score) continue;
+    const lines = text.split(/\r?\n/);
+    const previewLine = lines.find((line) => words.some((word) => line.toLowerCase().includes(word.toLowerCase()))) || lines[0] || '';
+    matches.push({ file, score, previewLine: previewLine.trim() });
+  }
+  matches.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
+  const topMatches = matches.slice(0, 8);
+  const resultText = topMatches.length
+    ? topMatches.map((item) => `${item.file}\n  score=${item.score} preview=${item.previewLine}`).join('\n')
+    : `No semantic matches found for ${JSON.stringify(query)}.`;
+  return {
+    ok: true,
+    tool: 'SemanticSearch',
+    args: { query, target_directories: requestedTargets, workspaceRoot },
+    resultText: trimToolOutput(resultText),
+    matches: topMatches.map((item) => ({
+      score: item.score,
+      codeBlock: {
+        relativeWorkspacePath: path.relative(workspaceRoot, item.file).replace(/\\/g, '/'),
+        contents: item.previewLine,
+        range: {
+          startLine: 1,
+          startColumn: 1,
+          endLine: 1,
+          endColumn: Math.max(1, item.previewLine.length),
+        },
+      },
+    })),
+    durationMs: 0,
+  };
+}
+
+async function executeTaskTool(args = {}, session = {}) {
+  const description = String(args.description || '').trim();
+  const prompt = String(args.prompt || '').trim();
+  const subagentType = args.subagent_type || args.subagentType || {};
+  const isExplore = typeof subagentType === 'object'
+    ? Object.prototype.hasOwnProperty.call(subagentType, 'explore')
+    : /explore/i.test(String(subagentType || ''));
+  if (isExplore) {
+    const query = prompt || description || 'Explore the workspace';
+    const search = await executeSemanticSearchTool({ query, target_directories: [] }, session);
+    return {
+      ok: true,
+      tool: 'Task',
+      args,
+      resultText: trimToolOutput([
+        `Explore task completed${description ? `: ${description}` : ''}.`,
+        search.resultText,
+      ].join('\n')),
+      conversationSteps: [
+        {
+          assistant_message: {
+            text: search.resultText,
+          },
+        },
+      ],
+      agentId: `explore-${Date.now().toString(36)}`,
+      isBackground: false,
+      durationMs: 0,
+    };
+  }
+  return {
+    ok: false,
+    tool: 'Task',
+    args,
+    resultText: 'Only explore-style Task calls are currently supported in local relay mode.',
+    durationMs: 0,
   };
 }
 
@@ -4600,6 +6302,12 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
   let upstreamUsage = null;
   let durationMs = 0;
   let eventTypes = '';
+  let stopReason = '';
+  // 检测缓存回放：伪 Response 上有 _fromCache 标记
+  if (upstream && typeof upstream === 'object' && upstream._fromCache) {
+    session._cacheHit = { layer: upstream._cacheLayer || 'unknown', cachedAt: upstream._cachedAt || Date.now() };
+    logger?.info?.(`agent local relay cache replay detected requestId=${session.requestId || '-'} phase=${phase} layer=${upstream._cacheLayer}`);
+  }
   session.logger?.info?.(`agent local relay upstream stream start requestId=${session.requestId || '-'} phase=${phase}`);
   try {
     session.currentUpstreamToolState = toolState;
@@ -4651,7 +6359,9 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
         if (!text) return;
         textParts.push(text);
         lastTextAt = Date.now();
-        if (options.emit !== false) {
+        if (shouldSuppressVisiblePlanText(session, options)) {
+          stashSuppressedPlanText(session, text);
+        } else if (options.emit !== false) {
           writeAgentTextFrame(session, text);
         }
       }
@@ -4661,9 +6371,19 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
       signal: session.abortController?.signal || null,
       extendMaxDurationOnActivity: options.extendMaxDurationOnActivity === true,
       shouldStop: () => {
-        if (upstreamUsage) return true;
+        if (sawDone) {
+          stopReason = 'upstream_done';
+          return true;
+        }
+        if (upstreamUsage) {
+          stopReason = 'usage_without_done';
+          return true;
+        }
         if (stopOnToolCall && normalizeCollectedToolCalls(toolState).length > 0) return false;
-        if (stopAfterTextMs > 0 && lastTextAt > 0 && Date.now() - lastTextAt >= stopAfterTextMs) return true;
+        if (stopAfterTextMs > 0 && lastTextAt > 0 && Date.now() - lastTextAt >= stopAfterTextMs) {
+          stopReason = 'local_stop_after_text';
+          return true;
+        }
         if (
           reasoningOnlyMaxMs > 0
           && firstReasoningAt > 0
@@ -4672,6 +6392,7 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
           && Date.now() - firstReasoningAt >= reasoningOnlyMaxMs
         ) {
           upstreamError = `上游模型持续只输出 Thought/思考内容超过 ${Math.round(reasoningOnlyMaxMs / 1000)} 秒，本地 Relay 已停止等待以避免空转。`;
+          stopReason = 'local_reasoning_timeout';
           session.logger?.warn?.(
             `agent local relay upstream stream reasoning-only stop requestId=${session.requestId || '-'} phase=${phase} maxMs=${reasoningOnlyMaxMs} reasoningLen=${reasoningParts.join('').length}`,
           );
@@ -4684,7 +6405,9 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
     const tailText = textFilter ? textFilter.flush() : '';
     if (tailText && session.active && !session.aborted) {
       textParts.push(tailText);
-      if (options.emit !== false) {
+      if (shouldSuppressVisiblePlanText(session, options)) {
+        stashSuppressedPlanText(session, tailText);
+      } else if (options.emit !== false) {
         writeAgentTextFrame(session, tailText);
       }
     }
@@ -4692,6 +6415,12 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
       writeAgentFrame(session, buildAgentThinkingCompletedFrame(Date.now() - thinkingStartedAt));
     }
     if (session.currentUpstreamToolState === toolState) session.currentUpstreamToolState = null;
+    if (!stopReason) {
+      if (sawDone) stopReason = 'upstream_done';
+      else if (isRecoverableStreamError(upstreamError)) stopReason = 'local_timeout';
+      else if (upstreamError) stopReason = 'upstream_error';
+      else stopReason = 'stream_end';
+    }
     eventTypes = Array.from(eventTypeCounts.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 12)
@@ -4699,10 +6428,24 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
       .join(',');
     durationMs = Date.now() - startedAt;
     session.logger?.info?.(
-      `agent local relay upstream stream end requestId=${session.requestId || '-'} phase=${phase} deltaCount=${deltaCount} textLen=${textParts.join('').length} reasoningLen=${reasoningParts.join('').length} toolCalls=${normalizeCollectedToolCalls(toolState).length} eventTypes=${JSON.stringify(eventTypes)} error=${JSON.stringify(upstreamError)} durationMs=${durationMs}`,
+      `agent local relay upstream stream end requestId=${session.requestId || '-'} phase=${phase} deltaCount=${deltaCount} textLen=${textParts.join('').length} reasoningLen=${reasoningParts.join('').length} toolCalls=${normalizeCollectedToolCalls(toolState).length} sawDone=${sawDone ? '1' : '0'} stopReason=${stopReason} eventTypes=${JSON.stringify(eventTypes)} error=${JSON.stringify(upstreamError)} durationMs=${durationMs}`,
     );
-    if (options.emit !== false && textParts.join('').trim()) {
+    if (options.emit !== false && textParts.join('').trim() && !shouldSuppressVisiblePlanText(session, options)) {
       flushAgentTextToHistory(session);
+    }
+    // ---- 响应缓存：写入（仅完整成功的响应） ----
+    if (upstream && upstream._cacheKeys && !session.aborted && !upstreamError) {
+      try {
+        responseCache.set(upstream._cacheKeys, {
+          text: textParts.join(''),
+          reasoning: reasoningParts.join(''),
+          upstreamError,
+          toolCalls: normalizeCollectedToolCalls(toolState),
+          model: String(session.configuredModel || session.modelName || options.model || ''),
+        });
+      } catch {
+        /* ignore cache write errors */
+      }
     }
   }
   return {
@@ -4714,11 +6457,24 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
     durationMs,
     deltaCount,
     eventTypes,
+    sawDone,
+    stopReason,
   };
 }
 
 function isRecoverableStreamError(errorText) {
-  return /idle timeout|max duration exceeded|upstream timeout|暂时无响应/i.test(String(errorText || ''));
+  const text = String(errorText || '');
+  if (!text) return false;
+  // Timeout / idle-class interruptions (original coverage). "暂时无响应" and
+  // "upstream timeout" are our own structured summaries from summarizeFetchError.
+  if (/idle timeout|max duration exceeded|upstream timeout|暂时无响应/i.test(text)) return true;
+  // Transient gateway / network errors: retryable. Match ONLY structured
+  // protocol-level identifiers — HTTP status codes, Node.js errno codes, the
+  // canonical Node "fetch failed" error name, and our own summary prefixes
+  // ("上游服务异常（HTTP 5xx）" from summarizeUpstreamFailure). No vague natural
+  // language ("network", "terminated", "aborted") to avoid false positives.
+  if (/HTTP\s*5(?:02|03|04)|上游服务异常|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|connection reset|connection refused/i.test(text)) return true;
+  return false;
 }
 
 function shouldRecoverPostToolStream(upstreamError, finalText, toolCalls = [], recoveryCount = 0) {
@@ -4739,6 +6495,7 @@ function buildPostToolRecoveryMessage(upstreamError, recoveryCount = 0) {
       `The previous upstream stream stalled before producing a final answer or another tool call (${String(upstreamError || 'stream stalled')}).`,
       `Recovery attempt ${Number(recoveryCount) + 1}/${MAX_POST_TOOL_STREAM_RECOVERIES}.`,
       'Continue from the tool results above. If another tool is required, call it; otherwise provide the final answer. Do not restart the task from scratch.',
+      'Do not restate the original user request or reopen the task as a new conversation. Continue from the exact same turn state only.',
     ].join('\n'),
   };
 }
@@ -4760,8 +6517,39 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
   const maxToolCallsPerRound = getMaxLocalToolCallsPerRound(session?.config || {});
   for (const rawToolCall of toolCalls.slice(0, maxToolCallsPerRound)) {
     const toolCall = normalizeToolCallPathsForWorkspace(rawToolCall, session);
+    const lowerToolName = String(toolCall?.name || '').trim().toLowerCase();
+    if (isPlanModeSession(session) && lowerToolName === 'createplan') {
+      const existingPlanState = getLatestSessionPlanState(session);
+      const existingCreatePlanResult = Array.isArray(session?.toolResultSummaries)
+        && session.toolResultSummaries.some((entry) => (
+          entry?.ok
+          && String(entry?.tool || '').trim().toLowerCase() === 'createplan'
+        ));
+      if (existingCreatePlanResult || existingPlanState?.plan_uri || existingPlanState?.plan_text || existingPlanState?.plan) {
+        logger.info(`agent local relay repeated createplan suppressed requestId=${requestId} tool=${toolCall.name}`);
+        const duplicateCreatePlanExecution = {
+          ok: true,
+          tool: 'CreatePlan',
+          args: toolCall.arguments || {},
+          resultText: existingPlanState?.plan_uri
+            ? `CreatePlan already succeeded in this turn.\nPlan URI: ${existingPlanState.plan_uri}`
+            : 'CreatePlan already succeeded in this turn.',
+          durationMs: 0,
+          duplicateToolSkipped: true,
+          repeatedCreatePlanSuppressed: true,
+          planPath: String(existingPlanState?.plan_uri || '').trim(),
+        };
+        toolResultMessages.push(toToolResultMessage(toolCall, duplicateCreatePlanExecution));
+        executions.push({
+          toolCall,
+          execution: duplicateCreatePlanExecution,
+        });
+        continue;
+      }
+    }
     const signature = getToolCallSignature(toolCall, session);
-    if (signature && session.executedToolSignatures.has(signature)) {
+    const allowFreshExploreDespiteDuplicate = shouldAllowFreshPlanExploreDespiteDuplicate(session, toolCall);
+    if (signature && session.executedToolSignatures.has(signature) && !allowFreshExploreDespiteDuplicate) {
       const previousExecution = session.executedToolResultsBySignature.get(signature);
       logger.info(`agent local relay duplicate tool skipped requestId=${requestId} tool=${toolCall.name} signature=${JSON.stringify(signature)}`);
       const duplicateExecution = {
@@ -4781,7 +6569,12 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       });
       continue;
     }
-    if (signature) session.executedToolSignatures.add(signature);
+    if (allowFreshExploreDespiteDuplicate) {
+      logger.info(
+        `agent local relay allowing fresh plan explore after answers requestId=${requestId} tool=${toolCall.name} signature=${JSON.stringify(signature)}`,
+      );
+    }
+    if (signature && !allowFreshExploreDespiteDuplicate) session.executedToolSignatures.add(signature);
     const toolCallId = toolCall.id || `tool_${Date.now().toString(36)}`;
     const modelCallId = `model_${toolCallId}`;
     const historyToolName = canonicalToolName(toolCall.name);
@@ -4827,7 +6620,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
     const emitStepFrames = shouldEmitLocalStepFrames(session?.config || {});
     const stepId = (session.nextStepId = (Number(session.nextStepId) || 0) + 1);
     const stepStartedAt = Date.now();
-    let execution = null;
+    let execution = interceptToolExecutionByMode(session, toolCall, { startedAt: stepStartedAt });
     if (emitToolInteraction) {
       if (emitStepFrames) writeAgentFrame(session, buildAgentStepStartedFrame(stepId));
       const streamedEditState = editLikeTool ? session.upstreamToolArgumentStreams?.get(toolCallId) : null;
@@ -4853,7 +6646,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
         if (streamedEditState) streamedEditState.completedStarted = true;
       }
     }
-    if (useNativeExec) {
+    if (!execution && useNativeExec) {
       const numericExecId = (session.nextExecNumericId = (Number(session.nextExecNumericId) || 0) + 1);
       session.execIdByNumericId = session.execIdByNumericId || new Map();
       session.execIdByNumericId.set(numericExecId, toolCallId);
@@ -4915,6 +6708,40 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       // eslint-disable-next-line no-await-in-loop
       execution = await executeRelayTool(toolCall, session, logger);
     }
+    let interactionQueryDispatch = null;
+    if (!execution?.pendingNativeMutation && shouldDispatchInteractionQueryForTool(session, toolCall, execution)) {
+      interactionQueryDispatch = buildInteractionQueryFrameForTool(session, toolCall, toolCallId);
+      if (interactionQueryDispatch?.frame) {
+        writeAgentFrame(session, interactionQueryDispatch.frame);
+        registerPendingInteractionQuery(session, {
+          queryId: interactionQueryDispatch.queryId,
+          kind: interactionQueryDispatch.kind,
+          toolCallId,
+          toolName: historyToolName,
+          arguments: toolCall.arguments || {},
+          execution,
+          stableConversationId: getSessionStableConversationId(session),
+          workspaceRoot: getSessionWorkspaceRoot(session),
+          createdAt: new Date().toISOString(),
+        });
+        appendInteractionQueryToHistory(session, {
+          queryId: interactionQueryDispatch.queryId,
+          kind: interactionQueryDispatch.kind,
+          toolCallId,
+          toolName: historyToolName,
+          arguments: toolCall.arguments || {},
+        });
+        logger.info(
+          `agent local relay interaction_query sent requestId=${requestId} tool=${toolCall.name} queryId=${interactionQueryDispatch.queryId} kind=${interactionQueryDispatch.kind}`,
+        );
+      }
+      execution = {
+        ...execution,
+        awaitingInteractionResponse: true,
+        interactionQueryId: interactionQueryDispatch?.queryId || 0,
+        interactionQueryKind: interactionQueryDispatch?.kind || '',
+      };
+    }
     if (!execution?.pendingNativeMutation) {
       if (emitToolInteraction) {
         const completionArgs = editLikeTool
@@ -4928,7 +6755,13 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
           buildAgentToolCallCompletedFrame(toolCall.name, completionArgs, toolCallId, modelCallId, { execution: completionExecution }),
         );
       }
-      emitVisibleToolResultSummary(session, toolCall, execution);
+      if (!interactionQueryDispatch) emitVisibleToolResultSummary(session, toolCall, execution);
+      if (String(toolCall.name || '').trim().toLowerCase() === 'createplan' && execution?.ok) {
+        const planState = buildPlanStateFromExecution(session, execution);
+        rememberSessionPlanState(session, planState);
+      }
+      syncPlanWorkflowAfterToolExecution(session, toolCall, execution);
+      if (signature) session.executedToolSignatures.add(signature);
       if (isMutation && execution?.ok) {
         emitAgentMutationCheckpointFrames(session, { ...toolCall, id: toolCallId }, execution, logger);
         appendLatestEditReminder(session, execution.args?.path || toolCall.arguments?.path || '');
@@ -4940,20 +6773,22 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       execution,
       toolCallId,
     );
-    appendSessionHistory(session, {
-      role: 'tool',
-      kind: 'tool_result',
-      tool_call_id: toolCallId,
-      payload: {
+    if (!execution?.awaitingInteractionResponse) {
+      appendSessionHistory(session, {
+        role: 'tool',
+        kind: 'tool_result',
         tool_call_id: toolCallId,
-        tool_name: historyToolName,
-        arguments: JSON.stringify(toolCall.arguments || {}),
-        result_text: execution?.resultText || '',
-        ok: Boolean(execution?.ok),
-        duration_ms: Number(execution?.durationMs) || 0,
-        ...(structuredToolCall ? { tool_call: structuredToolCall } : {}),
-      },
-    });
+        payload: {
+          tool_call_id: toolCallId,
+          tool_name: historyToolName,
+          arguments: JSON.stringify(toolCall.arguments || {}),
+          result_text: execution?.resultText || '',
+          ok: Boolean(execution?.ok),
+          duration_ms: Number(execution?.durationMs) || 0,
+          ...(structuredToolCall ? { tool_call: structuredToolCall } : {}),
+        },
+      });
+    }
     session.toolResultSummaries.push({
       tool: historyToolName,
       ok: Boolean(execution?.ok),
@@ -4974,193 +6809,38 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
   return { toolResultMessages, executions };
 }
 
-async function relayAgentUserMessage(session, userText, config, logger, stats) {
-  if (!session?.active || session.aborted || session.relaying) return;
-  session.relaying = true;
-  try {
-  if (!session.agentHistory) {
-    const { conversation, turnSeq } = beginAgentHistoryTurn(
-      config,
-      session.requestId || '',
-      getSessionWorkspaceRoot(session),
-      session.lastUserMessageCapture || null,
-    );
-    session.agentHistory = conversation;
-    session.agentTurnSeq = turnSeq;
-    appendSessionHistory(session, {
-      role: 'user',
-      kind: 'request_context',
-      payload: {
-        env: {
-          osVersion: `${process.platform} ${process.getSystemVersion ? process.getSystemVersion() : ''}`.trim(),
-          workspacePaths: [getSessionWorkspaceRoot(session)],
-          shell: 'powershell',
-          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-        },
-        fileContents: {},
-        readLintsEnabled: true,
-        mcpInfoComplete: true,
-        envInfoComplete: true,
-      },
-    });
-    appendSessionHistory(session, {
-      role: 'user',
-      kind: 'user_message',
-      payload: {
-        text: String(userText || ''),
-        mode: 'AGENT_MODE_AGENT',
-      },
-    });
-    appendSessionHistory(session, {
-      role: 'system',
-      kind: 'prompt_context',
-      payload: {
-        source: 'current_user_request',
-        role: 'user',
-        content: `<current_user_request>\n${String(userText || '')}\n</current_user_request>`,
-      },
-    });
-    updateAgentHistoryUsage(config, { requests: 1 });
-  }
-  const configuredModel = resolveRequestedUpstreamModel(config, {
-    requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
-  });
-  const activeUpstream = resolveUpstreamForModel(config, configuredModel);
-  const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
-    ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
-    : 0;
-  const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
-  const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
-  loadUnfinishedAgentTask(session);
-  const requestId = session.requestId || '-';
-  const runPostEditLints = shouldRunPostEditLints(config);
-  let upstreamMessages = buildLocalRelayMessages(userText, session);
-  let compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'initial' });
-  upstreamMessages = compacted.messages;
-  let usageMeta = compacted.usage;
-  const promptChars = usageMeta.messageChars;
+async function continueAgentStreamLoop(session, options = {}) {
+  const {
+    userText = '',
+    config = {},
+    logger = null,
+    streamed: initialStreamed = {},
+    upstreamMessages: initialUpstreamMessages = [],
+    usageMeta: initialUsageMeta = {},
+    configuredModel = '',
+    activeUpstream = {},
+    upstreamMode: initialUpstreamMode = '',
+    requestId = '',
+    agentMode = 'AGENT_MODE_AGENT',
+    runPostEditLints = false,
+    emitThinking = false,
+    filterInlineThinking = false,
+    reasoningOnlyMaxMs = 0,
+  } = options;
 
-  stats.chatTotal = (stats.chatTotal || 0) + 1;
-  stats.localRelayTurns = (stats.localRelayTurns || 0) + 1;
-  logger.info(
-    `agent local relay request requestId=${requestId} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))} upstreamModel=${configuredModel} endpointMode=${String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses')} textLen=${String(userText || '').length} promptChars=${promptChars}`,
-  );
-
-  let upstream;
-  let upstreamMode = '';
-  const initialVisibleProgressTimer = startInitialVisibleProgressTimer(session, logger, requestId);
-  try {
-    ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-      activeUpstream,
-      configuredModel,
-      upstreamMessages,
-      logger,
-      {
-        signal: session.abortController?.signal || null,
-        requestId,
-        phase: 'initial',
-        outboundProxy: config.outboundProxy || null,
-        localProxyPort: config.port,
-      },
-    ));
-  } catch (error) {
-    clearTimer(initialVisibleProgressTimer);
-    if (session.aborted) return;
-    const summarized = summarizeFetchError(error);
-    recordUpstreamUsagePhase(session, config, {
-      phase: 'initial',
-      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-      model: configuredModel,
-      status: 'fetch_error',
-      error: error.message || String(error),
-      promptChars,
-      meta: usageMeta,
-    });
-    logger.error(`agent local relay upstream fetch failed requestId=${requestId}: ${error.message}`);
-    appendSessionHistory(session, {
-      role: 'assistant',
-      kind: 'assistant_text',
-      payload: { text: summarized, error: true },
-    });
-    writeAgentTextFrame(session, summarized);
-    writeAgentFrame(session, buildAgentTurnEndedFrame());
-    session.turnEnded = true;
-    rememberCompletedAgentTurn(session.completedAgentTurns, session.requestId, userText, getSessionWorkspaceRoot(session), session.lastUserMessageCapture?.debug || null, session.generatedChunks, { hadError: true });
-    completeSessionHistory(session, 'failed', `fetch-${requestId}`);
-    finalizeInterceptedAgentSession(session);
-    return;
-  }
-
-  if (!upstream.ok) {
-    clearTimer(initialVisibleProgressTimer);
-    if (session.aborted) return;
-    const errorText = await upstream.text().catch(() => '');
-    const summarized = summarizeUpstreamFailure(upstream.status, errorText);
-    recordUpstreamUsagePhase(session, config, {
-      phase: 'initial',
-      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-      model: configuredModel,
-      status: 'http_error',
-      httpStatus: upstream.status,
-      error: errorText,
-      promptChars,
-      meta: usageMeta,
-    });
-    logger.error(`agent local relay upstream HTTP ${upstream.status} requestId=${requestId} bodyPreview=${JSON.stringify(errorText.slice(0, 300))}`);
-    appendSessionHistory(session, {
-      role: 'assistant',
-      kind: 'assistant_text',
-      payload: { text: summarized, error: true },
-    });
-    writeAgentTextFrame(session, summarized);
-    writeAgentFrame(session, buildAgentTurnEndedFrame());
-    session.turnEnded = true;
-    rememberCompletedAgentTurn(session.completedAgentTurns, session.requestId, userText, getSessionWorkspaceRoot(session), session.lastUserMessageCapture?.debug || null, session.generatedChunks, { hadError: true });
-    completeSessionHistory(session, 'failed', `http-${requestId}`);
-    finalizeInterceptedAgentSession(session);
-    return;
-  }
-
-  const recentEditedFile = getRecentEditedFilePath(session);
-  logger.info(
-    `agent local relay context requestId=${requestId} recentEditedFile=${JSON.stringify(recentEditedFile)}`,
-  );
-  let streamed;
-  try {
-    streamed = await streamAgentUpstreamResponse(upstream, session, {
-      collectTools: true,
-      emit: true,
-      emitThinking,
-      phase: 'initial',
-      idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
-      maxDurationMs: 0,
-      reasoningOnlyMaxMs,
-      filterInlineThinking,
-    });
-  } finally {
-    clearTimer(initialVisibleProgressTimer);
-  }
-  recordUpstreamUsagePhase(session, config, {
-    phase: 'initial',
-    endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-    model: configuredModel,
-    status: streamed.upstreamError ? 'stream_error' : 'success',
-    error: streamed.upstreamError,
-    usage: streamed.usage,
-    durationMs: streamed.durationMs,
-    promptChars,
-    responseTextChars: streamed.text.length,
-    reasoningChars: streamed.reasoning.length,
-    toolCalls: streamed.toolCalls.length,
-    meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
-  });
-  if (!session.active || session.aborted) return;
-  let finalText = streamed.text;
-  let finalReasoning = streamed.reasoning;
-  let upstreamError = streamed.upstreamError;
+  let streamed = initialStreamed;
+  let upstreamMode = initialUpstreamMode;
+  let finalText = streamed.text || '';
+  let finalReasoning = streamed.reasoning || '';
+  let upstreamError = streamed.upstreamError || '';
+  let usageMeta = initialUsageMeta;
+  let compacted = { messages: initialUpstreamMessages, usage: initialUsageMeta };
+  let upstreamMessages = Array.isArray(initialUpstreamMessages)
+    ? initialUpstreamMessages.map((message) => ({ ...message }))
+    : [];
   const maxToolCallsPerRound = getMaxLocalToolCallsPerRound(config);
   let toolCalls = attachDefaultMutationTarget(
-    streamed.toolCalls.slice(0, maxToolCallsPerRound),
+    Array.isArray(streamed.toolCalls) ? streamed.toolCalls.slice(0, maxToolCallsPerRound) : [],
     session,
     userText,
   );
@@ -5172,310 +6852,398 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
   let pendingNativeMutation = false;
   let completionVerificationCount = 0;
   let incompletePostMutationContinuationCount = 0;
+  let lastStreamSawDone = initialStreamed?.sawDone === true;
+  let lastStreamStopReason = String(initialStreamed?.stopReason || '').trim();
   const maxToolRounds = getMaxLocalToolRounds(config);
-  while (session.active && !session.aborted && toolCalls.length && (maxToolRounds <= 0 || toolStep < maxToolRounds)) {
-    toolStep += 1;
-    logger.info(
-      `agent local relay tool plan requestId=${requestId} step=${toolStep} count=${toolCalls.length} tools=${toolCalls.map((call) => call.name).join(',')}`,
-    );
-    const { toolResultMessages, executions } = await executeRelayToolCalls(session, toolCalls, requestId, logger);
-    if (executions.length && executions.every((entry) => entry.execution?.duplicateToolSkipped)) {
-      upstreamError = '';
-      logger.info(`agent local relay duplicate tool result forwarded requestId=${requestId}; asking upstream to continue`);
-    }
-    nativeMutationAckMissing = executions.some((entry) => entry.execution?.missingNativeAck);
-    pendingNativeMutation = executions.some((entry) => entry.execution?.pendingNativeMutation);
-    const sawMutationAttempt = executions.some((entry) => isMutationToolName(entry.toolCall?.name));
-    if (sawMutationAttempt) sawMutationTool = true;
-    if (executions.some((entry) => isReadOnlyContextToolName(entry.toolCall?.name))) {
-      sawReadOnlyTool = true;
-    }
-    const sawMutationExecution = executions.some((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok);
-    if (sawMutationExecution) {
-      sawWriteTool = true;
-      const lintPaths = executions
-        .filter((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok)
-        .map((entry) => entry.execution?.args?.path)
-        .filter(Boolean);
-      if (runPostEditLints && lintPaths.length && !executions.some((entry) => canonicalToolName(entry.toolCall?.name) === 'ReadLints')) {
-        await executeRelayToolCalls(session, [{
-          id: `tool_read_lints_${Date.now().toString(36)}`,
-          name: 'ReadLints',
-          arguments: { paths: Array.from(new Set(lintPaths)) },
-          provider: 'relay_post_edit',
-        }], requestId, logger);
+
+  while (session.active && !session.aborted) {
+    if (toolCalls.length) {
+      if (maxToolRounds > 0 && toolStep >= maxToolRounds) break;
+      toolStep += 1;
+      logger?.info?.(
+        `agent local relay tool plan requestId=${requestId} step=${toolStep} count=${toolCalls.length} tools=${toolCalls.map((call) => call.name).join(',')}`,
+      );
+      const { toolResultMessages, executions } = await executeRelayToolCalls(session, toolCalls, requestId, logger);
+      if (executions.length && executions.every((entry) => entry.execution?.duplicateToolSkipped)) {
+        upstreamError = '';
+        logger?.info?.(`agent local relay duplicate tool result forwarded requestId=${requestId}; asking upstream to continue`);
       }
-      upstreamError = '';
-    }
-    if (pendingNativeMutation) {
-      toolCalls = [];
-      finalText = '已发送 Cursor 原生工具调用，正在等待客户端处理。';
-      writeAgentTextFrame(session, finalText);
-      logger.info(`agent local relay native mutation pending requestId=${requestId}; ending turn without local write or retry`);
-      break;
-    }
-    if (nativeMutationAckMissing) {
-      toolCalls = [];
-      finalText = 'Cursor 客户端没有返回原生编辑工具执行回执，本轮已停止，避免重复修改。';
-      writeAgentTextFrame(session, finalText);
-      logger.info(`agent local relay native mutation ack missing requestId=${requestId}; stopping tool loop without local write`);
-      break;
-    }
-    let postToolRecoveryCount = 0;
-    upstreamMessages = [
-      ...upstreamMessages,
-      { role: 'assistant', content: streamed.text.trim() || `Called ${toolCalls.length} tool(s).` },
-      ...toolResultMessages,
-      {
-        role: 'user',
-        content: 'Continue working from these tool results. If another tool is required, call it; otherwise give the final answer.',
-      },
-    ];
-    while (session.active && !session.aborted) {
-      const postToolPhase = postToolRecoveryCount > 0
-        ? `post_tool_${toolStep}_recover_${postToolRecoveryCount}`
-        : `post_tool_${toolStep}`;
-      compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: postToolPhase });
-      upstreamMessages = compacted.messages;
-      usageMeta = compacted.usage;
-      try {
-        ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-          activeUpstream,
-          configuredModel,
+      const postToolTurnAction = getPostToolTurnActionByMode(session, executions, {
+        requestId,
+        toolStep,
+        finalText,
+        sawWriteTool,
+        sawMutationTool,
+        sawReadOnlyTool,
+      });
+      if (postToolTurnAction?.stopTurn) {
+        session.planTurnHandoff = postToolTurnAction.handoff || 'mode_handoff';
+        const updatedInteractions = updatePendingInteractionResumeState(
+          session,
+          executions,
           upstreamMessages,
-          logger,
-          {
-            enableTools: true,
-            signal: session.abortController?.signal || null,
-            timeoutMs: sawWriteTool
-              ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
-              : POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            requestId,
-            phase: postToolPhase,
-            outboundProxy: config.outboundProxy || null,
-            localProxyPort: config.port,
-          },
-        ));
-        if (!upstream.ok) {
-          const errorText = await upstream.text().catch(() => '');
-          upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+          toolResultMessages,
+          streamed.text || '',
+          userText,
+        );
+        if (updatedInteractions > 0) {
+          session.waitingForInteraction = true;
+          session.waitingInteractionSince = Date.now();
+          session.unfinishedWorkAtEnd = false;
+          const handler = getModeHandlerForSession(session);
+          const helpers = buildModeRuntimeHelpers(session);
+          const createPlanEntry = executions.find((entry) => String(entry?.toolCall?.name || '').trim().toLowerCase() === 'createplan');
+          const createPlanExecution = createPlanEntry?.execution || null;
+          const planState = createPlanExecution
+            ? buildPlanStateFromExecution(session, createPlanExecution)
+            : null;
+          if (planState) rememberSessionPlanState(session, planState);
+          const statePatch = typeof handler.buildWaitingForInteractionStatePatch === 'function'
+            ? handler.buildWaitingForInteractionStatePatch(session, {
+                handoff: session.planTurnHandoff,
+                pendingCount: updatedInteractions,
+                since: new Date(session.waitingInteractionSince).toISOString(),
+                plan: planState,
+              }, helpers)
+            : {
+                current_loop_status: 'waiting_for_interaction',
+                waiting_for_interaction: {
+                  handoff: String(session.planTurnHandoff || '').trim(),
+                  pending_count: Number(updatedInteractions) || 0,
+                  since: new Date(session.waitingInteractionSince).toISOString(),
+                },
+                plan: planState,
+              };
+          updateSessionHistoryState(session, statePatch);
+          logger?.info?.(
+            `agent local relay waiting for interaction_response requestId=${requestId} step=${toolStep} handoff=${session.planTurnHandoff} pendingInteractions=${updatedInteractions}`,
+          );
+          return { waitingForInteraction: true, handoff: session.planTurnHandoff };
+        }
+        finalText = '';
+        toolCalls = [];
+        upstreamError = '';
+        logger?.info?.(
+          `agent local relay post-tool handoff requestId=${requestId} step=${toolStep} handoff=${session.planTurnHandoff} reason=${JSON.stringify(String(postToolTurnAction.reason || ''))}`,
+        );
+        break;
+      }
+      nativeMutationAckMissing = executions.some((entry) => entry.execution?.missingNativeAck);
+      pendingNativeMutation = executions.some((entry) => entry.execution?.pendingNativeMutation);
+      const sawMutationAttempt = executions.some((entry) => isMutationToolName(entry.toolCall?.name));
+      if (sawMutationAttempt) sawMutationTool = true;
+      if (executions.some((entry) => isReadOnlyContextToolName(entry.toolCall?.name))) {
+        sawReadOnlyTool = true;
+      }
+      const sawMutationExecution = executions.some((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok);
+      if (sawMutationExecution) {
+        sawWriteTool = true;
+        const lintPaths = executions
+          .filter((entry) => isMutationToolName(entry.toolCall?.name) && entry.execution?.ok)
+          .map((entry) => entry.execution?.args?.path)
+          .filter(Boolean);
+        if (runPostEditLints && lintPaths.length && !executions.some((entry) => canonicalToolName(entry.toolCall?.name) === 'ReadLints')) {
+          await executeRelayToolCalls(session, [{
+            id: `tool_read_lints_${Date.now().toString(36)}`,
+            name: 'ReadLints',
+            arguments: { paths: Array.from(new Set(lintPaths)) },
+            provider: 'relay_post_edit',
+          }], requestId, logger);
+        }
+        upstreamError = '';
+      }
+      if (pendingNativeMutation) {
+        toolCalls = [];
+        finalText = '宸插彂閫?Cursor 鍘熺敓宸ュ叿璋冪敤锛屾鍦ㄧ瓑寰呭鎴风澶勭悊銆?';
+        writeAgentTextFrame(session, finalText);
+        logger?.info?.(`agent local relay native mutation pending requestId=${requestId}; ending turn without local write or retry`);
+        break;
+      }
+      if (nativeMutationAckMissing) {
+        toolCalls = [];
+        finalText = 'Cursor 瀹㈡埛绔病鏈夎繑鍥炲師鐢熺紪杈戝伐鍏锋墽琛屽洖鎵э紝鏈疆宸插仠姝紝閬垮厤閲嶅淇敼銆?';
+        writeAgentTextFrame(session, finalText);
+        logger?.info?.(`agent local relay native mutation ack missing requestId=${requestId}; stopping tool loop without local write`);
+        break;
+      }
+      let postToolRecoveryCount = 0;
+      upstreamMessages = [
+        ...upstreamMessages,
+        { role: 'assistant', content: streamed.text?.trim() || `Called ${toolCalls.length} tool(s).` },
+        ...toolResultMessages,
+        {
+          role: 'user',
+          content: 'Continue working from these tool results. If another tool is required, call it; otherwise give the final answer.',
+        },
+      ];
+      while (session.active && !session.aborted) {
+        const postToolPhase = postToolRecoveryCount > 0
+          ? `post_tool_${toolStep}_recover_${postToolRecoveryCount}`
+          : `post_tool_${toolStep}`;
+        compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: postToolPhase });
+        upstreamMessages = compacted.messages;
+        usageMeta = compacted.usage;
+        let upstream;
+        let resumedMode = upstreamMode;
+        try {
+          ({ response: upstream, mode: resumedMode } = await fetchUpstreamCompletion(
+            activeUpstream,
+            configuredModel,
+            upstreamMessages,
+            logger,
+            buildFetchUpstreamOptionsForSession(session, {
+              enableTools: true,
+              signal: session.abortController?.signal || null,
+              timeoutMs: sawWriteTool
+                ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
+                : POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              requestId,
+              phase: postToolPhase,
+              mode: agentMode,
+              outboundProxy: config.outboundProxy || null,
+              localProxyPort: config.port,
+            }, { phase: postToolPhase, agentMode, sawWriteTool }),
+          ));
+          upstreamMode = resumedMode || upstreamMode;
+          if (!upstream.ok) {
+            const errorText = await upstream.text().catch(() => '');
+            upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+            recordUpstreamUsagePhase(session, config, {
+              phase: postToolPhase,
+              endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: 'http_error',
+              httpStatus: upstream.status,
+              error: errorText,
+              promptChars: usageMeta.messageChars,
+              meta: usageMeta,
+            });
+            toolCalls = [];
+          } else {
+            streamed = await streamAgentUpstreamResponse(upstream, session, {
+              collectTools: true,
+              emit: !sawWriteTool,
+              emitThinking,
+              phase: postToolPhase,
+              idleTimeoutMs: sawWriteTool
+                ? POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS
+                : POST_TOOL_STREAM_IDLE_TIMEOUT_MS,
+              maxDurationMs: sawWriteTool
+                ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
+                : POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              extendMaxDurationOnActivity: sawWriteTool,
+              stopOnToolCall: true,
+              stopAfterTextMs: sawWriteTool ? POST_MUTATION_STOP_AFTER_TEXT_MS : 0,
+              reasoningOnlyMaxMs,
+              filterInlineThinking,
+            });
+            finalText = streamed.text;
+            finalReasoning = streamed.reasoning;
+            upstreamError = streamed.upstreamError;
+            lastStreamSawDone = streamed.sawDone === true;
+            lastStreamStopReason = String(streamed.stopReason || '').trim();
+            toolCalls = attachDefaultMutationTarget(
+              streamed.toolCalls.slice(0, maxToolCallsPerRound),
+              session,
+              userText,
+            );
+            recordUpstreamUsagePhase(session, config, {
+              phase: postToolPhase,
+              endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: streamed.upstreamError ? 'stream_error' : 'success',
+              error: streamed.upstreamError,
+              usage: streamed.usage,
+              durationMs: streamed.durationMs,
+              promptChars: usageMeta.messageChars,
+              responseTextChars: streamed.text.length,
+              reasoningChars: streamed.reasoning.length,
+              toolCalls: streamed.toolCalls.length,
+              meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+            });
+          }
+        } catch (error) {
+          if (session.aborted) return null;
+          upstreamError = summarizeFetchError(error);
+          toolCalls = [];
           recordUpstreamUsagePhase(session, config, {
             phase: postToolPhase,
             endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
             model: configuredModel,
-            status: 'http_error',
-            httpStatus: upstream.status,
-            error: errorText,
+            status: 'fetch_error',
+            error: error.message || String(error),
             promptChars: usageMeta.messageChars,
             meta: usageMeta,
           });
-          toolCalls = [];
-        } else {
-          streamed = await streamAgentUpstreamResponse(upstream, session, {
-            collectTools: true,
-            emit: !sawWriteTool,
-            emitThinking,
-            phase: postToolPhase,
-            idleTimeoutMs: sawWriteTool
-              ? POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS
-              : POST_TOOL_STREAM_IDLE_TIMEOUT_MS,
-            maxDurationMs: sawWriteTool
-              ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
-              : POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            extendMaxDurationOnActivity: sawWriteTool,
-            stopOnToolCall: true,
-            stopAfterTextMs: sawWriteTool ? POST_MUTATION_STOP_AFTER_TEXT_MS : 0,
-            reasoningOnlyMaxMs,
-            filterInlineThinking,
-          });
-          finalText = streamed.text;
-          finalReasoning = streamed.reasoning;
-          upstreamError = streamed.upstreamError;
-          toolCalls = attachDefaultMutationTarget(
-            streamed.toolCalls.slice(0, maxToolCallsPerRound),
-            session,
-            userText,
-          );
-          recordUpstreamUsagePhase(session, config, {
-            phase: postToolPhase,
-            endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
-            model: configuredModel,
-            status: streamed.upstreamError ? 'stream_error' : 'success',
-            error: streamed.upstreamError,
-            usage: streamed.usage,
-            durationMs: streamed.durationMs,
-            promptChars: usageMeta.messageChars,
-            responseTextChars: streamed.text.length,
-            reasoningChars: streamed.reasoning.length,
-            toolCalls: streamed.toolCalls.length,
-            meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
-          });
+          logger?.error?.(`agent local relay post-tool upstream failed requestId=${requestId} phase=${postToolPhase}: ${error.message}`);
         }
-      } catch (error) {
-        if (session.aborted) return;
-        upstreamError = summarizeFetchError(error);
-        toolCalls = [];
-        recordUpstreamUsagePhase(session, config, {
-          phase: postToolPhase,
-          endpointMode: upstreamMode || String(config.upstream?.endpointMode || 'responses'),
-          model: configuredModel,
-          status: 'fetch_error',
-          error: error.message || String(error),
-          promptChars: usageMeta.messageChars,
-          meta: usageMeta,
-        });
-        logger.error(`agent local relay post-tool upstream failed requestId=${requestId} phase=${postToolPhase}: ${error.message}`);
+        if (!shouldRecoverPostToolStream(upstreamError, finalText, toolCalls, postToolRecoveryCount)) break;
+        logger?.info?.(`agent local relay post-tool stream stalled; recovering requestId=${requestId} step=${toolStep} attempt=${postToolRecoveryCount + 1} error=${JSON.stringify(upstreamError)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
+        const trimmedRecoveryText = String(finalText || '').trim();
+        upstreamMessages = trimmedRecoveryText
+          ? [
+            ...upstreamMessages,
+            { role: 'assistant', content: trimmedRecoveryText },
+            buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
+          ]
+          : [
+            ...upstreamMessages,
+            buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
+          ];
+        finalText = '';
+        upstreamError = '';
+        postToolRecoveryCount += 1;
       }
-      if (!shouldRecoverPostToolStream(upstreamError, finalText, toolCalls, postToolRecoveryCount)) break;
-      logger.info(`agent local relay post-tool stream stalled; recovering requestId=${requestId} step=${toolStep} attempt=${postToolRecoveryCount + 1} error=${JSON.stringify(upstreamError)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
-      const trimmedRecoveryText = String(finalText || '').trim();
-      upstreamMessages = trimmedRecoveryText
-        ? [
-          ...upstreamMessages,
-          { role: 'assistant', content: trimmedRecoveryText },
-          buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
-        ]
-        : [
-          ...upstreamMessages,
-          buildPostToolRecoveryMessage(upstreamError, postToolRecoveryCount),
-        ];
-      finalText = '';
-      upstreamError = '';
-      postToolRecoveryCount += 1;
-    }
-    while (session.active
-      && !session.aborted
-      && (sawWriteTool || postToolRecoveryCount > 0)
-      && !upstreamError
-      && !toolCalls.length
-      && completionVerificationCount < MAX_COMPLETION_VERIFICATION_ROUNDS) {
-      const completionPhase = `completion_verify_${completionVerificationCount + 1}`;
-      logger.info(`agent local relay completion verification requestId=${requestId} step=${toolStep} attempt=${completionVerificationCount + 1} postToolRecoveries=${postToolRecoveryCount} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
-      const trimmedCandidate = String(finalText || '').trim();
-      upstreamMessages = trimmedCandidate
-        ? [
-          ...upstreamMessages,
-          { role: 'assistant', content: trimmedCandidate },
-          buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
-        ]
-        : [
-          ...upstreamMessages,
-          buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
-        ];
-      finalText = '';
-      upstreamError = '';
-      completionVerificationCount += 1;
-      compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: completionPhase });
-      upstreamMessages = compacted.messages;
-      usageMeta = compacted.usage;
-      try {
-        ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-          config.upstream,
-          configuredModel,
-          upstreamMessages,
-          logger,
-          {
-            enableTools: true,
-            signal: session.abortController?.signal || null,
-            timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            requestId,
-            phase: completionPhase,
-            outboundProxy: config.outboundProxy || null,
-            localProxyPort: config.port,
-          },
-        ));
-        if (!upstream.ok) {
-          const errorText = await upstream.text().catch(() => '');
-          upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+      while (session.active
+        && !session.aborted
+        && (sawWriteTool || postToolRecoveryCount > 0)
+        && !upstreamError
+        && !toolCalls.length
+        && completionVerificationCount < MAX_COMPLETION_VERIFICATION_ROUNDS) {
+        const completionPhase = `completion_verify_${completionVerificationCount + 1}`;
+        logger?.info?.(`agent local relay completion verification requestId=${requestId} step=${toolStep} attempt=${completionVerificationCount + 1} postToolRecoveries=${postToolRecoveryCount} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
+        const trimmedCandidate = String(finalText || '').trim();
+        upstreamMessages = trimmedCandidate
+          ? [
+            ...upstreamMessages,
+            { role: 'assistant', content: trimmedCandidate },
+            buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
+          ]
+          : [
+            ...upstreamMessages,
+            buildCompletionVerificationMessage(userText, finalText, session, completionVerificationCount),
+          ];
+        finalText = '';
+        upstreamError = '';
+        completionVerificationCount += 1;
+        compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: completionPhase });
+        upstreamMessages = compacted.messages;
+        usageMeta = compacted.usage;
+        let upstream;
+        let resumedMode = upstreamMode;
+        try {
+          ({ response: upstream, mode: resumedMode } = await fetchUpstreamCompletion(
+            config.upstream,
+            configuredModel,
+            upstreamMessages,
+            logger,
+            buildFetchUpstreamOptionsForSession(session, {
+              enableTools: true,
+              signal: session.abortController?.signal || null,
+              timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              requestId,
+              phase: completionPhase,
+              mode: agentMode,
+              outboundProxy: config.outboundProxy || null,
+              localProxyPort: config.port,
+            }, { phase: completionPhase, agentMode }),
+          ));
+          upstreamMode = resumedMode || upstreamMode;
+          if (!upstream.ok) {
+            const errorText = await upstream.text().catch(() => '');
+            upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
+            recordUpstreamUsagePhase(session, config, {
+              phase: completionPhase,
+              endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: 'http_error',
+              httpStatus: upstream.status,
+              error: errorText,
+              promptChars: usageMeta.messageChars,
+              meta: usageMeta,
+            });
+            toolCalls = [];
+          } else {
+              streamed = await streamAgentUpstreamResponse(upstream, session, {
+              collectTools: true,
+              emit: false,
+              emitThinking,
+              phase: completionPhase,
+              idleTimeoutMs: POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS,
+              maxDurationMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              extendMaxDurationOnActivity: true,
+              stopOnToolCall: true,
+              stopAfterTextMs: POST_MUTATION_STOP_AFTER_TEXT_MS,
+              reasoningOnlyMaxMs,
+              filterInlineThinking,
+            });
+            finalText = streamed.text;
+            finalReasoning = streamed.reasoning;
+            upstreamError = streamed.upstreamError;
+            lastStreamSawDone = streamed.sawDone === true;
+            lastStreamStopReason = String(streamed.stopReason || '').trim();
+            toolCalls = attachDefaultMutationTarget(
+              streamed.toolCalls.slice(0, maxToolCallsPerRound),
+              session,
+              userText,
+            );
+            recordUpstreamUsagePhase(session, config, {
+              phase: completionPhase,
+              endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+              model: configuredModel,
+              status: streamed.upstreamError ? 'stream_error' : 'success',
+              error: streamed.upstreamError,
+              usage: streamed.usage,
+              durationMs: streamed.durationMs,
+              promptChars: usageMeta.messageChars,
+              responseTextChars: streamed.text.length,
+              reasoningChars: streamed.reasoning.length,
+              toolCalls: streamed.toolCalls.length,
+              meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+            });
+          }
+        } catch (error) {
+          if (session.aborted) return null;
+          upstreamError = summarizeFetchError(error);
+          toolCalls = [];
           recordUpstreamUsagePhase(session, config, {
             phase: completionPhase,
             endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
             model: configuredModel,
-            status: 'http_error',
-            httpStatus: upstream.status,
-            error: errorText,
+            status: 'fetch_error',
+            error: error.message || String(error),
             promptChars: usageMeta.messageChars,
             meta: usageMeta,
           });
-          toolCalls = [];
-        } else {
-          streamed = await streamAgentUpstreamResponse(upstream, session, {
-            collectTools: true,
-            emit: false,
-            emitThinking,
-            phase: completionPhase,
-            idleTimeoutMs: POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS,
-            maxDurationMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
-            extendMaxDurationOnActivity: true,
-            stopOnToolCall: true,
-            stopAfterTextMs: POST_MUTATION_STOP_AFTER_TEXT_MS,
-            reasoningOnlyMaxMs,
-            filterInlineThinking,
-          });
-          finalText = streamed.text;
-          finalReasoning = streamed.reasoning;
-          upstreamError = streamed.upstreamError;
-          toolCalls = attachDefaultMutationTarget(
-            streamed.toolCalls.slice(0, maxToolCallsPerRound),
-            session,
-            userText,
-          );
-          recordUpstreamUsagePhase(session, config, {
-            phase: completionPhase,
-            endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-            model: configuredModel,
-            status: streamed.upstreamError ? 'stream_error' : 'success',
-            error: streamed.upstreamError,
-            usage: streamed.usage,
-            durationMs: streamed.durationMs,
-            promptChars: usageMeta.messageChars,
-            responseTextChars: streamed.text.length,
-            reasoningChars: streamed.reasoning.length,
-            toolCalls: streamed.toolCalls.length,
-            meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
-          });
+          logger?.error?.(`agent local relay completion verification upstream failed requestId=${requestId}: ${error.message}`);
         }
-      } catch (error) {
-        if (session.aborted) return;
-        upstreamError = summarizeFetchError(error);
-        toolCalls = [];
-        recordUpstreamUsagePhase(session, config, {
-          phase: completionPhase,
-          endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-          model: configuredModel,
-          status: 'fetch_error',
-          error: error.message || String(error),
-          promptChars: usageMeta.messageChars,
-          meta: usageMeta,
-        });
-        logger.error(`agent local relay completion verification upstream failed requestId=${requestId}: ${error.message}`);
       }
+      if (toolCalls.length) continue;
     }
-    if (toolCalls.length) continue;
+
     while (session.active
       && !session.aborted
-      && shouldContinueIncompleteWork(session, finalText, toolCalls, upstreamError, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool })) {
+      && shouldContinueIncompleteWorkByMode(session, finalText, toolCalls, upstreamError, incompletePostMutationContinuationCount, {
+        sawMutationTool,
+        sawReadOnlyTool,
+        lastStreamSawDone,
+        lastStreamStopReason,
+      })) {
       const continuationPhase = `incomplete_continuation_${incompletePostMutationContinuationCount + 1}`;
-      const maxIncompleteContinuations = sawReadOnlyTool && !sawMutationTool
-        ? getMaxReadOnlyExplorationContinuationCount(session)
-        : getMaxIncompleteContinuationCount(session);
+      const maxIncompleteContinuations = getMaxContinuationCountByMode(session, { sawMutationTool, sawReadOnlyTool });
       const incompleteTodosForContinuation = getIncompleteTodos(session);
-      const forceReadOnlyContinuationTool = shouldForceReadOnlyContinuationToolCall(session, finalText, { sawMutationTool, sawReadOnlyTool });
-      const forceToolForContinuation = forceReadOnlyContinuationTool || !sawReadOnlyTool || sawMutationTool || incompleteTodosForContinuation.length > 0;
+      const continuationOptions = {
+        sawMutationTool,
+        sawReadOnlyTool,
+        lastStreamSawDone,
+        lastStreamStopReason,
+      };
+      const forceReadOnlyContinuationTool = shouldForceReadOnlyContinuationToolCall(session, finalText, continuationOptions);
+      const forceToolForContinuation = shouldForceContinuationToolChoiceByMode(session, finalText, continuationOptions);
       const readOnlyContinuationTarget = forceReadOnlyContinuationTool
         ? (toWorkspaceRelativePath(getReadOnlyContinuationTargetPath(session), getSessionWorkspaceRoot(session)) || getReadOnlyContinuationTargetPath(session))
         : '';
-      logger.info(`agent local relay incomplete continuation requestId=${requestId} step=${toolStep} attempt=${incompletePostMutationContinuationCount + 1}/${formatContinuationLimitForLog(maxIncompleteContinuations)} sawMutationTool=${sawMutationTool ? 1 : 0} sawReadOnlyTool=${sawReadOnlyTool ? 1 : 0} toolChoice=${forceToolForContinuation ? 'required' : 'auto'} readOnlyTarget=${JSON.stringify(readOnlyContinuationTarget)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))} incompleteTodos=${incompleteTodosForContinuation.length}`);
+      logger?.info?.(`agent local relay incomplete continuation requestId=${requestId} step=${toolStep} attempt=${incompletePostMutationContinuationCount + 1}/${formatContinuationLimitForLog(maxIncompleteContinuations)} sawMutationTool=${sawMutationTool ? 1 : 0} sawReadOnlyTool=${sawReadOnlyTool ? 1 : 0} toolChoice=${forceToolForContinuation ? 'required' : 'auto'} readOnlyTarget=${JSON.stringify(readOnlyContinuationTarget)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))} incompleteTodos=${incompleteTodosForContinuation.length}`);
       const trimmedContinuationText = String(finalText || '').trim();
       upstreamMessages = trimmedContinuationText
         ? [
           ...upstreamMessages,
           { role: 'assistant', content: trimmedContinuationText },
-          buildIncompleteContinuationMessage(session, finalText, incompletePostMutationContinuationCount),
+          buildIncompleteContinuationMessageByMode(session, finalText, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool }),
         ]
         : [
           ...upstreamMessages,
-          buildIncompleteContinuationMessage(session, finalText, incompletePostMutationContinuationCount),
+          buildIncompleteContinuationMessageByMode(session, finalText, incompletePostMutationContinuationCount, { sawMutationTool, sawReadOnlyTool }),
         ];
       finalText = '';
       upstreamError = '';
@@ -5483,23 +7251,27 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
       compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: continuationPhase });
       upstreamMessages = compacted.messages;
       usageMeta = compacted.usage;
+      let upstream;
+      let resumedMode = upstreamMode;
       try {
-        ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+        ({ response: upstream, mode: resumedMode } = await fetchUpstreamCompletion(
           activeUpstream,
           configuredModel,
           upstreamMessages,
           logger,
-          {
+          buildFetchUpstreamOptionsForSession(session, {
             enableTools: true,
             toolChoice: forceToolForContinuation ? 'required' : 'auto',
             signal: session.abortController?.signal || null,
             timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
             requestId,
             phase: continuationPhase,
+            mode: agentMode,
             outboundProxy: config.outboundProxy || null,
             localProxyPort: config.port,
-          },
+          }, { phase: continuationPhase, agentMode, forceToolForContinuation }),
         ));
+        upstreamMode = resumedMode || upstreamMode;
         if (!upstream.ok) {
           const errorText = await upstream.text().catch(() => '');
           upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
@@ -5531,6 +7303,8 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
           finalText = streamed.text;
           finalReasoning = streamed.reasoning;
           upstreamError = streamed.upstreamError;
+          lastStreamSawDone = streamed.sawDone === true;
+          lastStreamStopReason = String(streamed.stopReason || '').trim();
           toolCalls = attachDefaultMutationTarget(
             streamed.toolCalls.slice(0, maxToolCallsPerRound),
             session,
@@ -5552,7 +7326,7 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
           });
         }
       } catch (error) {
-        if (session.aborted) return;
+        if (session.aborted) return null;
         upstreamError = summarizeFetchError(error);
         toolCalls = [];
         recordUpstreamUsagePhase(session, config, {
@@ -5564,49 +7338,59 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
           promptChars: usageMeta.messageChars,
           meta: usageMeta,
         });
-        logger.error(`agent local relay incomplete continuation failed requestId=${requestId} phase=${continuationPhase}: ${error.message}`);
+        logger?.error?.(`agent local relay incomplete continuation failed requestId=${requestId} phase=${continuationPhase}: ${error.message}`);
       }
     }
     if (toolCalls.length) continue;
+    break;
   }
 
   const incompleteTodosAtEnd = getIncompleteTodos(session);
-  const incompleteWorkAtEnd = !upstreamError
-    && !toolCalls.length
-    && (
-      incompleteTodosAtEnd.length > 0
-      || looksLikeIncompleteContinuationText(finalText)
-      || looksLikeReadOnlyExplorationStillInProgress(session, finalText, { sawMutationTool, sawReadOnlyTool })
-    );
+  const incompleteWorkAtEnd = hasIncompleteWorkAtEndByMode(
+    session,
+    finalText,
+    toolCalls,
+    upstreamError,
+    {
+      sawMutationTool,
+      sawReadOnlyTool,
+      lastStreamSawDone,
+      lastStreamStopReason,
+    },
+  );
   if (incompleteWorkAtEnd) {
     session.unfinishedWorkAtEnd = true;
     const latestText = String(finalText || '').trim();
-    const maxIncompleteContinuations = getMaxIncompleteContinuationCount(session);
+    const maxIncompleteContinuations = getMaxContinuationCountByMode(session, { sawMutationTool, sawReadOnlyTool });
     const note = [
-      `本地 Relay 已尝试自动续跑 ${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} 次，但不会把未完成 To-dos 强制改成完成。`,
-      incompleteTodosAtEnd.length ? `仍未完成的 To-dos：${incompleteTodosAtEnd.map((todo) => todo.content).slice(0, 6).join('；')}` : '',
-      latestText ? `最后一段上游文本：${latestText}` : '',
+      `鏈湴 Relay 宸插皾璇曡嚜鍔ㄧ画璺?${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} 娆★紝浣嗕笉浼氭妸鏈畬鎴?To-dos 寮哄埗鏀规垚瀹屾垚銆俙`,
+      incompleteTodosAtEnd.length ? `浠嶆湭瀹屾垚鐨?To-dos锛?${incompleteTodosAtEnd.map((todo) => todo.content).slice(0, 6).join('锛?)')}` : '',
+      latestText ? `鏈€鍚庝竴娈典笂娓告枃鏈細${latestText}` : '',
     ].filter(Boolean).join('\n');
     rememberUnfinishedAgentTask(session, userText, note);
     finalText = '';
-    logger.warn(`agent local relay incomplete work left to upstream requestId=${requestId} toolStep=${toolStep} continuations=${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} incompleteTodos=${incompleteTodosAtEnd.length} textPreview=${JSON.stringify(latestText.slice(0, 200))}`);
+    logger?.warn?.(`agent local relay incomplete work left to upstream requestId=${requestId} toolStep=${toolStep} continuations=${incompletePostMutationContinuationCount}/${formatContinuationLimitForLog(maxIncompleteContinuations)} incompleteTodos=${incompleteTodosAtEnd.length} textPreview=${JSON.stringify(latestText.slice(0, 200))}`);
   } else if (maxToolRounds > 0 && toolCalls.length && toolStep >= maxToolRounds) {
-    upstreamError = `本地 Relay 工具轮数保护已触发（${maxToolRounds} 轮），任务尚未确认完成。已保留当前工具结果上下文，避免伪造完成总结。`;
+    upstreamError = `鏈湴 Relay 宸ュ叿杞暟淇濇姢宸茶Е鍙戯紙${maxToolRounds} 杞級锛屼换鍔″皻鏈‘璁ゅ畬鎴愩€傚凡淇濈暀褰撳墠宸ュ叿缁撴灉涓婁笅鏂囷紝閬垮厤浼€犲畬鎴愭€荤粨銆俙`;
     rememberUnfinishedAgentTask(session, userText, upstreamError);
-    logger.warn(`agent local relay tool round guard reached requestId=${requestId} toolStep=${toolStep} pendingTools=${toolCalls.length}`);
+    logger?.warn?.(`agent local relay tool round guard reached requestId=${requestId} toolStep=${toolStep} pendingTools=${toolCalls.length}`);
   } else if (upstreamError && isRecoverableStreamError(upstreamError)) {
+    // A transient gateway/network error is an interruption, not a hard failure.
+    // Mark the turn as unfinished so the client can resume instead of treating
+    // it as a completed (but empty) or failed round.
+    session.unfinishedWorkAtEnd = true;
     rememberUnfinishedAgentTask(session, userText, upstreamError);
-    logger.warn(`agent local relay recoverable upstream interruption requestId=${requestId} toolStep=${toolStep} error=${JSON.stringify(upstreamError)}`);
+    logger?.warn?.(`agent local relay recoverable upstream interruption requestId=${requestId} toolStep=${toolStep} error=${JSON.stringify(upstreamError)}`);
   } else if (!upstreamError) {
     session.unfinishedWorkAtEnd = false;
     clearUnfinishedAgentTask(session);
   }
 
   if (shouldTreatStreamErrorAsComplete(upstreamError, finalText)) {
-    logger.info(`agent local relay treating recoverable stream error as completed requestId=${requestId} error=${JSON.stringify(upstreamError)} textLen=${String(finalText || '').length} toolStep=${toolStep}`);
+    logger?.info?.(`agent local relay treating recoverable stream error as completed requestId=${requestId} error=${JSON.stringify(upstreamError)} textLen=${String(finalText || '').length} toolStep=${toolStep}`);
     upstreamError = '';
   }
-  if (!session.active || session.aborted) return;
+  if (!session.active || session.aborted) return null;
   finalText = sanitizeFinalAgentText(finalText, session);
   session.hadError = Boolean(upstreamError);
   const finalStatus = session.unfinishedWorkAtEnd
@@ -5641,31 +7425,370 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     if (sawWriteTool || String(session.agentTextFrameText || '').trim()) {
       finalText = '';
     } else {
-      logger.info(`agent local relay completed without final text requestId=${requestId} toolStep=${toolStep}`);
+      logger?.info?.(`agent local relay completed without final text requestId=${requestId} toolStep=${toolStep}`);
     }
   } else if (String(finalText || '').trim() && !placeholderFinalText) {
     session.historyTextCursor = String(session.agentTextFrameText || '').length;
   } else if (placeholderFinalText) {
-    logger.info(`agent local relay suppressed placeholder final text requestId=${requestId} text=${JSON.stringify(String(finalText || '').trim())}`);
+    logger?.info?.(`agent local relay suppressed placeholder final text requestId=${requestId} text=${JSON.stringify(String(finalText || '').trim())}`);
   }
-  logger.info(
+  logger?.info?.(
     `agent local relay final text frame requestId=${requestId} finalTextLen=${String(finalText || '').length} sentTextDelta=${session.sentTextDelta ? '1' : '0'} finalAlreadySent=${finalTextAlreadySent ? '1' : '0'} sentTextLen=${String(session.agentTextFrameText || '').length}`,
   );
+  if (isPlanModeSession(session) && !session.unfinishedWorkAtEnd && !upstreamError) {
+    setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.COMPLETED, {
+      currentRequestId: String(session.requestId || '').trim(),
+    });
+  }
   writeAgentFrame(session, buildAgentTurnEndedFrame());
   session.turnEnded = true;
   markUpstreamUsageCompleted(session, config, finalStatus, upstreamError);
   rememberCompletedAgentTurn(session.completedAgentTurns, session.requestId, userText, getSessionWorkspaceRoot(session), session.lastUserMessageCapture?.debug || null, session.generatedChunks, { upstreamError, hadError: session.unfinishedWorkAtEnd });
   completeSessionHistory(session, historyStatus, `model-${requestId}`);
-  logger.info(
+  logger?.info?.(
     `agent local relay upstream response requestId=${requestId} mode=${upstreamMode || '-'} textLen=${finalText.length} reasoningLen=${finalReasoning.length} errorLen=${upstreamError.length} textPreview=${JSON.stringify(finalText.slice(0, 300))}`,
   );
   logGeneratedAgentRunSseSummary(session.generatedChunks || [], session.requestId, logger);
   finalizeInterceptedAgentSession(session);
+  return { waitingForInteraction: false, finalStatus, historyStatus };
+}
+
+async function resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction = null) {
+  if (!session?.active || session.aborted || session.relaying) return;
+  session.relaying = true;
+  session.webSearchProgressEmitted = false;
+  try {
+  const requestId = session.requestId || '-';
+  const userText = String(pendingInteraction?.resumeState?.userText || session.lastUserMessageCapture?.userText || '').trim();
+  if (!userText) {
+    logger?.warn?.(`agent local relay interaction resume skipped requestId=${requestId} reason=missing_user_text`);
+    return;
+  }
+  if (String(interactionResponse?.kind || '').trim() === 'create_plan_request_response') {
+    const planState = syncPresentedPlanStateFromInteractionResponse(session, interactionResponse, pendingInteraction);
+    if (planState) {
+      updatePlanWorkflowForInteractionResponse(session, interactionResponse, pendingInteraction);
+      session.waitingForInteraction = true;
+      session.planTurnHandoff = 'create_plan';
+      session.unfinishedWorkAtEnd = false;
+      updateSessionHistoryState(session, {
+        current_loop_status: 'waiting_for_interaction',
+        waiting_for_interaction: {
+          handoff: 'create_plan',
+          pending_count: 1,
+          since: new Date().toISOString(),
+        },
+        plan: planState,
+      });
+      emitPresentedPlanCheckpoint(session, logger, { force: true });
+      logger?.info?.(
+        `agent local relay create_plan acknowledged requestId=${requestId} planUri=${JSON.stringify(String(planState?.plan_uri || ''))} waiting_for_build=1`,
+      );
+      return;
+    }
+  }
+  if (String(interactionResponse?.kind || '').trim() === 'execute_plan_action') {
+    if (isPlanModeSession(session)) {
+      setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.EXECUTING, {
+        lastInteractionKind: String(interactionResponse?.kind || '').trim(),
+        currentRequestId: String(session.requestId || '').trim(),
+      });
+    }
+    const planState = getLatestSessionPlanState(session) || {};
+    session.waitingForInteraction = false;
+    session.planTurnHandoff = '';
+    session.deferredInteractionResponse = null;
+    session.relaying = false;
+    updateSessionHistoryState(session, {
+      current_loop_status: 'running',
+      waiting_for_interaction: null,
+      plan: planState.plan || planState.plan_uri
+        ? {
+          plan: String(planState.plan || planState.plan_uri || '').trim(),
+          plan_text: String(planState.plan_text || '').trim(),
+          plan_uri: String(planState.plan_uri || '').trim(),
+          todos: Array.isArray(planState.todos) ? planState.todos : [],
+        }
+        : null,
+    });
+  }
+  const configuredModel = resolveRequestedUpstreamModel(config, {
+    requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
+  });
+  const activeUpstream = resolveUpstreamForModel(config, configuredModel);
+  const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
+    ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
+    : 0;
+  const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
+  const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
+  const agentMode = getSessionAgentMode(session);
+  const runPostEditLints = shouldRunPostEditLints(config);
+  const upstreamMessages = buildPendingInteractionResumeMessages(session, pendingInteraction, interactionResponse);
+  const compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'interaction_resume' });
+  const usageMeta = compacted.usage;
+  const promptChars = usageMeta.messageChars;
+
+  stats.chatTotal = (stats.chatTotal || 0) + 1;
+  stats.localRelayTurns = (stats.localRelayTurns || 0) + 1;
+  logger?.info?.(
+    `agent local relay interaction resume requestId=${requestId} interactionKind=${interactionResponse?.kind || '-'} promptChars=${promptChars}`,
+  );
+
+  let upstream;
+  let upstreamMode = '';
+  try {
+    ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+      activeUpstream,
+      configuredModel,
+      compacted.messages,
+      logger,
+      buildFetchUpstreamOptionsForSession(session, {
+        signal: session.abortController?.signal || null,
+        requestId,
+        phase: 'interaction_resume',
+        mode: agentMode,
+        outboundProxy: config.outboundProxy || null,
+        localProxyPort: config.port,
+      }, { phase: 'interaction_resume', agentMode }),
+    ));
+    session.activeUpstreamResponse = upstream;
+  } catch (error) {
+    if (session.aborted) return;
+    const summarized = summarizeFetchError(error);
+    recordUpstreamUsagePhase(session, config, {
+      phase: 'interaction_resume',
+      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+      model: configuredModel,
+      status: 'fetch_error',
+      error: error.message || String(error),
+      promptChars,
+      meta: usageMeta,
+    });
+    logger?.error?.(`agent local relay interaction resume fetch failed requestId=${requestId}: ${error.message}`);
+    appendSessionHistory(session, {
+      role: 'assistant',
+      kind: 'assistant_text',
+      payload: { text: summarized, error: true },
+    });
+    writeAgentTextFrame(session, summarized);
+    writeAgentFrame(session, buildAgentTurnEndedFrame());
+    session.turnEnded = true;
+    completeSessionHistory(session, 'failed', `interaction-resume-fetch-${requestId}`);
+    finalizeInterceptedAgentSession(session);
+    return;
+  }
+
+  if (!upstream.ok) {
+    session.activeUpstreamResponse = null;
+    if (session.aborted) return;
+    const errorText = await upstream.text().catch(() => '');
+    const summarized = summarizeUpstreamFailure(upstream.status, errorText);
+    recordUpstreamUsagePhase(session, config, {
+      phase: 'interaction_resume',
+      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+      model: configuredModel,
+      status: 'http_error',
+      httpStatus: upstream.status,
+      error: errorText,
+      promptChars,
+      meta: usageMeta,
+    });
+    logger?.error?.(`agent local relay interaction resume HTTP ${upstream.status} requestId=${requestId} bodyPreview=${JSON.stringify(errorText.slice(0, 300))}`);
+    appendSessionHistory(session, {
+      role: 'assistant',
+      kind: 'assistant_text',
+      payload: { text: summarized, error: true },
+    });
+    writeAgentTextFrame(session, summarized);
+    writeAgentFrame(session, buildAgentTurnEndedFrame());
+    session.turnEnded = true;
+    completeSessionHistory(session, 'failed', `interaction-resume-http-${requestId}`);
+    finalizeInterceptedAgentSession(session);
+    return;
+  }
+
+  const streamed = await streamAgentUpstreamResponse(upstream, session, {
+    collectTools: true,
+    emit: true,
+    emitThinking,
+    phase: 'interaction_resume',
+    idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+    maxDurationMs: 0,
+    reasoningOnlyMaxMs,
+    filterInlineThinking,
+  });
+  session.activeUpstreamResponse = null;
+  recordUpstreamUsagePhase(session, config, {
+    phase: 'interaction_resume',
+    endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+    model: configuredModel,
+    status: streamed.upstreamError ? 'stream_error' : 'success',
+    error: streamed.upstreamError,
+    usage: streamed.usage,
+    durationMs: streamed.durationMs,
+    promptChars,
+    responseTextChars: streamed.text.length,
+    reasoningChars: streamed.reasoning.length,
+    toolCalls: streamed.toolCalls.length,
+    meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+  });
+  if (!session.active || session.aborted) return;
+  session.waitingForInteraction = false;
+  session.planTurnHandoff = '';
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  updateSessionHistoryState(
+    session,
+    typeof handler.buildResumedInteractionStatePatch === 'function'
+      ? handler.buildResumedInteractionStatePatch(session, interactionResponse, pendingInteraction, helpers)
+      : {
+        current_loop_status: 'running',
+        waiting_for_interaction: null,
+      },
+  );
+  await continueAgentStreamLoop(session, {
+    userText,
+    config,
+    logger,
+    streamed,
+    upstreamMessages: compacted.messages,
+    usageMeta,
+    configuredModel,
+    activeUpstream,
+    upstreamMode,
+    requestId,
+    agentMode,
+    runPostEditLints,
+    emitThinking,
+    filterInlineThinking,
+    reasoningOnlyMaxMs,
+  });
   } finally {
+    if (session) session.activeUpstreamResponse = null;
     if (session) session.relaying = false;
+    triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
   }
 }
 
+async function relayAgentUserMessage(session, userText, config, logger, stats) {
+  if (!session?.active || session.aborted || session.relaying) return;
+  session.relaying = true;
+  session.webSearchProgressEmitted = false;
+  try {
+    if (shouldTreatPlanTurnAsFreshRequest(session)) {
+      clearSessionPlanPresentationState(session, { clearTodos: true });
+    }
+    if (
+      isPlanModeSession(session)
+      && !session.waitingForInteraction
+      && !isPlanCheckpointVisiblePhase(getPlanWorkflowPhase(session))
+    ) {
+      setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.PLANNING, {
+        currentRequestId: String(session.requestId || '').trim(),
+        lastInteractionKind: '',
+        lastToolName: '',
+        draftPlanPath: '',
+        presentedPlanUri: '',
+        checkpointEmittedForPlanUri: '',
+        needsFreshExploreAfterAnswers: false,
+      });
+    }
+    const startedNewTurn = ensureOpenSessionHistoryTurn(session, config, {
+      userText,
+      includeUserMessage: true,
+      includeRequestContext: true,
+      includeModePromptContexts: isPlanModeSession(session),
+    });
+    if (startedNewTurn) {
+      updateAgentHistoryUsage(config, { requests: 1 });
+    }
+
+    const configuredModel = resolveRequestedUpstreamModel(config, {
+      requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
+    });
+    const activeUpstream = resolveUpstreamForModel(config, configuredModel);
+    const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
+      ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
+      : 0;
+    const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
+    const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
+    const requestId = session.requestId || '-';
+    const agentMode = getSessionAgentMode(session);
+
+    let upstreamMessages = buildLocalRelayMessages(userText, session);
+    const compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'initial' });
+    upstreamMessages = compacted.messages;
+    const usageMeta = compacted.usage;
+    const promptChars = usageMeta.messageChars;
+
+    stats.chatTotal = (stats.chatTotal || 0) + 1;
+    stats.localRelayTurns = (stats.localRelayTurns || 0) + 1;
+
+    const { response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+      activeUpstream,
+      configuredModel,
+      upstreamMessages,
+      logger,
+      buildFetchUpstreamOptionsForSession(session, {
+        signal: session.abortController?.signal || null,
+        requestId,
+        phase: 'initial',
+        mode: agentMode,
+        outboundProxy: config.outboundProxy || null,
+        localProxyPort: config.port,
+      }, { phase: 'initial', agentMode }),
+    );
+    session.activeUpstreamResponse = upstream;
+
+    const streamed = await streamAgentUpstreamResponse(upstream, session, {
+      collectTools: true,
+      emit: true,
+      emitThinking,
+      phase: 'initial',
+      idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+      maxDurationMs: 0,
+      reasoningOnlyMaxMs,
+      filterInlineThinking,
+    });
+    session.activeUpstreamResponse = null;
+
+    recordUpstreamUsagePhase(session, config, {
+      phase: 'initial',
+      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+      model: configuredModel,
+      status: streamed.upstreamError ? 'stream_error' : 'success',
+      error: streamed.upstreamError,
+      usage: streamed.usage,
+      durationMs: streamed.durationMs,
+      promptChars,
+      responseTextChars: streamed.text.length,
+      reasoningChars: streamed.reasoning.length,
+      toolCalls: streamed.toolCalls.length,
+      meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+    });
+
+    await continueAgentStreamLoop(session, {
+      userText,
+      config,
+      logger,
+      streamed,
+      upstreamMessages,
+      usageMeta,
+      configuredModel,
+      activeUpstream,
+      upstreamMode,
+      requestId,
+      agentMode,
+      emitThinking,
+      filterInlineThinking,
+      reasoningOnlyMaxMs,
+    });
+  } finally {
+    if (session) session.activeUpstreamResponse = null;
+    if (session) session.relaying = false;
+    triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
+  }
+}
 function forwardMitmH2Request(req, res, host, reqPath, method, body, logger, options = {}) {
   return new Promise((resolve, reject) => {
     const client = http2.connect(`https://${host}:443`);
@@ -5788,10 +7911,16 @@ async function forwardMitmHttpsRequest(req, res, logger, body, options = {}) {
   });
 }
 
-async function handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns) {
+async function handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const rawBody = await readRequestBody(req);
   const requestId = decodeRunSseRequestId(rawBody);
   const frameSummary = summarizeConnectFrames(rawBody);
+  let pendingCapture = null;
+  if (requestId && pendingAgentMessages?.get?.(requestId)?.capture) {
+    pendingCapture = pendingAgentMessages.get(requestId).capture;
+  }
+  const stableConversationId = extractStableConversationId(pendingCapture?.debug || null)
+    || String(pendingCapture?.stableConversationId || '').trim();
 
   stats.seenAgentRunSse = (stats.seenAgentRunSse || 0) + 1;
   logger.info(
@@ -5807,6 +7936,58 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
   }
 
   if (isLocalRelayMode(config)) {
+    const existingWaitingSession = requestId ? agentSessions.get(requestId) : null;
+    if (existingWaitingSession?.waitingForInteraction && !existingWaitingSession.aborted) {
+      const session = reattachWaitingInteractionSession(existingWaitingSession, req, res, rawBody, logger);
+      if (pendingCapture) {
+        session.lastUserMessageCapture = pendingCapture;
+        session.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || session.workspaceRoot || '');
+        pendingAgentMessages.delete(requestId);
+      }
+      res.on('close', () => {
+        if (session?.completed) return;
+        if (session?.ignoreNextRunsseClose) {
+          session.ignoreNextRunsseClose = false;
+          logger?.info?.(`agent local relay ignored runsse close after finalize requestId=${session?.requestId || '-'}`);
+          return;
+        }
+        abortAgentSession(session, logger, 'runsse_closed');
+      });
+      if (session?.deferredInteractionResponse?.interactionResponse && !session.relaying) {
+        triggerDeferredInteractionResume(session, config, logger, stats, 'runsse_reattach');
+      }
+      return;
+    }
+    const crossRequestWaitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, requestId);
+    if (
+      crossRequestWaitingSession
+      && !crossRequestWaitingSession.aborted
+      && shouldReuseWaitingSessionForPendingCapture(crossRequestWaitingSession, pendingCapture)
+    ) {
+      if (requestId && requestId !== crossRequestWaitingSession.requestId) {
+        rebindWaitingSessionRequestId(crossRequestWaitingSession, requestId, logger);
+      }
+      const session = reattachWaitingInteractionSession(crossRequestWaitingSession, req, res, rawBody, logger);
+      if (pendingCapture) {
+        session.lastUserMessageCapture = pendingCapture;
+        session.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || session.workspaceRoot || '');
+        pendingAgentMessages.delete(requestId);
+      }
+      res.on('close', () => {
+        if (session?.completed) return;
+        if (session?.ignoreNextRunsseClose) {
+          session.ignoreNextRunsseClose = false;
+          logger?.info?.(`agent local relay ignored runsse close after finalize requestId=${session?.requestId || '-'}`);
+          return;
+        }
+        abortAgentSession(session, logger, 'runsse_closed');
+      });
+      if (session?.deferredInteractionResponse?.interactionResponse && !session.relaying) {
+        triggerDeferredInteractionResume(session, config, logger, stats, 'runsse_cross_request_reattach');
+      }
+      return;
+    }
+
     const session = {
       req,
       res,
@@ -5830,6 +8011,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       lastUserMessageCapture: null,
       workspaceRoot: '',
       completedAgentTurns,
+      pendingAgentInteractions,
     };
     logger.info(`agent local relay RunSSE open requestId=${requestId || '-'} mode=${getRunnerMode(config)}`);
     try {
@@ -5849,6 +8031,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       if (pending?.userText) {
         pendingAgentMessages.delete(requestId);
         session.lastUserMessageCapture = pending.capture || null;
+        session.agentMode = normalizeAgentModeName(pending.capture?.mode || session.agentMode || 'AGENT_MODE_AGENT');
         session.workspaceRoot = normalizeWorkspacePath(pending.workspaceRoot || pending.capture?.workspaceRoot || session.workspaceRoot || '');
         if (pending.completedTurn) {
           completeDuplicateAgentSession(session, logger, 'completed_scope_replay_pending', pending.completedTurn);
@@ -5862,6 +8045,11 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
     }
     res.on('close', () => {
       if (session.completed) return;
+      if (session?.ignoreNextRunsseClose) {
+        session.ignoreNextRunsseClose = false;
+        logger?.info?.(`agent local relay ignored runsse close after finalize requestId=${session?.requestId || '-'}`);
+        return;
+      }
       abortAgentSession(session, logger, 'runsse_closed');
     });
     return;
@@ -5872,7 +8060,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
   logAgentRunSseResponseSummary(captureResponsePath, requestId, logger);
 }
 
-async function handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns) {
+async function handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const rawBody = await readRequestBody(req);
   const decoded = decodeBidiAppendRequest(rawBody);
   const protocolOneof = decoded.debug?.agentClientMessage?.oneof || '-';
@@ -5890,6 +8078,12 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
   logger.info(
     `protocol BidiAppend kind=${decoded.kind || '-'} requestId=${decoded.requestId || '-'} rawLen=${rawBody.length} agentOneof=${protocolOneof} workspaceRoot=${JSON.stringify(decoded.debug?.workspaceRoot || '')} userTextPreview=${JSON.stringify(userTextPreview)}`,
   );
+
+  if (decoded.kind === 'conversation_action') {
+    logger.info(
+      `protocol BidiAppend conversation_action debug requestId=${decoded.requestId || '-'} rawTextPreview=${JSON.stringify(decoded.debug?.rawTextPreview || '')} dataTextPreview=${JSON.stringify(decoded.debug?.dataTextPreview || '')} agentShape=${JSON.stringify(decoded.debug?.agentShape || '')} agentClientMessage=${JSON.stringify(decoded.debug?.agentClientMessage || {})}`,
+    );
+  }
 
   const samplePath = persistProtocolSample(config, 'bidi', rawBody, {
     requestId: decoded.requestId || '',
@@ -5944,12 +8138,253 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
     }
 
     if (decoded.kind === 'conversation_action' && decoded.requestId) {
-      const session = agentSessions.get(decoded.requestId);
-      const actionText = `${userTextPreview}\n${decoded.debug?.rawTextPreview || ''}\n${decoded.debug?.dataTextPreview || ''}`;
-      if (/abort|aborted|cancel|stop/i.test(actionText)) {
-        abortAgentSession(session, logger, 'conversation_action_abort');
-        logger.info(`agent local relay conversation abort requestId=${decoded.requestId}`);
+      const action = decoded.debug?.agentClientMessage?.conversationAction || {};
+      let session = agentSessions.get(decoded.requestId);
+      const stableConversationId = extractStableConversationId(decoded.debug || null)
+        || String(decoded.debug?.agentClientMessage?.runRequest?.stableConversationId || '').trim();
+      if (!session && stableConversationId) {
+        session = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
       }
+      const actionKind = String(action.kind || '').trim();
+      const isCancel = actionKind === 'cancel_action';
+      const isExecutePlan = actionKind === 'execute_plan_action';
+      const isStartPlan = actionKind === 'start_plan_action';
+      logger.info(
+        `agent local relay conversation_action requestId=${decoded.requestId} sessionActive=${session?.active ? '1' : '0'} sessionAborted=${session?.aborted ? '1' : '0'} actionKind=${actionKind || '-'} isCancel=${isCancel ? '1' : '0'} isExecutePlan=${isExecutePlan ? '1' : '0'} isStartPlan=${isStartPlan ? '1' : '0'} action=${JSON.stringify(action).slice(0, 1200)}`,
+      );
+      if (!session) {
+        ack();
+        return;
+      }
+      if (isCancel) {
+        abortAgentSession(session, logger, 'conversation_action_cancel');
+        logger.info(`agent local relay conversation cancel requestId=${decoded.requestId}`);
+        ack();
+        return;
+      }
+      if (isStartPlan) {
+        ensureOpenSessionHistoryTurn(session, config, {
+          includeUserMessage: false,
+          includeRequestContext: false,
+          includeModePromptContexts: false,
+        });
+        const planState = {
+          plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
+          plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+          plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+          todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+        };
+        rememberSessionPlanState(session, planState);
+        updatePlanWorkflowForConversationAction(session, actionKind, action);
+        session.waitingForInteraction = true;
+        session.planTurnHandoff = 'create_plan';
+        updateSessionHistoryState(session, {
+          current_loop_status: 'waiting_for_interaction',
+          waiting_for_interaction: {
+            handoff: 'create_plan',
+            pending_count: 1,
+            since: new Date().toISOString(),
+          },
+          plan: planState,
+        });
+        emitPresentedPlanCheckpoint(session, logger, { force: true });
+        ack();
+        return;
+      }
+      if (isExecutePlan) {
+        ensureOpenSessionHistoryTurn(session, config, {
+          includeUserMessage: false,
+          includeRequestContext: false,
+          includeModePromptContexts: false,
+        });
+        const planState = {
+          plan: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan || '').trim(),
+          plan_text: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan_text || '').trim(),
+          plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
+          todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+        };
+        rememberSessionPlanState(session, planState);
+        updatePlanWorkflowForConversationAction(session, actionKind, action);
+        if (String(action.executionMode || '').trim()) {
+          session.agentMode = normalizeAgentModeName(action.executionMode);
+        } else if (getSessionAgentMode(session) === 'AGENT_MODE_PLAN') {
+          session.agentMode = 'AGENT_MODE_AGENT';
+        }
+        session.relaying = false;
+        session.waitingForInteraction = false;
+        session.planTurnHandoff = '';
+        session.deferredInteractionResponse = null;
+        const interactionResponse = buildSyntheticPlanExecutionResponse(session, action);
+        const pendingInteraction = clonePendingInteractionSnapshot(
+          findPendingInteractionQuery(pendingAgentInteractions, decoded.requestId, interactionResponse)
+          || buildFallbackPendingPlanExecution(session),
+        );
+        removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
+        if (pendingInteraction?.resumeState) {
+          const existingResumeMessages = Array.isArray(pendingInteraction.resumeState.upstreamMessages)
+            ? pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }))
+            : [];
+          pendingInteraction.resumeState = {
+            ...pendingInteraction.resumeState,
+            plan: planState,
+            userText: String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || '').trim(),
+            upstreamMessages: existingResumeMessages.length
+              ? existingResumeMessages
+              : buildLocalRelayMessages(String(session.lastUserMessageCapture?.userText || pendingInteraction.resumeState.userText || ''), session),
+          };
+          session.lastPlanResumeMessages = pendingInteraction.resumeState.upstreamMessages.map((message) => ({ ...message }));
+        }
+        updateSessionHistoryState(session, {
+          current_loop_status: 'running',
+          waiting_for_interaction: null,
+          plan: planState,
+        });
+        ack();
+        if (session.active && !session.aborted) {
+          resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+            .catch((error) => failAgentRelaySession(session, logger, error, 'conversation_action_execute_plan'));
+        }
+        return;
+      }
+      ack();
+      return;
+    }
+
+    if (decoded.kind === 'interaction_response' && decoded.requestId) {
+      const interactionResponse = decoded.debug?.agentClientMessage?.interactionResponse || null;
+      const matchedPendingByStableConversation = findPendingInteractionQuery(pendingAgentInteractions, decoded.requestId, interactionResponse);
+      const session = agentSessions.get(decoded.requestId)
+        || findWaitingSessionByStableConversationId(
+          agentSessions,
+          matchedPendingByStableConversation?.stableConversationId || '',
+          decoded.requestId,
+        );
+      const pendingInteraction = matchedPendingByStableConversation;
+      logger.info(
+        `agent local relay received interaction_response requestId=${decoded.requestId} interactionKind=${interactionResponse?.kind || '-'} interactionId=${Number(interactionResponse?.id) || 0} matchedPending=${pendingInteraction ? '1' : '0'} pendingKind=${pendingInteraction?.kind || '-'} pendingTool=${pendingInteraction?.toolName || '-'} payload=${JSON.stringify(interactionResponse || {})}`,
+      );
+      if (session && pendingInteraction) {
+        appendInteractionResponseToHistory(session, pendingInteraction, interactionResponse);
+        syncPresentedPlanStateFromInteractionResponse(session, interactionResponse, pendingInteraction);
+        updatePlanWorkflowForInteractionResponse(session, interactionResponse, pendingInteraction);
+      }
+      const shouldKeepWaiting = shouldKeepWaitingForInteractionResponse(pendingInteraction, interactionResponse);
+      const shouldReplayPending = shouldReplayPendingInteractionAfterResponse(pendingInteraction, interactionResponse);
+      const shouldFinalizeTurn = session && pendingInteraction
+        ? shouldFinalizeInteractionResponseTurnByMode(session, interactionResponse, pendingInteraction)
+        : false;
+      if (!shouldKeepWaiting) {
+        removePendingInteractionEntry(pendingAgentInteractions, pendingInteraction);
+      }
+      ack();
+      if (shouldFinalizeTurn && session?.active && !session.aborted) {
+        session.waitingForInteraction = true;
+        session.waitingInteractionSince = session.waitingInteractionSince || Date.now();
+        session.planTurnHandoff = String(pendingInteraction?.kind || session.planTurnHandoff || '').trim() || session.planTurnHandoff;
+        updateSessionHistoryState(session, buildCompletedInteractionStatePatchByMode(session, interactionResponse, pendingInteraction));
+        syncOfficialPlanState(session, { appendPromptContext: false });
+        emitPresentedPlanCheckpoint(session, logger, { force: true });
+        completeSessionHistory(session, 'completed', `interaction-${decoded.requestId}`);
+        finalizeWaitingInteractionSessionStream(session, logger, 'interaction_completed');
+        logger.info(
+          `agent local relay finalized interaction turn requestId=${decoded.requestId} pendingKind=${pendingInteraction?.kind || '-'} responseKind=${interactionResponse?.kind || '-'}`
+        );
+        return;
+      }
+      if (shouldKeepWaiting && session?.active && !session.aborted) {
+        session.waitingForInteraction = true;
+        session.waitingInteractionSince = session.waitingInteractionSince || Date.now();
+        session.planTurnHandoff = String(pendingInteraction?.kind || session.planTurnHandoff || '').trim() || session.planTurnHandoff;
+        const waitingStatePatch = buildCompletedInteractionStatePatchByMode(session, interactionResponse, pendingInteraction);
+        updateSessionHistoryState(session, waitingStatePatch?.current_loop_status === 'waiting_for_interaction'
+          ? waitingStatePatch
+          : {
+            current_loop_status: 'waiting_for_interaction',
+            waiting_for_interaction: {
+              handoff: String(session.planTurnHandoff || pendingInteraction?.kind || '').trim(),
+              pending_count: 1,
+              since: new Date(session.waitingInteractionSince || Date.now()).toISOString(),
+            },
+            plan: getLatestSessionPlanState(session),
+          });
+        syncOfficialPlanState(session, { appendPromptContext: false });
+        emitPresentedPlanCheckpoint(session, logger, { force: true });
+        if (shouldReplayPending) {
+          replayPendingInteractionQuery(session, pendingInteraction, logger);
+        }
+        logger.info(
+          `agent local relay kept waiting for interaction requestId=${decoded.requestId} pendingKind=${pendingInteraction?.kind || '-'} responseKind=${interactionResponse?.kind || '-'}`
+        );
+        return;
+      }
+      if (session?.active && !session.aborted && !session.relaying) {
+        resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+          .catch((error) => failAgentRelaySession(session, logger, error, 'interaction_resume'));
+      } else if (session?.active && session.relaying) {
+        session.deferredInteractionResponse = {
+          interactionResponse,
+          pendingInteraction,
+          capturedAt: new Date().toISOString(),
+        };
+        logger.info(`agent local relay deferred interaction resume requestId=${decoded.requestId} reason=session_relaying`);
+      }
+      return;
+    }
+
+    if (decoded.kind === 'run_request' && decoded.requestId) {
+      const stableConversationId = extractStableConversationId(decoded.debug || null)
+        || String(decoded.debug?.agentClientMessage?.runRequest?.stableConversationId || '').trim();
+      const session = agentSessions.get(decoded.requestId);
+      const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      if (
+        waitingSession
+        && !waitingSession.relaying
+        && waitingSession !== session
+        && shouldReuseWaitingSessionForRunRequest(waitingSession, decoded)
+      ) {
+        if (isPlaceholderRunSseSession(session)) {
+          adoptPlaceholderRunSseSession(waitingSession, session, logger);
+        }
+        rebindWaitingSessionRequestId(waitingSession, decoded.requestId, logger);
+        if (decoded.mode) waitingSession.agentMode = normalizeAgentModeName(decoded.mode);
+        if (!waitingSession.lastUserMessageCapture && stableConversationId) {
+          waitingSession.lastUserMessageCapture = {
+            capturedAt: new Date().toISOString(),
+            requestId: decoded.requestId,
+            kind: decoded.kind,
+            mode: normalizeAgentModeName(decoded.mode || waitingSession.agentMode || 'AGENT_MODE_AGENT'),
+            userText: '',
+            userTextPreview: '',
+            selectedImages: [],
+            rawLen: rawBody.length,
+            workspaceRoot: waitingSession.workspaceRoot || '',
+            stableConversationId,
+            debug: decoded.debug || null,
+          };
+        }
+        logger.info(
+          `agent local relay mapped run_request to waiting session requestId=${decoded.requestId} stableConversationId=${JSON.stringify(stableConversationId)} handoff=${waitingSession.planTurnHandoff || waitingSession.modeTurnHandoff || '-'}`
+        );
+        if (maybeHandleRunRequestConversationAction(waitingSession, decoded, config, logger, stats, pendingAgentInteractions, ack)) {
+          return;
+        }
+        ack();
+        return;
+      }
+      if (session?.active && session.waitingForInteraction && !session.relaying) {
+        if (decoded.mode) session.agentMode = normalizeAgentModeName(decoded.mode);
+        if (maybeHandleRunRequestConversationAction(session, decoded, config, logger, stats, pendingAgentInteractions, ack)) {
+          return;
+        }
+        logger.info(
+          `agent local relay waiting run_request acked requestId=${decoded.requestId} stableConversationId=${JSON.stringify(stableConversationId)} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'}`
+        );
+        ack();
+        return;
+      }
+      logger.info(
+        `agent local relay ack run_request requestId=${decoded.requestId} stableConversationId=${JSON.stringify(stableConversationId)}`
+      );
       ack();
       return;
     }
@@ -5957,16 +8392,18 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
     if (decoded.kind === 'user_message' && decoded.requestId && decoded.userText) {
       const normalizedUserText = trimRelayText(decoded.userText, 12000);
       const workspaceRoot = selectWorkspaceRootForUserMessage(decoded.debug?.workspaceRoot || '', logger, decoded.requestId);
+      const stableConversationId = extractStableConversationId(decoded.debug || null);
       const capture = {
         capturedAt: new Date().toISOString(),
         requestId: decoded.requestId,
         kind: decoded.kind,
+        mode: normalizeAgentModeName(decoded.mode || extractAgentModeFromPayload(Buffer.alloc(0))),
         userText: normalizedUserText,
         userTextPreview,
         selectedImages: Array.isArray(decoded.selectedImages) ? decoded.selectedImages : [],
         rawLen: rawBody.length,
         workspaceRoot,
-        stableConversationId: extractStableConversationId(decoded.debug || null),
+        stableConversationId,
         debug: decoded.debug || null,
       };
       const completedTurn = getCompletedAgentTurn(completedAgentTurns, decoded.requestId, normalizedUserText, workspaceRoot, decoded.debug || null);
@@ -5988,12 +8425,41 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         return;
       }
       const session = agentSessions.get(decoded.requestId);
+      const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      if (
+        waitingSession
+        && !waitingSession.relaying
+        && waitingSession !== session
+        && isSameWaitingSessionUserMessage(waitingSession, normalizedUserText)
+      ) {
+        if (isPlaceholderRunSseSession(session)) {
+          adoptPlaceholderRunSseSession(waitingSession, session, logger);
+        }
+        rebindWaitingSessionRequestId(waitingSession, decoded.requestId, logger);
+        waitingSession.agentMode = capture.mode;
+        waitingSession.lastUserMessageCapture = capture;
+        waitingSession.workspaceRoot = workspaceRoot || waitingSession.workspaceRoot || '';
+        logger.info(`agent local relay mapped new request to waiting session requestId=${decoded.requestId} previousRequestId=${waitingSession.requestId || '-'} stableConversationId=${JSON.stringify(stableConversationId)} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(waitingSession))}`);
+        ack();
+        return;
+      }
+      if (session?.active && session.waitingForInteraction && !session.relaying) {
+        session.agentMode = capture.mode;
+        session.lastUserMessageCapture = capture;
+        session.workspaceRoot = workspaceRoot || session.workspaceRoot || '';
+        logger.info(
+          `agent local relay waiting user_message acked requestId=${decoded.requestId} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))} textLen=${normalizedUserText.length}`,
+        );
+        ack();
+        return;
+      }
       if (session?.active && session.relaying) {
         logger.info(`agent local relay in-flight user_message acked requestId=${decoded.requestId} workspaceRoot=${JSON.stringify(workspaceRoot)} textLen=${normalizedUserText.length}`);
         ack();
         return;
       }
       if (session?.active) {
+        session.agentMode = capture.mode;
         session.lastUserMessageCapture = capture;
         session.workspaceRoot = workspaceRoot || session.workspaceRoot || '';
         logger.info(`agent local relay workspace requestId=${decoded.requestId} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))}`);
@@ -6048,7 +8514,7 @@ async function handleCursorChat(req, res, config, logger, stats) {
   await forwardMitmHttpsRequest(req, res, logger, rawBody);
 }
 
-async function handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns) {
+async function handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const { pathname, method, protocol } = getMitmRequestMeta(req);
   if (protocol === 'h2') stats.connectH2 = (stats.connectH2 || 0) + 1;
   trackRecentPath(stats, method, pathname);
@@ -6062,12 +8528,12 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
   }
 
   if (isAgentRunSsePath(pathname) && method === 'POST') {
-    await handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns);
+    await handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions);
     return;
   }
 
   if (isBidiAppendPath(pathname) && method === 'POST') {
-    await handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns);
+    await handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions);
     return;
   }
 
@@ -6116,6 +8582,7 @@ function startProxy(config) {
   const agentSessions = new Map();
   const pendingAgentMessages = new Map();
   const completedAgentTurns = new Map();
+  const pendingAgentInteractions = new Map();
   const stats = {
     connectTotal: 0,
     connectMitm: 0,
@@ -6184,7 +8651,7 @@ function startProxy(config) {
     if (protocol === 'h2') stats.connectH2 = (stats.connectH2 || 0) + 1;
     trackRecentPath(stats, method, pathname);
     logger.info(`mitm request ${method} ${pathname} proto=${protocol} entry=${entry}`);
-    handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns).catch((error) => {
+    handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions).catch((error) => {
       logger.error(`mitm request failed (${entry}): ${error.stack || error.message}`);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -6262,6 +8729,7 @@ function startProxy(config) {
         localNativeAgentTools: Boolean(config.localNativeAgentTools),
         structuredAgentToolCalls: Boolean(config.structuredAgentToolCalls),
         emitLocalToolInteractionFrames: config.emitLocalToolInteractionFrames !== false,
+        emitLocalStepFrames: Boolean(config.emitLocalStepFrames),
         emitSyntheticLocalNativeToolFrames: Boolean(config.emitSyntheticLocalNativeToolFrames),
         emitAgentExecServerFrames: Boolean(config.emitAgentExecServerFrames),
         maxLocalToolCallsPerRound: getMaxLocalToolCallsPerRound(config),
@@ -6360,6 +8828,13 @@ function startProxy(config) {
 
   proxyServer.listen(config.port, '127.0.0.1', () => {
     logger.info(`cursor relay proxy listening on 127.0.0.1:${config.port}`);
+    // 异步预热响应缓存（从历史对话目录加载），不阻塞启动
+    responseCache.warmupFromHistory().then(() => {
+      const stats = responseCache.getStats();
+      if (stats.entries > 0) {
+        logger.info(`response cache warmed up: ${stats.entries} entries (exact=${stats.exactEntries} fuzzy=${stats.fuzzyEntries})`);
+      }
+    }).catch(() => { /* ignore warmup errors */ });
   });
 
   process.on('SIGTERM', shutdown);

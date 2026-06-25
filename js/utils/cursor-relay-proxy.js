@@ -1,6 +1,7 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
+const { fork } = require('child_process');
 const { getCursorAppDataDir } = require('./cursor-local-state');
 const { resolveMainJsPath } = require('../../paths');
 const {
@@ -9,6 +10,7 @@ const {
   forceQuitCursorForRestart,
   quitCursorAndWait,
   launchCursorApp,
+  startNewCursorAgentConversation,
   waitForCursorWindowReady,
   reloadRunningCursorWindow,
   focusCursorAndSendChatMessage,
@@ -94,6 +96,20 @@ const PROXY_ALLOWLIST_KEYS = [
 const DEFAULT_ENABLE_REVIEW_BRIDGE = false;
 const REVIEW_BRIDGE_LAUNCH_TIMEOUT_MS = 30000;
 const RELAY_RUNTIME_STATE_PATH = path.join(getCursorAppDataDir(), 'relay-runtime-state.json');
+const PLAN_UI_MOCK_PORT = Number(process.env.CURSOR_RELAY_PLAN_UI_MOCK_PORT || 17888);
+const PLAN_UI_MOCK_SCENARIO = 'plan-full';
+const PLAN_UI_MOCK_SCRIPT = path.join(__dirname, '..', '..', 'scripts', 'mock-cursor-agent-protocol-server.cjs');
+
+let planUiMockChild = null;
+
+function getPlanUiMockLogPath() {
+  try {
+    const paths = getRunnerLogPaths();
+    return path.join(path.dirname(paths.primary), 'mock-plan-ui.log');
+  } catch {
+    return path.join(process.cwd(), 'mock-plan-ui.log');
+  }
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -194,6 +210,48 @@ function clearRelayRuntimeState() {
   }
 }
 
+function getPlanUiMockState() {
+  const state = readRelayRuntimeState();
+  const active = state.mockProxyActive === true;
+  const port = Number(state.mockProxyPort) || 0;
+  return {
+    active,
+    port,
+    scenario: String(state.mockProxyScenario || '').trim(),
+    pid: Number(state.mockProxyPid) || 0,
+    startedAt: Number(state.mockProxyStartedAt) || 0,
+    proxyServer: active && port > 0 ? `http://127.0.0.1:${port}` : '',
+  };
+}
+
+async function stopPlanUiMockProxy() {
+  const current = getPlanUiMockState();
+  const pid = Number(planUiMockChild?.pid || current.pid) || 0;
+  if (planUiMockChild && !planUiMockChild.killed) {
+    try {
+      planUiMockChild.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
+  planUiMockChild = null;
+  if (pid) {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
+  writeRelayRuntimeState({
+    mockProxyActive: false,
+    mockProxyPid: 0,
+    mockProxyPort: 0,
+    mockProxyScenario: '',
+    mockProxyStartedAt: 0,
+  });
+  return { ok: true, stopped: Boolean(pid || current.active) };
+}
+
 function readLastRelayRunnerConfig() {
   try {
     const paths = getRunnerLogPaths();
@@ -278,6 +336,8 @@ function buildRelayModelRoutesFromStore(store = {}) {
 
 function buildRelayStartOptionsFromConfig(config = null, overrides = {}) {
   const existing = config && typeof config === 'object' ? config : {};
+  const nextMode = String(overrides.mode || existing.mode || 'local_relay');
+  const isLocalRelay = nextMode === 'local_relay';
   const hasReviewBridgeOverride = Object.prototype.hasOwnProperty.call(overrides, 'enableReviewBridge');
   const maxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(
     overrides.maxLocalToolCallsPerRound
@@ -285,11 +345,14 @@ function buildRelayStartOptionsFromConfig(config = null, overrides = {}) {
       || 12,
   ) || 12)));
   return {
-    mode: String(overrides.mode || existing.mode || 'local_relay'),
+    mode: nextMode,
     directMitmPort: Number(overrides.directMitmPort ?? existing.directMitmPort) || 0,
-    localNativeAgentTools: overrides.localNativeAgentTools !== false && existing.localNativeAgentTools !== false,
-    structuredAgentToolCalls: overrides.structuredAgentToolCalls !== false && existing.structuredAgentToolCalls !== false,
-    emitLocalToolInteractionFrames: overrides.emitLocalToolInteractionFrames !== false,
+    localNativeAgentTools: isLocalRelay ? overrides.localNativeAgentTools !== false : overrides.localNativeAgentTools !== false,
+    structuredAgentToolCalls: isLocalRelay ? overrides.structuredAgentToolCalls !== false : overrides.structuredAgentToolCalls !== false,
+    emitLocalToolInteractionFrames: isLocalRelay ? overrides.emitLocalToolInteractionFrames !== false : overrides.emitLocalToolInteractionFrames !== false,
+    emitLocalStepFrames: isLocalRelay
+      ? overrides.emitLocalStepFrames !== false
+      : (overrides.emitLocalStepFrames === true || existing.emitLocalStepFrames === true),
     emitSyntheticLocalNativeToolFrames: false,
     maxLocalToolCallsPerRound,
     enableReviewBridge: hasReviewBridgeOverride
@@ -564,6 +627,7 @@ async function readCursorRelayProxyConfig(options = {}) {
     hasProxyWhitelist(fs.readFileSync(mainJsPath, 'utf8')),
   );
   const cert = getRelayCertStatusReadonly();
+  const mockProxy = getPlanUiMockState();
   const inferredPort = parseLocalProxyPort(argv.data['proxy-server'])
     || parseLocalProxyPort(systemProxy?.cursorSettings?.httpProxy)
     || DEFAULT_PORT;
@@ -619,6 +683,7 @@ async function readCursorRelayProxyConfig(options = {}) {
       noProxyServer: Boolean(argv.data['no-proxy-server']),
     },
     cert,
+    mockProxy,
     runner: {
       ...runner,
       logPath: runner.logPath || logPaths.primary,
@@ -651,6 +716,7 @@ async function readCursorRelayProxyConfig(options = {}) {
 }
 
 async function applyCursorRelayProxyConfig(payload = {}) {
+  await stopPlanUiMockProxy().catch(() => null);
   const requestedRestartCursor = payload.restartCursor === true;
   const reloadCursor = payload.reloadCursor === true && payload.allowWindowFocusSwitch === true;
   const bypassList = String(payload.proxyBypassList || DEFAULT_PROXY_BYPASS_LIST).trim() || DEFAULT_PROXY_BYPASS_LIST;
@@ -795,11 +861,11 @@ async function applyCursorRelayProxyConfig(payload = {}) {
 
   if (restartCursor && isCursorRunningHeuristic()) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
     if (isCursorRunningHeuristic()) {
       const { killCursorForce } = require('./cursor-process');
       killCursorForce();
-      await sleep(1500);
+      await sleep(500);
     }
   }
 
@@ -910,7 +976,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
         reviewBridgeWorkbenchPath: patchedWorkbenchPath,
         reviewBridgeWorkbenchMtimeMs: workbenchMtimeMs,
       });
-      await sleep(1500);
+      await sleep(800);
     }
   } else if (!runtimePatchChanged && reloadCursor && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
@@ -1144,6 +1210,8 @@ async function quickSwitchRelayModel(payload = {}) {
   const modelRoutes = buildRelayModelRoutesFromStore(store);
   const status = await readCursorRelayProxyConfig({ lightweight: true });
   const relayEnabled = Boolean(status?.enabled);
+  const currentMode = String(status?.runner?.mode || '').trim();
+  const switchingFromOfficialPassthrough = currentMode === 'official_passthrough';
   if (!relayEnabled) {
     const applied = await applyCursorRelayProxyConfig({
       upstream,
@@ -1158,6 +1226,7 @@ async function quickSwitchRelayModel(payload = {}) {
       localNativeAgentTools: true,
       structuredAgentToolCalls: true,
       emitLocalToolInteractionFrames: true,
+      emitLocalStepFrames: true,
       enableReviewBridge: status?.runner?.enableReviewBridge === true,
       skipCursorAuthEnsure: true,
     });
@@ -1179,10 +1248,22 @@ async function quickSwitchRelayModel(payload = {}) {
     installCert: false,
     useSystemProxy: false,
     disableByok: true,
-    mode: status?.runner?.mode || 'local_relay',
-    localNativeAgentTools: status?.runner?.localNativeAgentTools !== false,
-    structuredAgentToolCalls: status?.runner?.structuredAgentToolCalls !== false,
-    emitLocalToolInteractionFrames: status?.runner?.emitLocalToolInteractionFrames !== false,
+    mode: switchingFromOfficialPassthrough ? 'local_relay' : (currentMode || 'local_relay'),
+    localNativeAgentTools: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.localNativeAgentTools !== false,
+    structuredAgentToolCalls: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.structuredAgentToolCalls !== false,
+    nativeMutationTools: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.nativeMutationTools !== false,
+    emitLocalToolInteractionFrames: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.emitLocalToolInteractionFrames !== false,
+    emitLocalStepFrames: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.emitLocalStepFrames === true,
     maxLocalToolCallsPerRound: status?.runner?.maxLocalToolCallsPerRound || 12,
     enableReviewBridge: status?.runner?.enableReviewBridge === true,
     skipCursorAuthEnsure: true,
@@ -1201,12 +1282,15 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   const reloadCursor = payload.reloadCursor === true && payload.allowWindowFocusSwitch === true;
   const transparentHosts = clearTransparentHosts();
   const clearSystemProxy = payload.clearSystemProxy === true;
+  await stopPlanUiMockProxy().catch(() => null);
   clearRelayRuntimeState();
   const cursorWasRunning = isCursorRunningHeuristic();
+  const resetActiveAgentConversation = payload.resetActiveAgentConversation !== false && cursorWasRunning && !restartCursor;
+  const stopRunnerFast = payload.fast === true && !resetActiveAgentConversation;
 
   if (restartCursor && cursorWasRunning) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
   }
 
   const argv = readArgvJson();
@@ -1228,6 +1312,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   let restarted = false;
   let reloaded = false;
   let runnerStopped = false;
+  let agentConversationReset = { ok: false, skipped: true, message: '未请求切换 Agent 对话' };
   const runtimePatchChanged = Boolean(mainJsRestoreResult?.changed || reviewBridgeRestoreResult?.changed);
   if (restartCursor) {
     const launch = launchCursorApp({
@@ -1237,7 +1322,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
     await stopLocalRelayRunner();
     runnerStopped = true;
   } else if (payload.fast === true || payload.stopRunner === true || payload.stopRunner !== false) {
-    await stopLocalRelayRunner({ fast: payload.fast === true });
+    await stopLocalRelayRunner({ fast: stopRunnerFast });
     runnerStopped = true;
   } else if (!runtimePatchChanged && reloadCursor && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
@@ -1246,6 +1331,11 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   if (!restartCursor && !isCursorRunningHeuristic()) {
     await stopLocalRelayRunner();
     runnerStopped = true;
+  }
+
+  if (resetActiveAgentConversation) {
+    await sleep(80);
+    agentConversationReset = startNewCursorAgentConversation();
   }
 
   const status = await readCursorRelayProxyConfig({ lightweight: true });
@@ -1257,6 +1347,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
     runnerStopped,
     hotSwitched: !restartCursor && !runtimePatchChanged,
     requiresCursorRestart: runtimePatchChanged,
+    agentConversationReset,
     mainJsRestoreResult,
     reviewBridgeRestoreResult,
     systemProxy: systemProxyResult,
@@ -1481,7 +1572,7 @@ async function disableByokForRelay(payload = {}) {
   const restartCursor = payload.restartCursor !== false;
   if (restartCursor && isCursorRunningHeuristic()) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
   }
   const cleared = await clearModelProxyConfigOnly();
   let restarted = false;
@@ -1575,6 +1666,7 @@ async function runRelayAgentDialogTest(payload = {}) {
   }
 
   const customPrompt = String(payload?.prompt || payload?.userPrompt || payload?.message || '').trim();
+  const requestedMode = String(payload?.mode || payload?.agentMode || 'AGENT_MODE_AGENT').trim() || 'AGENT_MODE_AGENT';
   const token = customPrompt ? '' : createRelayAgentTestToken();
   const prompt = customPrompt || buildRelayAgentTestPrompt(token);
   const port = Number(runner.port || DEFAULT_PORT);
@@ -1590,6 +1682,7 @@ async function runRelayAgentDialogTest(payload = {}) {
   const probe = await runRelayAgentConnectionTest({
     port,
     prompt,
+    mode: requestedMode,
     targetHosts,
     timeoutMs: customPrompt ? directTimeoutMs : Math.min(30000, directTimeoutMs),
   });
@@ -1664,6 +1757,126 @@ async function runRelayAgentDialogTest(payload = {}) {
   };
 }
 
+async function startRelayPlanUiMock(payload = {}) {
+  const scenario = String(payload.scenario || PLAN_UI_MOCK_SCENARIO).trim() || PLAN_UI_MOCK_SCENARIO;
+  const port = Number(payload.port || PLAN_UI_MOCK_PORT) || PLAN_UI_MOCK_PORT;
+  const bypassList = String(payload.proxyBypassList || DEFAULT_PROXY_BYPASS_LIST).trim() || DEFAULT_PROXY_BYPASS_LIST;
+  const restartCursor = payload.restartCursor === true;
+  const reloadCursor = payload.reloadCursor === true && payload.allowWindowFocusSwitch === true;
+
+  await stopPlanUiMockProxy().catch(() => null);
+  await stopLocalRelayRunner({ fast: true }).catch(() => null);
+
+  const certInstallResult = installRelayCaCertificate();
+  if (!certInstallResult?.installed) {
+    throw new Error(certInstallResult?.message || 'Plan UI Mock 证书安装失败。');
+  }
+
+  patchProxySupportInMainJs();
+  try {
+    restoreRelayReviewBridgeInWorkbench();
+  } catch {
+    /* ignore */
+  }
+
+  const mockLogPath = getPlanUiMockLogPath();
+  fs.mkdirSync(path.dirname(mockLogPath), { recursive: true });
+  const mockLogHeader = [
+    `# Mock Plan UI Log`,
+    `# Started: ${new Date().toISOString()}`,
+    `# Scenario: ${scenario}`,
+    '',
+  ].join('\n');
+  fs.writeFileSync(mockLogPath, mockLogHeader, 'utf8');
+  const mockStdout = fs.openSync(mockLogPath, 'a');
+  const mockStderr = fs.openSync(mockLogPath, 'a');
+
+  const child = fork(PLAN_UI_MOCK_SCRIPT, ['--port', String(port), '--scenario', scenario], {
+    stdio: ['ignore', mockStdout, mockStderr, 'ipc'],
+    detached: true,
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+    },
+  });
+  child.on('exit', () => {
+    if (planUiMockChild && planUiMockChild.pid === child.pid) {
+      planUiMockChild = null;
+      writeRelayRuntimeState({
+        mockProxyActive: false,
+        mockProxyPid: 0,
+        mockProxyPort: 0,
+        mockProxyScenario: '',
+        mockProxyStartedAt: 0,
+      });
+    }
+  });
+  try {
+    child.unref?.();
+    child.channel?.unref?.();
+  } catch {
+    /* ignore */
+  }
+  planUiMockChild = child;
+
+  writeRelayRuntimeState({
+    mockProxyActive: true,
+    mockProxyPid: child.pid || 0,
+    mockProxyPort: port,
+    mockProxyScenario: scenario,
+    mockProxyStartedAt: Date.now(),
+  });
+
+  await sleep(1200);
+
+  const argv = readArgvJson();
+  const next = { ...argv.data };
+  next['proxy-server'] = `http://127.0.0.1:${port}`;
+  next['proxy-bypass-list'] = bypassList;
+  delete next['proxy-pac-url'];
+  delete next['no-proxy-server'];
+  const argvPath = writeArgvJson(next);
+  const cursorSettingsResult = applyCursorHttpProxySettings(`http://127.0.0.1:${port}`, {
+    disableHttp2: true,
+    proxyStrictSSL: false,
+  });
+
+  let restarted = false;
+  let reloaded = false;
+  let cursorWindowReady = null;
+  if (restartCursor && isCursorRunningHeuristic()) {
+    await quitCursorAndWait({ throwOnTimeout: false });
+    await sleep(300);
+    const relayCert = getRelayCertStatusReadonly();
+    const launch = launchCursorApp({
+      proxyServer: `http://127.0.0.1:${port}`,
+      proxyBypassList: bypassList,
+      extraCaCertPath: relayCert.caCertPath,
+    });
+    restarted = Boolean(launch?.ok);
+    cursorWindowReady = restarted ? await waitForCursorWindowReady(45000) : null;
+  } else if (reloadCursor && isCursorRunningHeuristic()) {
+    reloaded = reloadRunningCursorWindow();
+  }
+
+  const status = await readCursorRelayProxyConfig({ lightweight: true });
+  return {
+    ok: true,
+    mode: 'plan_ui_mock',
+    scenario,
+    port,
+    proxyServer: `http://127.0.0.1:${port}`,
+    argvPath,
+    restarted,
+    reloaded,
+    cursorWindowReady,
+    certInstallResult,
+    cursorSettings: cursorSettingsResult,
+    mockProxy: status.mockProxy,
+    summary: `Plan UI Mock 已启动，当前代理切到 http://127.0.0.1:${port}，场景为 ${scenario}。`,
+  };
+}
+
 module.exports = {
   DEFAULT_PROXY_BYPASS_LIST,
   getCursorArgvJsonPath,
@@ -1689,4 +1902,5 @@ module.exports = {
   buildRelayDiagnostics,
   clearModelProxyConfigOnly,
   runRelayAgentDialogTest,
+  startRelayPlanUiMock,
 };

@@ -87,6 +87,15 @@ function saveConversation(conversation) {
   writeJson(conversation.statePath, conversation.state);
 }
 
+function updateConversationState(conversation, patch = {}) {
+  if (!conversation || !patch || typeof patch !== 'object') return;
+  conversation.state = conversation.state && typeof conversation.state === 'object'
+    ? conversation.state
+    : {};
+  Object.assign(conversation.state, patch);
+  saveConversation(conversation);
+}
+
 function beginTurn(config = {}, requestId = '', workspaceRoot = '', capture = null) {
   const stableConversationId = String(capture?.stableConversationId || capture?.conversationId || '').trim();
   const conversation = loadConversation(config, stableConversationId || requestId, { requestId, workspaceRoot });
@@ -130,7 +139,11 @@ function appendHistoryItem(conversation, item = {}) {
 
 function completeTurn(conversation, options = {}) {
   if (!conversation) return;
-  conversation.state.current_loop_status = options.status || 'completed';
+  const preserveWaiting = Boolean(options.preserveWaitingForInteraction)
+    && String(conversation.state?.current_loop_status || '').trim() === 'waiting_for_interaction';
+  conversation.state.current_loop_status = preserveWaiting
+    ? 'waiting_for_interaction'
+    : (options.status || 'completed');
   conversation.state.last_provider_call = options.lastProviderCall || conversation.state.last_provider_call || null;
   appendHistoryItem(conversation, {
     role: 'system',
@@ -169,5 +182,6 @@ module.exports = {
   completeTurn,
   getConversationId,
   getHistoryRoot,
+  updateConversationState,
   updateUsage,
 };

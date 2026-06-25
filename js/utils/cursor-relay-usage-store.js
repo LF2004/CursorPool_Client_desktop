@@ -28,6 +28,7 @@ function ensureRelayUsageSchema(db) {
     db.prepare('PRAGMA table_info(relay_usage)').all().map((column) => column.name),
   );
   const migrations = [
+    ['mode', 'ALTER TABLE relay_usage ADD COLUMN mode TEXT'],
     ['billed_points', 'ALTER TABLE relay_usage ADD COLUMN billed_points REAL DEFAULT 0'],
     ['cursor_agent_account', 'ALTER TABLE relay_usage ADD COLUMN cursor_agent_account TEXT'],
     ['reasoning_effort', 'ALTER TABLE relay_usage ADD COLUMN reasoning_effort TEXT'],
@@ -52,6 +53,7 @@ function openUsageDb(customRoot) {
       created_at TEXT NOT NULL,
       request_id TEXT NOT NULL,
       conversation_id TEXT,
+      mode TEXT,
       phase TEXT,
       endpoint_mode TEXT,
       model TEXT,
@@ -210,6 +212,7 @@ function recordRelayUsage(customRoot, payload = {}) {
     created_at: createdAt,
     request_id: String(payload.requestId || ''),
     conversation_id: String(payload.conversationId || ''),
+    mode: String(payload.mode || ''),
     phase: String(payload.phase || ''),
     endpoint_mode: String(payload.endpointMode || ''),
     model: String(payload.model || ''),
@@ -248,7 +251,7 @@ function recordRelayUsage(customRoot, payload = {}) {
   };
   const stmt = db.prepare(`
     INSERT INTO relay_usage (
-      created_at, request_id, conversation_id, phase, endpoint_mode, model, model_label,
+      created_at, request_id, conversation_id, mode, phase, endpoint_mode, model, model_label,
       status, http_status, error, input_tokens, cached_input_tokens, output_tokens, total_tokens,
       input_price_per_million, cached_input_price_per_million, output_price_per_million,
       input_cost_usd, cached_input_cost_usd, output_cost_usd, total_cost_usd, points, billed_points,
@@ -256,7 +259,7 @@ function recordRelayUsage(customRoot, payload = {}) {
       upstream_base_url, price_source, price_source_url, raw_usage_json, meta_json, cursor_agent_account,
       reasoning_effort, platform_billing
     ) VALUES (
-      @created_at, @request_id, @conversation_id, @phase, @endpoint_mode, @model, @model_label,
+      @created_at, @request_id, @conversation_id, @mode, @phase, @endpoint_mode, @model, @model_label,
       @status, @http_status, @error, @input_tokens, @cached_input_tokens, @output_tokens, @total_tokens,
       @input_price_per_million, @cached_input_price_per_million, @output_price_per_million,
       @input_cost_usd, @cached_input_cost_usd, @output_cost_usd, @total_cost_usd, @points, @billed_points,
@@ -267,6 +270,18 @@ function recordRelayUsage(customRoot, payload = {}) {
   `);
   const info = stmt.run(row);
   return { ok: true, id: info.lastInsertRowid, dbPath: getUsageDbPath(customRoot), row };
+}
+
+function appendRelayUsageMeta(customRoot, usageId, extraMeta = {}) {
+  if (!usageId || !extraMeta || typeof extraMeta !== 'object') return { ok: false };
+  const db = openUsageDb(customRoot);
+  const row = db.prepare('SELECT meta_json FROM relay_usage WHERE id = ?').get(usageId);
+  if (!row) return { ok: false };
+  let existing = {};
+  try { existing = JSON.parse(row.meta_json || '{}'); } catch { /* empty */ }
+  const merged = JSON.stringify({ ...existing, ...extraMeta });
+  db.prepare('UPDATE relay_usage SET meta_json = ? WHERE id = ?').run(merged, usageId);
+  return { ok: true };
 }
 
 function deleteZeroTokenRelayUsage(customRoot) {
@@ -323,12 +338,17 @@ function syncUsageFromHistory(customRoot) {
     for (const item of completed) {
       const requestId = String(item.payload.value.request_id || item.request_id || '').trim();
       if (!requestId) continue;
+      const request = items.find((candidate) => (
+        candidate?.request_id === requestId
+        && candidate?.kind === 'user_message'
+      ));
       const exists = db.prepare('SELECT id FROM relay_usage WHERE request_id = ? LIMIT 1').get(requestId);
       if (exists) {
-        if (upstream.modelName) {
+        if (upstream.modelName || request?.payload?.mode) {
           db.prepare(`
             UPDATE relay_usage
             SET
+              mode = CASE WHEN COALESCE(mode, '') = '' THEN @mode ELSE mode END,
               model = CASE WHEN COALESCE(model, '') = '' THEN @model ELSE model END,
               endpoint_mode = CASE WHEN COALESCE(endpoint_mode, '') = '' THEN @endpointMode ELSE endpoint_mode END,
               upstream_base_url = CASE WHEN COALESCE(upstream_base_url, '') = '' THEN @baseUrl ELSE upstream_base_url END,
@@ -336,6 +356,7 @@ function syncUsageFromHistory(customRoot) {
             WHERE id = @id
           `).run({
             id: exists.id,
+            mode: String(request?.payload?.mode || ''),
             model: String(upstream.modelName || ''),
             endpointMode: String(upstream.endpointMode || ''),
             baseUrl: String(upstream.baseUrl || ''),
@@ -348,16 +369,13 @@ function syncUsageFromHistory(customRoot) {
         candidate?.request_id === requestId
         && candidate?.kind === 'assistant_text'
       ));
-      const request = items.find((candidate) => (
-        candidate?.request_id === requestId
-        && candidate?.kind === 'user_message'
-      ));
       const createdAt = String(item.created_at || assistant?.created_at || request?.created_at || context.updated_at || new Date().toISOString());
       const responseText = String(assistant?.payload?.text || '');
       const result = recordRelayUsage(customRoot, {
         createdAt,
         requestId,
         conversationId: String(context.conversation_id || ''),
+        mode: String(request?.payload?.mode || ''),
         phase: 'history',
         endpointMode: String(upstream.endpointMode || ''),
         model: String(upstream.modelName || ''),
@@ -507,6 +525,7 @@ module.exports = {
   getUsageDbPath,
   estimateCost,
   recordRelayUsage,
+  appendRelayUsageMeta,
   deleteZeroTokenRelayUsage,
   updateRelayUsageBilledPoints,
   updateRelayUsageStatusForRequest,

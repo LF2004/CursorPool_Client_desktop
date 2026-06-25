@@ -738,6 +738,24 @@ body.theme-light .log-detail { color: #374151; }
   flex: 0 0 auto;
   margin-left: auto;
 }
+.usage-view-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.42);
+  border: 1px solid rgba(71, 85, 105, 0.42);
+}
+.usage-view-toggle .ghost-btn {
+  min-height: 36px;
+  padding: 8px 12px;
+}
+.usage-view-toggle .ghost-btn.active {
+  background: rgba(var(--accent-rgb), 0.18);
+  border-color: rgba(var(--accent-rgb), 0.55);
+  color: rgba(255, 255, 255, 0.96);
+}
 .usage-filter-card .input,
 .usage-filter-card .ghost-btn,
 .usage-filter-card .record-btn-danger {
@@ -1093,7 +1111,7 @@ body.theme-light .log-detail { color: #374151; }
 }
 .usage-link:hover { text-decoration: underline; }
 .usage-table {
-  min-width: calc(1060px * var(--app-font-scale, 1));
+  min-width: calc(1180px * var(--app-font-scale, 1));
 }
 .usage-table.record-table th {
   font-size: var(--usage-table-head-font-size);
@@ -1128,25 +1146,136 @@ body.theme-light .log-detail { color: #374151; }
   min-width: calc(160px * var(--app-font-scale, 1));
 }
 .usage-table th:nth-child(3) {
+  width: calc(96px * var(--app-font-scale, 1));
+  min-width: calc(96px * var(--app-font-scale, 1));
+}
+.usage-table th:nth-child(4) {
   width: calc(84px * var(--app-font-scale, 1));
   min-width: calc(84px * var(--app-font-scale, 1));
   white-space: nowrap;
   padding-left: calc(2px * var(--app-font-scale, 1));
   padding-right: calc(4px * var(--app-font-scale, 1));
 }
-.usage-table th:nth-child(4) { width: 118px; }
 .usage-table th:nth-child(5) {
+  width: 118px;
+}
+.usage-table th:nth-child(6) {
   width: calc(210px * var(--app-font-scale, 1));
   min-width: calc(210px * var(--app-font-scale, 1));
 }
-.usage-table th:nth-child(6) {
+.usage-table th:nth-child(7) {
   width: calc(118px * var(--app-font-scale, 1));
   min-width: calc(118px * var(--app-font-scale, 1));
 }
-.usage-table th:nth-child(7) { width: 88px; }
-.usage-table th:nth-child(8) {
+.usage-table th:nth-child(8) { width: 88px; }
+.usage-table th:nth-child(9) {
+  width: 90px;
+  min-width: 90px;
+}
+.usage-table th:nth-child(10) {
   width: 140px;
   min-width: 140px;
+}
+/* 隐藏 detail-only 列：阶段、缓存、Request */
+.usage-page[data-usage-view="compact"] .usage-table [data-usage-col="phase"],
+.usage-page[data-usage-view="compact"] .usage-table [data-usage-col="cache"],
+.usage-page[data-usage-view="compact"] .usage-table [data-usage-col="request"],
+.usage-page[data-usage-view="compact"] .usage-phase-cell,
+.usage-page[data-usage-view="compact"] .usage-cache-cell,
+.usage-page[data-usage-view="compact"] .usage-request {
+  display: none;
+}
+.usage-page[data-usage-view="compact"] .usage-token-content {
+  gap: calc(3px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-token-row {
+  gap: calc(3px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-cost-main {
+  gap: calc(3px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-info-btn {
+  width: calc(18px * var(--app-font-scale, 1));
+  height: calc(18px * var(--app-font-scale, 1));
+  font-size: calc(11px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-th-help {
+  margin-left: 2px;
+  font-size: calc(11px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table.record-table th {
+  padding: calc(6px * var(--app-font-scale, 1)) calc(6px * var(--app-font-scale, 1));
+  font-size: calc(12px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table.record-table td {
+  padding: calc(3px * var(--app-font-scale, 1)) calc(6px * var(--app-font-scale, 1));
+  font-size: var(--usage-table-compact-font-size);
+}
+.usage-page[data-usage-view="compact"] .usage-table.record-table-paged tbody tr,
+.usage-page[data-usage-view="compact"] .usage-table tbody tr {
+  min-height: calc(34px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table th:nth-child(4) {
+  padding-left: calc(1px * var(--app-font-scale, 1));
+  padding-right: calc(2px * var(--app-font-scale, 1));
+}
+.usage-page[data-usage-view="compact"] .usage-table th:nth-child(6) {
+  width: calc(150px * var(--app-font-scale, 1));
+  min-width: calc(150px * var(--app-font-scale, 1));
+}
+.usage-mode-cell {
+  white-space: nowrap;
+}
+.usage-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 60px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.12);
+  border: 1px solid rgba(var(--accent-rgb), 0.34);
+  color: rgba(255, 255, 255, 0.95);
+  font-size: var(--usage-table-compact-font-size);
+  font-weight: 600;
+}
+
+/* ---- 缓存命中状态样式 ---- */
+.usage-cache-hit-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  border-radius: 4px;
+  background: #0F6E56;
+  color: #E1F5EE;
+  font-size: 10px;
+  vertical-align: middle;
+}
+.usage-cache-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #0F6E56;
+  color: #E1F5EE;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  vertical-align: middle;
+}
+.usage-cache-detail {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #0F6E56;
+  font-size: var(--usage-table-compact-font-size);
+}
+.usage-cache-detail i { color: #0F6E56; }
+.usage-row-cache-hit {
+  background: rgba(15, 110, 86, 0.06);
 }
 .usage-table td.usage-time {
   overflow: visible;
@@ -1332,8 +1461,10 @@ body.theme-light .log-detail { color: #374151; }
 }
 .usage-status-ok { color: #34d399; }
 .usage-status-paid { color: #fbbf24; }
+.usage-status-cache { color: #0F6E56; font-weight: 700; }
 .usage-status-stop { color: #94a3b8; }
 .usage-status-warn { color: #f87171; }
+.usage-cost-cache { color: #0F6E56; }
 .usage-popover {
   position: fixed;
   z-index: 9999;
@@ -1523,7 +1654,9 @@ body.theme-light .usage-popover-total .mono { color: #059669; }
   .usage-filter-actions {
     margin-left: 0;
     width: 100%;
+    flex-wrap: wrap;
   }
+  .usage-view-toggle,
   .usage-filter-actions .ghost-btn,
   .usage-filter-actions .record-btn-danger {
     flex: 1 1 0;

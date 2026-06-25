@@ -83,6 +83,7 @@ contextBridge.exposeInMainWorld('electronBridge', {
   cursorRelayReadLog: () => ipcRenderer.invoke('cursorRelay:readLog'),
   cursorRelayDiagnose: () => ipcRenderer.invoke('cursorRelay:diagnose'),
   cursorRelayTestAgent: (payload) => ipcRenderer.invoke('cursorRelay:testAgent', payload),
+  cursorRelayStartPlanUiMock: (payload) => ipcRenderer.invoke('cursorRelay:startPlanUiMock', payload),
   cursorRelayOpenLog: () => ipcRenderer.invoke('cursorRelay:openLog'),
   cursorRelayOpenDiagnose: () => ipcRenderer.invoke('cursorRelay:openDiagnose'),
   cursorRelayOpenLogDir: () => ipcRenderer.invoke('cursorRelay:openLogDir'),

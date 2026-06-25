@@ -84,6 +84,7 @@ function requestHttpViaProxy(target, proxy, options, signal) {
     }, (res) => {
       resolve(createNodeResponse(res, target.href));
     });
+    req.on('error', reject);
 
     const abort = () => {
       req.destroy(makeAbortError());
@@ -97,7 +98,6 @@ function requestHttpViaProxy(target, proxy, options, signal) {
       req.on('close', () => signal.removeEventListener('abort', abort));
     }
 
-    req.on('error', reject);
     if (options.body !== undefined && options.body !== null) req.end(options.body);
     else req.end();
   });
@@ -123,6 +123,7 @@ function requestHttpsViaProxy(target, proxy, options, signal) {
       path: `${target.hostname}:${targetPort}`,
       headers: connectHeaders,
     });
+    connectReq.on('error', reject);
 
     const abort = () => {
       const error = makeAbortError();
@@ -170,8 +171,6 @@ function requestHttpsViaProxy(target, proxy, options, signal) {
       });
       secureSocket.on('error', reject);
     });
-
-    connectReq.on('error', reject);
     connectReq.end();
   });
 }
