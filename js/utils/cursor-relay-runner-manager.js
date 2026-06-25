@@ -328,10 +328,11 @@ async function waitForRunnerHealth(port, options = {}) {
   const isExpected = typeof options.isExpected === 'function' ? options.isExpected : null;
   for (let i = 0; i < attempts; i += 1) {
     // eslint-disable-next-line no-await-in-loop
-    const health = await probeRunnerHealth(port);
+    const health = await probeRunnerHealth(port, i < 6 ? 120 : 250);
     if (health.ok && (!isExpected || isExpected(health))) return health;
+    // 前 8 次用短间隔(40ms)加速启动探测，之后用配置间隔
     // eslint-disable-next-line no-await-in-loop
-    await sleep(delayMs);
+    await sleep(i < 8 ? 40 : delayMs);
   }
   const finalHealth = await probeRunnerHealth(port);
   if (finalHealth.ok && isExpected && !isExpected(finalHealth)) {
@@ -562,18 +563,18 @@ async function stopLocalRelayRunner(payload = {}) {
     };
   }
 
-  await requestRunnerShutdown(port, 700).catch(() => null);
+  await requestRunnerShutdown(port, 400).catch(() => null);
 
   pidSet.forEach((pid) => {
     terminateRunnerPid(pid, { force: false });
   });
 
-  let down = await waitForRunnerDown(port, 8, 100);
+  let down = await waitForRunnerDown(port, 6, 60);
   if (!down) {
     pidSet.forEach((pid) => {
       terminateRunnerPid(pid, { force: true });
     });
-    down = await waitForRunnerDown(port, 6, 120);
+    down = await waitForRunnerDown(port, 4, 80);
   }
 
   return {

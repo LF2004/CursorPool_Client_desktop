@@ -42,6 +42,7 @@ const RELAY_BUTTON_IDS = [
   'relayViewLogBtn',
   'relayDiagnoseBtn',
   'relayPlanUiMockBtn',
+  'relayExploreUiMockBtn',
   'relayOfficialCaptureBtn',
   'relayDisableByokBtn',
   'relayTestAllBtn',
@@ -1298,7 +1299,7 @@ async function enablePlanUiMock() {
   }
 
   const ok = await showConfirm(
-    '将启动固定 `plan-full` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是验证前端是否能完整渲染 Ask -> 只读探索（通常会显示为 `Explored 1 directory, 4 searches`）-> Plan -> Build 卡片，不依赖真实模型与真实调度。\n\n继续？',
+    '将启动固定 `plan-full` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是验证稳定的 Plan UI 链路：Ask -> 只读探索 -> Plan -> Build。像 Explore 子对话这类不确定 UI，请放到单独实验场景验证，不混入默认 Mock。\n\n继续？',
     { title: 'Plan UI Mock', tone: 'info', confirmText: '启动 Mock' },
   );
   if (!ok) return;
@@ -1319,7 +1320,7 @@ async function enablePlanUiMock() {
           result?.summary || 'Plan UI Mock 已启动。',
           '',
           '下一步请在 Cursor Agent 中发送任意一条消息。',
-          '如果前端仍然没有出现只读探索汇总卡片或 Build 卡片，就基本可以确定是 UI 帧兼容/渲染链路问题。',
+          '如果前端仍然没有出现只读探索汇总卡片或 Build 卡片，就基本可以确定是默认 Plan UI 渲染链路问题。',
         ].filter(Boolean).join('\n'),
         { title: 'Plan UI Mock 已就绪', tone: 'success' },
       );
@@ -1333,10 +1334,56 @@ async function enablePlanUiMock() {
   }, { fullscreen: true });
 }
 
+async function enableExploreUiMock() {
+  const bridge = window.electronBridge;
+  if (!bridge?.cursorRelayStartPlanUiMock) {
+    await showAlert('当前客户端不支持 Explore UI Mock 调试。', {
+      title: 'Explore UI Mock',
+      tone: 'danger',
+    });
+    return;
+  }
+
+  const ok = await showConfirm(
+    '将启动固定 `explore-only` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是只验证 Explore 相关 UI，本场景不再复现 Ask / Plan / Build，只观察前端是否会生成独立的探索卡片或子对话入口。\n\n继续？',
+    { title: 'Explore UI Mock', tone: 'info', confirmText: '启动 Mock' },
+  );
+  if (!ok) return;
+
+  await withRelayBusy('正在启动 Explore UI Mock…', async () => {
+    try {
+      const result = await bridge.cursorRelayStartPlanUiMock({
+        scenario: 'multitask',
+        restartCursor: false,
+        reloadCursor: true,
+        allowWindowFocusSwitch: true,
+      });
+      relayEnabled = true;
+      updateRelayToggleButton(true, true);
+      await refreshRelayStatus();
+      await showAlert(
+        [
+          result?.summary || 'Explore UI Mock 已启动。',
+          '',
+          '下一步请在 Cursor Agent 中发送任意一条消息。',
+          '重点观察前端是否会为探索阶段生成独立卡片、可点击入口或新的总结子对话。',
+        ].filter(Boolean).join('\n'),
+        { title: 'Explore UI Mock 已就绪', tone: 'success' },
+      );
+    } catch (error) {
+      await refreshRelayStatus().catch(() => null);
+      await showAlert(error.message || String(error), {
+        title: 'Explore UI Mock 启动失败',
+        tone: 'danger',
+      });
+    }
+  }, { fullscreen: true });
+}
+
 function describeUserStatusHint(local, localState = null) {
   if (local?.mockProxy?.active) {
     const proxyServer = String(local?.mockProxy?.proxyServer || '').trim();
-    return `Plan UI Mock 已接管当前 Cursor 代理${proxyServer ? `（${proxyServer}）` : ''}。现在请直接在 Cursor Agent 里发送一条消息，观察 Ask -> 只读探索汇总 -> Plan -> Build UI 是否完整出现。`;
+    return `Plan UI Mock 已接管当前 Cursor 代理${proxyServer ? `（${proxyServer}）` : ''}。现在请直接在 Cursor Agent 里发送一条消息，观察默认的 Ask -> 只读探索汇总 -> Plan -> Build UI 是否完整出现。`;
   }
   if (localState && !localState.cursorLoggedIn) {
     return 'Cursor 尚未登录。启用 Relay 时会自动检测，并从 desktop/js/utils/users.json 写入本地免登账号。';
@@ -1619,6 +1666,10 @@ function bindRelayLogButtons() {
   const relayPlanUiMockBtn = $('relayPlanUiMockBtn');
   if (relayPlanUiMockBtn) {
     relayPlanUiMockBtn.onclick = () => enablePlanUiMock().catch(() => {});
+  }
+  const relayExploreUiMockBtn = $('relayExploreUiMockBtn');
+  if (relayExploreUiMockBtn) {
+    relayExploreUiMockBtn.onclick = () => enableExploreUiMock().catch(() => {});
   }
 }
 

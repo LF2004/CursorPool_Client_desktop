@@ -272,6 +272,18 @@ function recordRelayUsage(customRoot, payload = {}) {
   return { ok: true, id: info.lastInsertRowid, dbPath: getUsageDbPath(customRoot), row };
 }
 
+function appendRelayUsageMeta(customRoot, usageId, extraMeta = {}) {
+  if (!usageId || !extraMeta || typeof extraMeta !== 'object') return { ok: false };
+  const db = openUsageDb(customRoot);
+  const row = db.prepare('SELECT meta_json FROM relay_usage WHERE id = ?').get(usageId);
+  if (!row) return { ok: false };
+  let existing = {};
+  try { existing = JSON.parse(row.meta_json || '{}'); } catch { /* empty */ }
+  const merged = JSON.stringify({ ...existing, ...extraMeta });
+  db.prepare('UPDATE relay_usage SET meta_json = ? WHERE id = ?').run(merged, usageId);
+  return { ok: true };
+}
+
 function deleteZeroTokenRelayUsage(customRoot) {
   const db = openUsageDb(customRoot);
   const info = db.prepare(`
@@ -513,6 +525,7 @@ module.exports = {
   getUsageDbPath,
   estimateCost,
   recordRelayUsage,
+  appendRelayUsageMeta,
   deleteZeroTokenRelayUsage,
   updateRelayUsageBilledPoints,
   updateRelayUsageStatusForRequest,

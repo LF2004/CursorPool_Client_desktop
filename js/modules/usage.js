@@ -24,7 +24,7 @@ let pendingUsageRows = null;
 let pendingUsageApply = null;
 
 function getUsageVisibleColumnCount() {
-  return usageViewState.mode === USAGE_VIEW_MODES.detail ? 9 : 7;
+  return usageViewState.mode === USAGE_VIEW_MODES.detail ? 10 : 7;
 }
 
 function formatUsageModeLabel(value) {
@@ -137,10 +137,6 @@ function renderPriceSources(data = {}) {
   const links = sources.map((item) => (
     `<a href="#" class="usage-link" data-external-url="${escapeHtml(item.url)}">${escapeHtml(item.label)}</a>`
   )).join(' / ');
-  const el = $('usagePriceSource');
-  if (!el) return;
-  const html = `价格按 ${links} 官方 API Pricing 估算 · 线上调用计入卡密额度，本地代理仅记录 Token 与费用估算`;
-  if (el.innerHTML !== html) el.innerHTML = html;
 }
 
 const CACHE_GAUGE_ARC_LENGTH = 157.08;
@@ -435,25 +431,45 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
   const isDetail = usageViewState.mode === USAGE_VIEW_MODES.detail;
   body.innerHTML = rows.map((row) => {
     const status = String(row.status || 'unknown');
-    const statusClass = status === 'success'
-      ? 'usage-status-ok'
-      : ['paid', 'pending'].includes(status)
-        ? 'usage-status-paid'
-        : ['stop', 'stopped', 'aborted', 'cancelled', 'canceled'].includes(status)
-          ? 'usage-status-stop'
-          : 'usage-status-warn';
-    const statusLabel = status.toUpperCase();
+    // 解析缓存命中状态（优先从 status 字段判断，再从 meta_json 兜底）
+    let cacheHit = null;
+    if (status === 'cache_hit') {
+      try { cacheHit = JSON.parse(row.meta_json || '{}').cacheHit || { layer: 'unknown' }; } catch { cacheHit = { layer: 'unknown' }; }
+    } else {
+      try { cacheHit = JSON.parse(row.meta_json || '{}').cacheHit || null; } catch { /* ignore */ }
+    }
+    const isCacheHit = !!cacheHit || status === 'cache_hit';
+    const cacheLayer = cacheHit?.layer || '';
+    const statusClass = isCacheHit
+      ? 'usage-status-cache'
+      : status === 'success'
+        ? 'usage-status-ok'
+        : ['paid', 'pending'].includes(status)
+          ? 'usage-status-paid'
+          : ['stop', 'stopped', 'aborted', 'cancelled', 'canceled'].includes(status)
+            ? 'usage-status-stop'
+            : 'usage-status-warn';
+    const statusLabel = isCacheHit ? (cacheLayer ? `${cacheLayer.toUpperCase()} CACHE` : 'CACHE') : status.toUpperCase();
     const reasoningEffort = String(row.reasoning_effort || '').trim();
     const phase = String(row.phase || '-');
     const endpointMode = String(row.endpoint_mode || '').trim();
     const modeLabel = formatUsageModeLabel(row.mode);
+    // 缓存命中：费用归零显示，token 显示缓存标记
+    const displayCost = isCacheHit ? '$0.000000' : formatUsd(row.total_cost_usd);
+    // 构建状态单元格（含缓存标记）
+    const statusCellHtml = `<span class="usage-status ${statusClass}" title="${escapeHtml(row.error || '')}">${escapeHtml(statusLabel)}</span>`
+      + (isCacheHit
+        ? ` <span class="usage-cache-hit-badge" title="缓存回放 (${cacheLayer})"><i class="fa fa-bolt" aria-hidden="true"></i></span>`
+        : ''
+      );
     return `
-      <tr>
+      <tr class="${isCacheHit ? 'usage-row-cache-hit' : ''}">
         <td class="mono usage-time">${escapeHtml(formatDate(row.created_at))}</td>
         <td class="usage-model-cell">
           <div class="usage-model mono" title="${escapeHtml(row.model || '')}">${escapeHtml(row.model || '-')}</div>
           <div class="usage-model-meta">
             ${row.model_label ? `<span class="usage-muted">${escapeHtml(row.model_label)}</span>` : ''}
+            ${isCacheHit && !isDetail ? `<span class="usage-cache-tag usage-muted">CACHE</span>` : ''}
           </div>
         </td>
         <td class="usage-mode-cell"><span class="usage-mode-badge">${escapeHtml(modeLabel)}</span></td>
@@ -479,8 +495,8 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
         </td>
         <td class="usage-cost-cell">
           <div class="usage-cost-main">
-            <span class="usage-cost-value mono">${formatUsd(row.total_cost_usd)}</span>
-            <button type="button" class="usage-info-btn" aria-label="费用明细" data-popover="cost"
+            <span class="usage-cost-value mono${isCacheHit ? ' usage-cost-cache' : ''}">${displayCost}</span>
+            ${!isCacheHit ? `<button type="button" class="usage-info-btn" aria-label="费用明细" data-popover="cost"
               data-input-cost="${Number(row.input_cost_usd) || 0}"
               data-cached-input-cost="${Number(row.cached_input_cost_usd) || 0}"
               data-output-cost="${Number(row.output_cost_usd) || 0}"
@@ -492,10 +508,14 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
               data-points="${Number(row.billed_points) || Number(row.points) || 0}"
               data-price-source="${escapeHtml(row.price_source || '')}">
               <i class="fa fa-question-circle" aria-hidden="true"></i>
-            </button>
+            </button>` : ''}
           </div>
         </td>
-        <td><span class="usage-status ${statusClass}" title="${escapeHtml(row.error || '')}">${escapeHtml(statusLabel)}</span></td>
+        <td>${statusCellHtml}</td>
+        ${isDetail ? `<td class="usage-cache-cell">${isCacheHit
+          ? `<span class="usage-cache-detail" title="本地缓存回放，跳过上游请求"><i class="fa fa-bolt" aria-hidden="true"></i> <strong>${cacheLayer.toUpperCase()}</strong> 命中</span>`
+          : '<span class="usage-muted">-</span>'
+        }</td>` : ''}
         ${isDetail ? `<td class="mono usage-request" title="${escapeHtml(row.request_id || '')}">${escapeHtml(row.request_id || '-')}</td>` : ''}
       </tr>
     `;

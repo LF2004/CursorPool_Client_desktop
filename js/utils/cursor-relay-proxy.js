@@ -102,6 +102,15 @@ const PLAN_UI_MOCK_SCRIPT = path.join(__dirname, '..', '..', 'scripts', 'mock-cu
 
 let planUiMockChild = null;
 
+function getPlanUiMockLogPath() {
+  try {
+    const paths = getRunnerLogPaths();
+    return path.join(path.dirname(paths.primary), 'mock-plan-ui.log');
+  } catch {
+    return path.join(process.cwd(), 'mock-plan-ui.log');
+  }
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function restartCursorAfterRelayCertChange(payload = {}) {
@@ -852,11 +861,11 @@ async function applyCursorRelayProxyConfig(payload = {}) {
 
   if (restartCursor && isCursorRunningHeuristic()) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
     if (isCursorRunningHeuristic()) {
       const { killCursorForce } = require('./cursor-process');
       killCursorForce();
-      await sleep(1500);
+      await sleep(500);
     }
   }
 
@@ -967,7 +976,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
         reviewBridgeWorkbenchPath: patchedWorkbenchPath,
         reviewBridgeWorkbenchMtimeMs: workbenchMtimeMs,
       });
-      await sleep(1500);
+      await sleep(800);
     }
   } else if (!runtimePatchChanged && reloadCursor && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
@@ -1281,7 +1290,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
 
   if (restartCursor && cursorWasRunning) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
   }
 
   const argv = readArgvJson();
@@ -1325,7 +1334,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   }
 
   if (resetActiveAgentConversation) {
-    await sleep(250);
+    await sleep(80);
     agentConversationReset = startNewCursorAgentConversation();
   }
 
@@ -1563,7 +1572,7 @@ async function disableByokForRelay(payload = {}) {
   const restartCursor = payload.restartCursor !== false;
   if (restartCursor && isCursorRunningHeuristic()) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
   }
   const cleared = await clearModelProxyConfigOnly();
   let restarted = false;
@@ -1770,8 +1779,20 @@ async function startRelayPlanUiMock(payload = {}) {
     /* ignore */
   }
 
+  const mockLogPath = getPlanUiMockLogPath();
+  fs.mkdirSync(path.dirname(mockLogPath), { recursive: true });
+  const mockLogHeader = [
+    `# Mock Plan UI Log`,
+    `# Started: ${new Date().toISOString()}`,
+    `# Scenario: ${scenario}`,
+    '',
+  ].join('\n');
+  fs.writeFileSync(mockLogPath, mockLogHeader, 'utf8');
+  const mockStdout = fs.openSync(mockLogPath, 'a');
+  const mockStderr = fs.openSync(mockLogPath, 'a');
+
   const child = fork(PLAN_UI_MOCK_SCRIPT, ['--port', String(port), '--scenario', scenario], {
-    stdio: 'ignore',
+    stdio: ['ignore', mockStdout, mockStderr, 'ipc'],
     detached: true,
     env: {
       ...process.env,
@@ -1825,7 +1846,7 @@ async function startRelayPlanUiMock(payload = {}) {
   let cursorWindowReady = null;
   if (restartCursor && isCursorRunningHeuristic()) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
     const relayCert = getRelayCertStatusReadonly();
     const launch = launchCursorApp({
       proxyServer: `http://127.0.0.1:${port}`,

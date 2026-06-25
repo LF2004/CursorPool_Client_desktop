@@ -63,7 +63,7 @@ function parseArgs(argv) {
 function printHelp() {
   console.log([
     'Usage:',
-    '  node scripts/mock-cursor-agent-protocol-server.cjs [--port 17888] [--scenario all-tools|edit-stream|file-ops|complex-multifile|minimal|plan-full|plan-explore-task] [--delay 180] [--native-exec] [--dry-run] [--self-test]',
+    '  node scripts/mock-cursor-agent-protocol-server.cjs [--port 17888] [--scenario all-tools|edit-stream|file-ops|complex-multifile|minimal|plan-full|plan-explore-task|explore-only|multitask] [--delay 180] [--native-exec] [--dry-run] [--self-test]',
     '',
     'What it does:',
     '  Starts a temporary HTTP CONNECT proxy that intercepts Cursor Agent RunSSE/BidiAppend',
@@ -104,6 +104,26 @@ function isBidiAppendPath(pathname) {
   return /\/aiserver\.v1\.BidiService\/BidiAppend$/i.test(pathname);
 }
 
+function isTaskInitPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskInit$/i.test(pathname);
+}
+
+function isTaskStreamLogPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskStreamLog$/i.test(pathname);
+}
+
+function isTaskSendMessagePath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskSendMessage$/i.test(pathname);
+}
+
+function isTaskProvideResultPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskProvideResult$/i.test(pathname);
+}
+
+function isTaskGetInterfaceAgentStatusPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskGetInterfaceAgentStatus$/i.test(pathname);
+}
+
 function safeWriteHead(res, status, headers) {
   if (!res.headersSent) res.writeHead(status, headers);
 }
@@ -116,6 +136,7 @@ function writeProtoAck(res) {
 function sendControlPlaneStub(req, res) {
   const pathname = getPathname(req);
   const method = getMethod(req);
+  console.log(`[mock-agent] control-plane stub ${method} ${pathname}`);
   if (method === 'GET') {
     safeWriteHead(res, 200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: true, mock: true, path: pathname }));
@@ -154,6 +175,338 @@ function buildCompleted(toolName, args, execution, ids) {
   return buildAgentToolCallCompletedFrame(toolName, args, ids.callId, ids.modelCallId, {
     execution,
   });
+}
+
+function connectFrame(type, body) {
+  const payload = Buffer.isBuffer(body) ? body : Buffer.from(body || []);
+  const header = Buffer.allocUnsafe(5);
+  header[0] = Number(type) || 0;
+  header.writeUInt32BE(payload.length, 1);
+  return Buffer.concat([header, payload]);
+}
+
+function encodeFieldTag(fieldNumber, wireType) {
+  return encodeVarint(((Number(fieldNumber) || 0) << 3) | (Number(wireType) || 0));
+}
+
+function encodeVarintField(fieldNumber, value) {
+  return concatBytes([
+    encodeFieldTag(fieldNumber, 0),
+    encodeVarint(Number(value) || 0),
+  ]);
+}
+
+function encodeStringField(fieldNumber, value) {
+  const text = String(value || '');
+  if (!text) return Buffer.alloc(0);
+  return encodeBytesField(fieldNumber, text);
+}
+
+function encodeMessageField(fieldNumber, payload) {
+  const bytes = Buffer.isBuffer(payload) ? payload : Buffer.from(payload || []);
+  if (!bytes.length) return Buffer.alloc(0);
+  return encodeBytesField(fieldNumber, bytes);
+}
+
+function buildRawAgentServerMessageField(fieldNumber, innerPayload) {
+  return connectFrame(0, encodeMessage([{ field: fieldNumber, value: innerPayload }]));
+}
+
+function encodeTokenDetailsStructure(options = {}) {
+  return concatBytes([
+    encodeVarintField(1, Number(options.usedTokens) || 1),
+    encodeVarintField(2, Number(options.maxTokens) || 200000),
+  ]);
+}
+
+function encodeSubagentTypeExploreStructure() {
+  return encodeMessageField(4, Buffer.alloc(0));
+}
+
+function encodeConversationStateStructure(options = {}) {
+  const rootPromptMessagesJson = Array.isArray(options.rootPromptMessagesJson) ? options.rootPromptMessagesJson : [];
+  const turns = Array.isArray(options.turns) ? options.turns : [];
+  const pendingToolCalls = Array.isArray(options.pendingToolCalls) ? options.pendingToolCalls : [];
+  const todos = Array.isArray(options.todos) ? options.todos : [];
+  const previousWorkspaceUris = Array.isArray(options.previousWorkspaceUris) ? options.previousWorkspaceUris : [];
+  const readPaths = Array.isArray(options.readPaths) ? options.readPaths : [];
+  const subagentStates = options.subagentStates && typeof options.subagentStates === 'object'
+    ? options.subagentStates
+    : {};
+
+  return concatBytes([
+    ...rootPromptMessagesJson.map((item) => encodeMessageField(
+      1,
+      Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'),
+    )),
+    ...todos.map((item) => encodeMessageField(
+      3,
+      Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'),
+    )),
+    ...pendingToolCalls.map((item) => encodeStringField(4, item)),
+    encodeMessageField(5, encodeTokenDetailsStructure(options)),
+    typeof options.summary === 'string' && options.summary
+      ? encodeMessageField(6, Buffer.from(options.summary, 'base64'))
+      : Buffer.alloc(0),
+    typeof options.plan === 'string' && options.plan
+      ? encodeMessageField(7, Buffer.from(options.plan, 'base64'))
+      : Buffer.alloc(0),
+    ...turns.map((item) => encodeMessageField(
+      8,
+      Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'),
+    )),
+    ...previousWorkspaceUris.map((item) => encodeStringField(9, item)),
+    encodeVarintField(10, Number(options.mode) || 1),
+    encodeVarintField(17, Number(options.selfSummaryCount) || 0),
+    ...readPaths.map((item) => encodeStringField(18, item)),
+    ...Object.entries(subagentStates).map(([subagentId, state]) => encodeMessageField(16, encodeMessage([
+      { field: 1, value: String(subagentId || '') },
+      { field: 2, value: encodeSubagentPersistedStateStructure(state) },
+    ]))),
+  ]);
+}
+
+function encodeSubagentPersistedStateStructure(options = {}) {
+  return concatBytes([
+    encodeMessageField(1, encodeConversationStateStructure({
+      ...options.conversationState,
+      subagentStates: {},
+    })),
+    encodeVarintField(2, Number(options.createdTimestampMs) || Date.now()),
+    encodeVarintField(3, Number(options.lastUsedTimestampMs) || Number(options.createdTimestampMs) || Date.now()),
+    options.subagentType?.explore ? encodeMessageField(4, encodeSubagentTypeExploreStructure()) : Buffer.alloc(0),
+    encodeStringField(5, options.modelId || ''),
+    Number(options.environment) ? encodeVarintField(6, Number(options.environment)) : Buffer.alloc(0),
+  ]);
+}
+
+function buildTaskInteractionQueryFrame(argumentsValue = {}, toolCallId = '', queryId = 1) {
+  const subagentType = argumentsValue?.subagent_type || argumentsValue?.subagentType || {};
+  const argsPayload = concatBytes([
+    encodeStringField(1, argumentsValue?.description || ''),
+    encodeStringField(2, argumentsValue?.prompt || ''),
+    subagentType && (subagentType.explore || /explore/i.test(String(subagentType)))
+      ? encodeMessageField(3, encodeStringField(1, 'explore'))
+      : Buffer.alloc(0),
+    encodeStringField(4, toolCallId),
+  ]);
+  const taskQueryPayload = concatBytes([
+    encodeMessageField(1, argsPayload),
+    encodeStringField(2, toolCallId),
+  ]);
+  const interactionQuery = concatBytes([
+    encodeVarintField(1, Math.max(1, Number(queryId) || 1)),
+    encodeMessageField(19, taskQueryPayload),
+  ]);
+  return buildRawAgentServerMessageField(7, interactionQuery);
+}
+
+function buildConversationCheckpointWithSubagentsFrame(options = {}) {
+  return buildRawAgentServerMessageField(3, encodeConversationStateStructure(options));
+}
+
+function encodeProtoString(fieldNumber, value) {
+  return encodeStringField(fieldNumber, value);
+}
+
+function encodeProtoBool(fieldNumber, value) {
+  if (!value) return Buffer.alloc(0);
+  return encodeVarintField(fieldNumber, 1);
+}
+
+function encodeTaskInitResponse(taskUuid, title) {
+  return encodeMessage([
+    { field: 1, value: String(taskUuid || '') },
+    { field: 2, value: String(title || '') },
+  ]);
+}
+
+function encodeTaskLogOutput(text) {
+  return encodeMessage([
+    { field: 1, value: String(text || '') },
+  ]);
+}
+
+function encodeTaskLogThought(text) {
+  return encodeMessage([
+    { field: 1, value: String(text || '') },
+  ]);
+}
+
+function encodeTaskLogItem(options = {}) {
+  const sequenceNumber = Number(options.sequenceNumber) || 1;
+  const itemType = String(options.type || '').trim();
+  let logItemPayload = Buffer.alloc(0);
+  let fieldNumber = 0;
+  if (itemType === 'thought') {
+    fieldNumber = 5;
+    logItemPayload = encodeTaskLogThought(options.text || '');
+  } else {
+    fieldNumber = 3;
+    logItemPayload = encodeTaskLogOutput(options.text || '');
+  }
+  return encodeMessage([
+    { field: 1, value: encodeVarint(sequenceNumber) },
+    ...(options.isNotDone ? [{ field: 2, value: encodeVarint(1) }] : []),
+    { field: fieldNumber, value: logItemPayload },
+  ]);
+}
+
+function encodeTaskStreamInfoUpdate(title, taskStatus = 2) {
+  return encodeMessage([
+    { field: 1, value: encodeStringField(1, title) + encodeVarintField(2, taskStatus) },
+  ]);
+}
+
+function encodeTaskStreamInitialTaskInfo(taskUuid, title) {
+  return encodeMessage([
+    { field: 1, value: String(taskUuid || '') },
+    { field: 2, value: String(title || '') },
+  ]);
+}
+
+function encodeTaskStreamResponse(responseFieldNumber, payload) {
+  return connectFrame(0, encodeMessage([
+    {
+      field: responseFieldNumber,
+      value: Buffer.isBuffer(payload) ? payload : Buffer.from(payload || []),
+    },
+  ]));
+}
+
+function safeTaskId(value, fallback = 'task') {
+  const text = String(value || '').trim();
+  return (text || fallback).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 120) || fallback;
+}
+
+function decodePrintableStrings(body) {
+  const buffer = Buffer.from(body || []);
+  const matches = buffer.toString('utf8').match(/[ -~]{4,}/g);
+  return Array.isArray(matches) ? matches : [];
+}
+
+function findTaskUuidInBody(body) {
+  const strings = decodePrintableStrings(body);
+  return strings.find((item) => /^mock-task-|^multitask-|^task_/i.test(String(item || '').trim())) || '';
+}
+
+function ensureMockTaskState(state, taskUuid, title = '') {
+  if (!state.mockTasks) state.mockTasks = new Map();
+  const stableTaskUuid = String(taskUuid || '').trim() || `mock-task-${Date.now().toString(36)}`;
+  let existing = state.mockTasks.get(stableTaskUuid);
+  if (existing) return existing;
+  existing = {
+    taskUuid: stableTaskUuid,
+    title: title || 'Multitask subagent',
+    createdAt: Date.now(),
+    log: [
+      { sequenceNumber: 1, type: 'thought', text: 'Subagent started and is inspecting the assigned task.', isNotDone: true },
+      { sequenceNumber: 2, type: 'output', text: 'Scanning local mock traces and protocol notes...', isNotDone: true },
+      { sequenceNumber: 3, type: 'output', text: 'Subagent finished and returned a compact summary to the parent agent.', isNotDone: false },
+    ],
+  };
+  state.mockTasks.set(stableTaskUuid, existing);
+  return existing;
+}
+
+function encodeTaskGetInterfaceAgentStatusWrappedBackgroundTaskUuid(taskUuid) {
+  return connectFrame(0, encodeMessage([
+    { field: 2, value: String(taskUuid || '') },
+  ]));
+}
+
+async function handleTaskInit(req, res, state) {
+  const body = await readRequestBody(req);
+  const strings = decodePrintableStrings(body);
+  const hintedTitle = strings.find((item) => /task|agent|explore|protocol|ui/i.test(item)) || 'Mock Multitask Subagent';
+  const task = ensureMockTaskState(
+    state,
+    `mock-task-${safeTaskId(hintedTitle, Date.now().toString(36))}`,
+    hintedTitle,
+  );
+  const payload = encodeTaskInitResponse(task.taskUuid, task.title);
+  safeWriteHead(res, 200, { 'Content-Type': 'application/proto' });
+  res.end(payload);
+  console.log(`[mock-agent] TaskInit taskUuid=${task.taskUuid} title=${JSON.stringify(task.title)}`);
+}
+
+async function handleTaskStreamLog(req, res, state) {
+  const body = await readRequestBody(req);
+  const taskUuid = findTaskUuidInBody(body) || Array.from(state.mockTasks?.keys?.() || [])[0] || '';
+  const task = ensureMockTaskState(state, taskUuid, 'Mock Multitask Subagent');
+  safeWriteHead(res, 200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connect-Protocol-Version': '1',
+    'X-Accel-Buffering': 'no',
+  });
+  const frames = [
+    encodeTaskStreamResponse(3, encodeTaskStreamInitialTaskInfo(task.taskUuid, task.title)),
+    encodeTaskStreamResponse(2, encodeStringField(1, task.title) + encodeVarintField(2, 2)),
+    ...task.log.map((item) => encodeTaskStreamResponse(1, encodeTaskLogItem(item))),
+  ];
+  frames.forEach((frame, index) => {
+    setTimeout(() => {
+      try {
+        if (!res.destroyed) res.write(frame);
+        if (index === frames.length - 1 && !res.destroyed) {
+          setTimeout(() => {
+            try {
+              res.end();
+            } catch {
+              /* ignore */
+            }
+          }, 80);
+        }
+      } catch {
+        /* ignore */
+      }
+    }, index * Math.max(60, Math.floor((state.options?.delayMs || 180) / 2)));
+  });
+  console.log(`[mock-agent] TaskStreamLog taskUuid=${task.taskUuid} frames=${frames.length}`);
+}
+
+async function handleTaskSendMessage(req, res, state) {
+  const body = await readRequestBody(req);
+  const taskUuid = findTaskUuidInBody(body) || Array.from(state.mockTasks?.keys?.() || [])[0] || '';
+  const task = ensureMockTaskState(state, taskUuid, 'Mock Multitask Subagent');
+  safeWriteHead(res, 200, { 'Content-Type': 'application/proto' });
+  res.end(Buffer.alloc(0));
+  console.log(`[mock-agent] TaskSendMessage taskUuid=${task.taskUuid}`);
+}
+
+async function handleTaskProvideResult(req, res, state) {
+  const body = await readRequestBody(req);
+  const taskUuid = findTaskUuidInBody(body) || Array.from(state.mockTasks?.keys?.() || [])[0] || '';
+  const task = ensureMockTaskState(state, taskUuid, 'Mock Multitask Subagent');
+  safeWriteHead(res, 200, { 'Content-Type': 'application/proto' });
+  res.end(Buffer.alloc(0));
+  console.log(`[mock-agent] TaskProvideResult taskUuid=${task.taskUuid}`);
+}
+
+async function handleTaskGetInterfaceAgentStatus(req, res, state) {
+  const body = await readRequestBody(req);
+  const taskUuid = findTaskUuidInBody(body) || Array.from(state.mockTasks?.keys?.() || [])[0] || '';
+  const task = ensureMockTaskState(state, taskUuid, 'Mock Multitask Subagent');
+  safeWriteHead(res, 200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connect-Protocol-Version': '1',
+    'X-Accel-Buffering': 'no',
+  });
+  try {
+    if (!res.destroyed) res.write(encodeTaskGetInterfaceAgentStatusWrappedBackgroundTaskUuid(task.taskUuid));
+    setTimeout(() => {
+      try {
+        if (!res.destroyed) res.end();
+      } catch {
+        /* ignore */
+      }
+    }, 80);
+  } catch {
+    /* ignore */
+  }
+  console.log(`[mock-agent] TaskGetInterfaceAgentStatus taskUuid=${task.taskUuid}`);
 }
 
 function buildMinimalScenario() {
@@ -510,6 +863,463 @@ function buildPlanExploreTaskScenario() {
     ...frames.slice(0, insertAt),
     ...exploreFrames,
     ...frames.slice(insertAt),
+  ];
+}
+
+function buildExploreOnlyScenario() {
+  const workspaceRoot = 'E:\\project\\h5-test';
+  const taskIds = toolIds('task_explore');
+  const lsIds = toolIds('ls');
+  const globPackageIds = toolIds('glob_package');
+  const globIndexIds = toolIds('glob_index');
+  const globSrcIds = toolIds('glob_src');
+  const globReadmeIds = toolIds('glob_readme');
+  return [
+    { label: 'heartbeat_1', frame: buildAgentHeartbeatFrame() },
+    { label: 'step_started_1', frame: buildAgentStepStartedFrame(1) },
+    { label: 'thinking_explore', frame: buildAgentThinkingDeltaFrame('Mock explore-only flow: try to surface the standalone exploration UI without Ask or Plan.') },
+    {
+      label: 'partial_task_explore',
+      frame: buildAgentPartialToolCallFrame('Task', {
+        description: 'Explore project structure',
+        prompt: 'Inspect the workspace structure and summarize the key files relevant to the current task.',
+        subagent_type: { explore: 'explore' },
+      }, taskIds.callId, taskIds.modelCallId),
+    },
+    {
+      label: 'started_task_explore',
+      frame: buildAgentToolCallStartedFrame('Task', {
+        description: 'Explore project structure',
+        prompt: 'Inspect the workspace structure and summarize the key files relevant to the current task.',
+        subagent_type: { explore: 'explore' },
+      }, taskIds.callId, taskIds.modelCallId),
+    },
+    {
+      label: 'completed_task_explore',
+      frame: buildCompleted('Task', {
+        description: 'Explore project structure',
+        prompt: 'Inspect the workspace structure and summarize the key files relevant to the current task.',
+        subagent_type: { explore: 'explore' },
+      }, {
+        ok: true,
+        tool: 'Task',
+        args: {
+          description: 'Explore project structure',
+          prompt: 'Inspect the workspace structure and summarize the key files relevant to the current task.',
+          subagent_type: { explore: 'explore' },
+        },
+        resultText: 'Explore task completed: Explore project structure.\nFound package.json and src/ modules relevant to the current task.',
+        conversationSteps: [
+          {
+            assistant_message: {
+              text: 'Inspected the workspace and identified package.json, src/app.js, and src/data.js as the most relevant files.',
+            },
+          },
+        ],
+        agentId: `explore-${Date.now().toString(36)}`,
+        isBackground: false,
+        durationMs: 1,
+      }, taskIds),
+    },
+    { label: 'partial_ls', frame: buildAgentPartialToolCallFrame('Ls', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
+    { label: 'started_ls', frame: buildAgentToolCallStartedFrame('Ls', { path: workspaceRoot }, lsIds.callId, lsIds.modelCallId) },
+    {
+      label: 'exec_ls',
+      frame: buildAgentExecLsFrame({
+        id: lsIds.callId,
+        execId: lsIds.callId,
+        numericId: 1,
+        toolCallId: lsIds.callId,
+        path: workspaceRoot,
+        ignore: ['node_modules'],
+      }),
+    },
+    {
+      label: 'completed_ls',
+      frame: buildCompleted('Ls', { path: workspaceRoot }, {
+        ok: true,
+        tool: 'Ls',
+        args: { path: workspaceRoot },
+        resultText: [
+          `ls success path=${workspaceRoot} files=2`,
+          '[dir] src',
+          '[file] package.json',
+        ].join('\n'),
+        durationMs: 1,
+      }, lsIds),
+    },
+    {
+      label: 'partial_glob_package',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'package.json',
+      }, globPackageIds.callId, globPackageIds.modelCallId),
+    },
+    {
+      label: 'started_glob_package',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'package.json',
+      }, globPackageIds.callId, globPackageIds.modelCallId),
+    },
+    {
+      label: 'completed_glob_package',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'package.json',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: 'package.json',
+        },
+        resultText: 'package.json',
+        durationMs: 1,
+      }, globPackageIds),
+    },
+    {
+      label: 'partial_glob_index',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'index.html',
+      }, globIndexIds.callId, globIndexIds.modelCallId),
+    },
+    {
+      label: 'started_glob_index',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'index.html',
+      }, globIndexIds.callId, globIndexIds.modelCallId),
+    },
+    {
+      label: 'completed_glob_index',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'index.html',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: 'index.html',
+        },
+        resultText: 'No files matched "index.html" under E:\\project\\h5-test.',
+        noMatches: true,
+        durationMs: 1,
+      }, globIndexIds),
+    },
+    {
+      label: 'partial_glob_src',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'src/**',
+      }, globSrcIds.callId, globSrcIds.modelCallId),
+    },
+    {
+      label: 'started_glob_src',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'src/**',
+      }, globSrcIds.callId, globSrcIds.modelCallId),
+    },
+    {
+      label: 'completed_glob_src',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'src/**',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: 'src/**',
+        },
+        resultText: 'src/app.js\nsrc/data.js',
+        durationMs: 1,
+      }, globSrcIds),
+    },
+    {
+      label: 'partial_glob_readme',
+      frame: buildAgentPartialToolCallFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'README*',
+      }, globReadmeIds.callId, globReadmeIds.modelCallId),
+    },
+    {
+      label: 'started_glob_readme',
+      frame: buildAgentToolCallStartedFrame('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'README*',
+      }, globReadmeIds.callId, globReadmeIds.modelCallId),
+    },
+    {
+      label: 'completed_glob_readme',
+      frame: buildCompleted('Glob', {
+        target_directory: workspaceRoot,
+        glob_pattern: 'README*',
+      }, {
+        ok: true,
+        tool: 'Glob',
+        args: {
+          target_directory: workspaceRoot,
+          glob_pattern: 'README*',
+        },
+        resultText: 'No files matched "README*" under E:\\project\\h5-test.',
+        noMatches: true,
+        durationMs: 1,
+      }, globReadmeIds),
+    },
+    { label: 'step_completed_1', frame: buildAgentStepCompletedFrame(1, 180) },
+    { label: 'turn_end', frame: buildAgentTurnEndedFrame() },
+    { label: 'connect_end', frame: buildConnectEndFrame({ mock: true, scenario: 'explore-only' }) },
+  ];
+}
+
+function buildMultitaskScenario() {
+  const workspaceRoot = 'E:\\project\\CursorPool_Client_desktop';
+  const taskExploreIds = toolIds('task_explore');
+  const taskProtocolIds = toolIds('task_protocol');
+  const taskUiIds = toolIds('task_ui');
+  const createdTimestampMs = Date.now();
+  const subagentExploreId = `multitask-explore-${createdTimestampMs.toString(36)}`;
+  const subagentProtocolId = `multitask-protocol-${(createdTimestampMs + 1).toString(36)}`;
+  const subagentUiId = `multitask-ui-${(createdTimestampMs + 2).toString(36)}`;
+  const subagentReadPaths = {
+    [subagentExploreId]: [
+      'C:\\Users\\Administrator\\.cursorpool\\relay\\samples',
+      `${workspaceRoot}\\skills\\cursor.md`,
+    ],
+    [subagentProtocolId]: [
+      `${workspaceRoot}\\skills\\cursor.md`,
+      `${workspaceRoot}\\js\\utils\\cursor-relay-protocol.js`,
+    ],
+    [subagentUiId]: [
+      'D:\\cursor\\resources\\app\\out\\vs\\workbench\\workbench.desktop.main.js',
+      `${workspaceRoot}\\html\\tab-advanced.html`,
+      `${workspaceRoot}\\js\\modules\\proxy.js`,
+    ],
+  };
+
+  const exploreArgs = {
+    description: 'Explore sample traces',
+    prompt: 'Inspect the local relay samples and summarize how parent request IDs and subagent-like follow-up requests appear linked in the captured traffic.',
+    subagent_type: { explore: 'explore' },
+  };
+  const protocolArgs = {
+    description: 'Trace task protocol',
+    prompt: 'Inspect the local reverse-engineering notes and summarize how TaskInit, TaskSendMessage, and TaskProvideResult map to a parent agent spawning subagents.',
+    subagent_type: { explore: 'explore' },
+  };
+  const uiArgs = {
+    description: 'Draft multitask UI',
+    prompt: 'Inspect the local workbench notes and summarize how a replica UI should distinguish manual New Agent from Task-based multitask fan-out.',
+    subagent_type: { explore: 'explore' },
+  };
+
+  return [
+    { label: 'heartbeat_1', frame: buildAgentHeartbeatFrame() },
+    { label: 'step_started_1', frame: buildAgentStepStartedFrame(1) },
+    {
+      label: 'thinking_multitask',
+      frame: buildAgentThinkingDeltaFrame('Mock multitask flow: clarify that manual New Agent is separate, then fan out three Task subagents and summarize their results back into the parent agent.'),
+    },
+    {
+      label: 'text_intro',
+      frame: buildAgentTextDeltaFrame('Mock Multitask scenario: manual New Agent is a separate UI entry. The frames below simulate the parent agent using Task to fan out parallel subagents and then backfeed a concise summary.'),
+    },
+
+    { label: 'partial_task_explore', frame: buildAgentPartialToolCallFrame('Task', exploreArgs, taskExploreIds.callId, taskExploreIds.modelCallId) },
+    { label: 'started_task_explore', frame: buildAgentToolCallStartedFrame('Task', exploreArgs, taskExploreIds.callId, taskExploreIds.modelCallId) },
+    { label: 'query_task_explore', frame: buildTaskInteractionQueryFrame(exploreArgs, taskExploreIds.callId, 1) },
+    { label: 'partial_task_protocol', frame: buildAgentPartialToolCallFrame('Task', protocolArgs, taskProtocolIds.callId, taskProtocolIds.modelCallId) },
+    { label: 'started_task_protocol', frame: buildAgentToolCallStartedFrame('Task', protocolArgs, taskProtocolIds.callId, taskProtocolIds.modelCallId) },
+    { label: 'query_task_protocol', frame: buildTaskInteractionQueryFrame(protocolArgs, taskProtocolIds.callId, 2) },
+    { label: 'partial_task_ui', frame: buildAgentPartialToolCallFrame('Task', uiArgs, taskUiIds.callId, taskUiIds.modelCallId) },
+    { label: 'started_task_ui', frame: buildAgentToolCallStartedFrame('Task', uiArgs, taskUiIds.callId, taskUiIds.modelCallId) },
+    { label: 'query_task_ui', frame: buildTaskInteractionQueryFrame(uiArgs, taskUiIds.callId, 3) },
+    {
+      label: 'checkpoint_multitask_active',
+      frame: buildConversationCheckpointWithSubagentsFrame({
+        mode: 1,
+        workspaceRoot,
+        usedTokens: 1432,
+        maxTokens: 200000,
+        readPaths: [
+          `${workspaceRoot}\\scripts\\mock-cursor-agent-protocol-server.cjs`,
+          `${workspaceRoot}\\js\\utils\\cursor-relay-protocol.js`,
+          'D:\\cursor\\resources\\app\\out\\vs\\workbench\\workbench.desktop.main.js',
+        ],
+        subagentStates: {
+          [subagentExploreId]: {
+            createdTimestampMs,
+            lastUsedTimestampMs: createdTimestampMs + 21,
+            subagentType: { explore: {} },
+            modelId: 'gpt-5',
+            conversationState: {
+              mode: 2,
+              usedTokens: 54816,
+              maxTokens: 200000,
+              readPaths: subagentReadPaths[subagentExploreId],
+            },
+          },
+          [subagentProtocolId]: {
+            createdTimestampMs: createdTimestampMs + 1,
+            lastUsedTimestampMs: createdTimestampMs + 32,
+            subagentType: { explore: {} },
+            modelId: 'gpt-5',
+            conversationState: {
+              mode: 2,
+              usedTokens: 38112,
+              maxTokens: 200000,
+              readPaths: subagentReadPaths[subagentProtocolId],
+            },
+          },
+          [subagentUiId]: {
+            createdTimestampMs: createdTimestampMs + 2,
+            lastUsedTimestampMs: createdTimestampMs + 44,
+            subagentType: { explore: {} },
+            modelId: 'gpt-5',
+            conversationState: {
+              mode: 2,
+              usedTokens: 29504,
+              maxTokens: 200000,
+              readPaths: subagentReadPaths[subagentUiId],
+            },
+          },
+        },
+      }),
+    },
+
+    {
+      label: 'completed_task_explore',
+      frame: buildCompleted('Task', exploreArgs, {
+        ok: true,
+        tool: 'Task',
+        args: exploreArgs,
+        resultText: 'Subagent summary: the relay samples show linked request IDs, where a later request can carry the earlier parent request ID and continue the same higher-level objective.',
+        conversationSteps: [
+          {
+            assistant_message: {
+              text: 'Inspected relay samples. Observed a second request carrying the earlier request ID, which matches a parent task spawning or resuming a child flow rather than a totally separate conversation.',
+            },
+          },
+        ],
+        agentId: subagentExploreId,
+        isBackground: false,
+        durationMs: 1,
+      }, taskExploreIds),
+    },
+    {
+      label: 'completed_task_protocol',
+      frame: buildCompleted('Task', protocolArgs, {
+        ok: true,
+        tool: 'Task',
+        args: protocolArgs,
+        resultText: 'Subagent summary: official Cursor task orchestration is centered on TaskInit, TaskSendMessage, and TaskProvideResult, which looks like the parent/child agent handoff protocol.',
+        conversationSteps: [
+          {
+            assistant_message: {
+              text: 'Inspected the task protocol notes. The child agent lifecycle appears to be created by TaskInit, advanced via TaskSendMessage, and summarized back via TaskProvideResult.',
+            },
+          },
+        ],
+        agentId: subagentProtocolId,
+        isBackground: false,
+        durationMs: 1,
+      }, taskProtocolIds),
+    },
+    {
+      label: 'completed_task_ui',
+      frame: buildCompleted('Task', uiArgs, {
+        ok: true,
+        tool: 'Task',
+        args: uiArgs,
+        resultText: 'Subagent summary: the replica UI should separate manual New Agent sessions from Task-generated subagents, and show only Task results flowing back into the parent timeline.',
+        conversationSteps: [
+          {
+            assistant_message: {
+              text: 'Drafted the replica UI shape: one section for manual New Agent sessions, one section for active Task subagents, and a parent summary area that only ingests Task results.',
+            },
+          },
+        ],
+        agentId: subagentUiId,
+        isBackground: false,
+        durationMs: 1,
+      }, taskUiIds),
+    },
+    {
+      label: 'checkpoint_multitask',
+      frame: buildConversationCheckpointWithSubagentsFrame({
+        mode: 1,
+        workspaceRoot,
+        usedTokens: 2118,
+        maxTokens: 200000,
+        readPaths: [
+          `${workspaceRoot}\\scripts\\mock-cursor-agent-protocol-server.cjs`,
+          `${workspaceRoot}\\js\\utils\\cursor-relay-protocol.js`,
+          `${workspaceRoot}\\html\\tab-advanced.html`,
+          `${workspaceRoot}\\js\\modules\\proxy.js`,
+          'C:\\Users\\Administrator\\.cursorpool\\relay\\samples',
+          'D:\\cursor\\resources\\app\\out\\vs\\workbench\\workbench.desktop.main.js',
+        ],
+        subagentStates: {
+          [subagentExploreId]: {
+            createdTimestampMs,
+            lastUsedTimestampMs: createdTimestampMs + 90,
+            subagentType: { explore: {} },
+            modelId: 'gpt-5',
+            conversationState: {
+              mode: 2,
+              usedTokens: 55392,
+              maxTokens: 200000,
+              readPaths: subagentReadPaths[subagentExploreId],
+            },
+          },
+          [subagentProtocolId]: {
+            createdTimestampMs: createdTimestampMs + 1,
+            lastUsedTimestampMs: createdTimestampMs + 96,
+            subagentType: { explore: {} },
+            modelId: 'gpt-5',
+            conversationState: {
+              mode: 2,
+              usedTokens: 38704,
+              maxTokens: 200000,
+              readPaths: subagentReadPaths[subagentProtocolId],
+            },
+          },
+          [subagentUiId]: {
+            createdTimestampMs: createdTimestampMs + 2,
+            lastUsedTimestampMs: createdTimestampMs + 104,
+            subagentType: { explore: {} },
+            modelId: 'gpt-5',
+            conversationState: {
+              mode: 2,
+              usedTokens: 30144,
+              maxTokens: 200000,
+              readPaths: subagentReadPaths[subagentUiId],
+            },
+          },
+        },
+      }),
+    },
+    { label: 'step_completed_1', frame: buildAgentStepCompletedFrame(1, 240) },
+    { label: 'step_started_2', frame: buildAgentStepStartedFrame(2) },
+    {
+      label: 'text_summary',
+      frame: buildAgentTextDeltaFrame(
+        [
+          'Parent agent summary:',
+          '- Manual New Agent is a separate UI action for opening a standalone agent conversation.',
+          '- Multitask is better modeled as the parent agent issuing multiple Task calls in parallel.',
+          '- Each Task returns a compact result, and the parent agent is the one that synthesizes those results into the final answer.',
+        ].join('\n'),
+      ),
+    },
+    { label: 'token', frame: buildAgentTokenDeltaFrame(22) },
+    { label: 'step_completed_2', frame: buildAgentStepCompletedFrame(2, 120) },
+    { label: 'turn_end', frame: buildAgentTurnEndedFrame() },
+    { label: 'connect_end', frame: buildConnectEndFrame({ mock: true, scenario: 'multitask' }) },
   ];
 }
 
@@ -945,6 +1755,8 @@ function buildScenario(name, options = {}) {
   if (scenario === 'minimal') return buildMinimalScenario(options);
   if (scenario === 'plan-full') return buildPlanFullScenario(options);
   if (scenario === 'plan-explore-task') return buildPlanExploreTaskScenario(options);
+  if (scenario === 'explore-only') return buildExploreOnlyScenario(options);
+  if (scenario === 'multitask') return buildMultitaskScenario(options);
   if (scenario === 'edit-stream') return buildEditStreamScenario(options);
   if (scenario === 'file-ops') return buildFileOpsScenario(options);
   if (scenario === 'complex-multifile') return buildComplexMultifileScenario(options);
@@ -1282,6 +2094,26 @@ async function handleTlsRequest(req, res, state) {
     await handleBidiAppend(req, res, state);
     return;
   }
+  if (method === 'POST' && isTaskInitPath(pathname)) {
+    await handleTaskInit(req, res, state);
+    return;
+  }
+  if (method === 'POST' && isTaskStreamLogPath(pathname)) {
+    await handleTaskStreamLog(req, res, state);
+    return;
+  }
+  if (method === 'POST' && isTaskSendMessagePath(pathname)) {
+    await handleTaskSendMessage(req, res, state);
+    return;
+  }
+  if (method === 'POST' && isTaskProvideResultPath(pathname)) {
+    await handleTaskProvideResult(req, res, state);
+    return;
+  }
+  if (method === 'POST' && isTaskGetInterfaceAgentStatusPath(pathname)) {
+    await handleTaskGetInterfaceAgentStatus(req, res, state);
+    return;
+  }
   sendControlPlaneStub(req, res);
 }
 
@@ -1291,6 +2123,7 @@ function startProxy(options) {
     options,
     sessions: new Map(),
     pendingUserMessages: new Map(),
+    mockTasks: new Map(),
   };
   const tlsServer = http2.createSecureServer({
     key: fs.readFileSync(cert.leafKeyPath),

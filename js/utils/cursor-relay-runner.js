@@ -6,6 +6,7 @@ const https = require('https');
 const net = require('net');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
+const responseCache = require('./relay-response-cache');
 
 const {
   decodeCursorChatRequest,
@@ -84,6 +85,7 @@ const {
 } = require('../mode/plan-workflow');
 const {
   recordRelayUsage,
+  appendRelayUsageMeta,
   updateRelayUsageBilledPoints,
   updateRelayUsageStatusForRequest,
 } = require('./cursor-relay-usage-store');
@@ -722,6 +724,18 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
     const status = String(details.status || '');
     const requestId = session.requestId || '';
     const platformBilling = isPlatformBillingEnabled(config);
+    const isCacheHit = !!session._cacheHit;
+    // 缓存命中：status 标记为 cache_hit，费用/token 归零，上游无消耗
+    const effectiveStatus = isCacheHit
+      ? 'cache_hit'
+      : (status === 'success' ? (platformBilling ? 'paid' : 'success') : status);
+    // 构建基础 meta
+    let meta = details.meta || null;
+    if (isCacheHit) {
+      const cacheMeta = { ...meta, cacheHit: { layer: session._cacheHit.layer, cachedAt: session._cacheHit.cachedAt } };
+      meta = cacheMeta;
+      session._cacheHit = null; // 用完清除，避免重复写入
+    }
     const recorded = recordRelayUsage(getConfigCustomRoot(config), {
       requestId,
       conversationId: session.conversationId || '',
@@ -729,21 +743,33 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
       phase: details.phase || '',
       endpointMode: details.endpointMode || config.upstream?.endpointMode || '',
       model: details.model || config.upstream?.modelName || '',
-      status: status === 'success' ? (platformBilling ? 'paid' : 'success') : status,
-      httpStatus: details.httpStatus || 0,
-      error: details.error || '',
-      usage,
+      status: effectiveStatus,
+      httpStatus: isCacheHit ? 0 : (details.httpStatus || 0),
+      error: isCacheHit ? '' : (details.error || ''),
+      usage: isCacheHit ? {} : usage,
       durationMs: details.durationMs || 0,
       promptChars: details.promptChars || 0,
       responseTextChars: details.responseTextChars || 0,
       reasoningChars: details.reasoningChars || 0,
       toolCalls: details.toolCalls || 0,
       upstreamBaseUrl: config.upstream?.baseUrl || '',
-      meta: details.meta || null,
+      meta,
       cursorAgentAccount: resolveCurrentCursorAgentAccount(),
       reasoningEffort: details.reasoningEffort || config.upstream?.reasoningEffort || '',
       platformBilling,
     });
+    // 缓存命中的 meta 已在写入时内嵌（上面的 meta 对象），不需要二次 append
+    // 非缓存命中但有 _cacheHit 残留的兜底路径
+    if (!isCacheHit && session._cacheHit && recorded?.id) {
+      try {
+        appendRelayUsageMeta(
+          getConfigCustomRoot(config),
+          recorded.id,
+          { cacheHit: { layer: session._cacheHit.layer, cachedAt: session._cacheHit.cachedAt } },
+        );
+        session._cacheHit = null;
+      } catch { /* ignore */ }
+    }
     if (platformBilling && status === 'success' && hasPositiveUsageTokens(usage)) {
       reportAdvancedModelUsage(config, {
         requestId,
@@ -789,6 +815,19 @@ function markUpstreamUsageCompleted(session, config, status = 'success', error =
 
 async function fetchUpstreamCompletion(upstream, modelName, messages, logger, options = {}) {
   const attempts = buildUpstreamAttempts(upstream, modelName, messages, options);
+
+  // ---- 响应缓存：查询（命中则直接回放，跳过上游请求） ----
+  const cacheKeys = responseCache.buildCacheKeys(modelName, messages, options);
+  if (cacheKeys && !(options.signal && options.signal.aborted)) {
+    const hit = responseCache.get(cacheKeys);
+    if (hit) {
+      logger?.info?.(
+        `agent local relay cache HIT requestId=${requestId} phase=${phase} layer=${hit.layer} hits=${hit.entry.hits || 0}`,
+      );
+      return { response: responseCache.buildCachedResponse(hit.entry), mode: 'cache' };
+    }
+  }
+
   let lastError = null;
   let lastResponse = null;
   const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : UPSTREAM_FETCH_TIMEOUT_MS;
@@ -829,7 +868,12 @@ async function fetchUpstreamCompletion(upstream, modelName, messages, logger, op
       logger?.info?.(
         `agent local relay upstream fetch headers requestId=${requestId} phase=${phase} mode=${attempt.label} status=${response.status} ok=${response.ok ? '1' : '0'} contentType=${String(response.headers.get('content-type') || '-')}`,
       );
-      if (response.ok) return { response, mode: attempt.label };
+      if (response.ok) {
+        if (cacheKeys && response && typeof response === 'object') {
+          response._cacheKeys = cacheKeys;
+        }
+        return { response, mode: attempt.label };
+      }
 
       const bodyText = await response.text().catch(() => '');
       lastResponse = { status: response.status, text: bodyText, mode: attempt.label };
@@ -2514,17 +2558,44 @@ function failAgentRelaySession(session, logger, error, label = 'async') {
   session.activeUpstreamResponse = null;
   logger?.error?.(`agent local relay ${label} failed requestId=${requestId}: ${error?.stack || message}`);
   try {
-    const userVisible = `Relay failed: ${message}`;
+    // Decide whether this is an interruption of in-progress work (→ unfinished,
+    // context preserved, client can resume) or a genuine hard failure (→ failed).
+    // Use ONLY hard structural signals — no natural-language intent guessing:
+    //   - tools actually executed this turn (toolResultSummaries non-empty)
+    //   - pending tool calls never dispatched
+    //   - structured todo state with incomplete items
+    //   - the error itself is a recoverable transient network/gateway error
+    const toolResultCount = Array.isArray(session.toolResultSummaries) ? session.toolResultSummaries.length : 0;
+    const pendingToolCount = Array.isArray(session.pendingToolCalls) ? session.pendingToolCalls.length : 0;
+    const incompleteTodoCount = getIncompleteTodos(session).length;
+    const hadWorkInProgress = toolResultCount > 0
+      || pendingToolCount > 0
+      || incompleteTodoCount > 0
+      || Boolean(session.unfinishedWorkAtEnd);
+    const recoverable = isRecoverableStreamError(message) || isRecoverableStreamError(summarizeFetchError(error));
+    const treatAsUnfinished = hadWorkInProgress || recoverable;
+    const userVisible = treatAsUnfinished
+      ? `上游连接中断（${message}）。本轮已进行的工作已保留，任务未确认完成，可继续。`
+      : `Relay failed: ${message}`;
     appendSessionHistory(session, {
       role: 'assistant',
       kind: 'assistant_text',
-      payload: { text: userVisible, error: true },
+      payload: { text: userVisible, error: !treatAsUnfinished, interrupted: treatAsUnfinished },
     });
     writeAgentTextFrame(session, userVisible);
     writeAgentFrame(session, buildAgentTurnEndedFrame());
     session.turnEnded = true;
-    markUpstreamUsageCompleted(session, session.config, 'failed', message);
-    completeSessionHistory(session, 'failed', `error-${session.requestId || ''}`);
+    if (treatAsUnfinished) {
+      session.unfinishedWorkAtEnd = true;
+      const userText = String(session.lastUserMessageCapture?.userText || '').trim();
+      if (userText) rememberUnfinishedAgentTask(session, userText, message);
+      markUpstreamUsageCompleted(session, session.config, 'unfinished', message);
+      completeSessionHistory(session, 'unfinished', `interrupted-${session.requestId || ''}`);
+      logger?.warn?.(`agent local relay ${label} interrupted-as-unfinished requestId=${requestId} toolResults=${toolResultCount} pendingTools=${pendingToolCount} incompleteTodos=${incompleteTodoCount} recoverable=${recoverable ? 1 : 0} message=${message}`);
+    } else {
+      markUpstreamUsageCompleted(session, session.config, 'failed', message);
+      completeSessionHistory(session, 'failed', `error-${session.requestId || ''}`);
+    }
   } catch (innerError) {
     logger?.error?.(`agent local relay failure finalization failed requestId=${requestId}: ${innerError?.stack || innerError?.message || String(innerError)}`);
   }
@@ -5149,9 +5220,39 @@ function getIncompleteTodos(session = {}) {
 }
 
 function looksLikeIncompleteContinuationText(text = '') {
+  // NOTE: We intentionally do NOT guess "continuation intent" from natural
+  // language (Chinese / English / Japanese / Korean / Russian ...). Text-based
+  // intent matching is fragile and unscalable across languages. Instead, turn
+  // completeness is decided from hard protocol/state signals only:
+  //   - toolCalls emitted this round (pending tool frames)
+  //   - toolResultSummaries (tools actually executed this turn)
+  //   - session.todos (incomplete todo items — structured state)
+  //   - stream sawDone / stopReason (protocol-level completion signal)
+  // The only text-based check kept here is the structural "placeholder final
+  // text" marker emitted by the relay itself (e.g. "Called N tool(s)."), which
+  // is a machine-generated protocol string, not model natural language.
   const value = String(text || '').trim();
   if (!value) return false;
   return isPlaceholderFinalText(value);
+}
+
+// Hard, language-agnostic signal: the upstream stream ended without a reliable
+// `done` flag and without emitting a tool call. This means the turn did not
+// reach a proper completion point from the protocol's perspective — regardless
+// of what natural-language text was produced. Returns true only when there is
+// concrete structural evidence the turn was interrupted mid-flight.
+function streamEndedWithoutReliableCompletion(options = {}) {
+  const sawDone = options.lastStreamSawDone === true;
+  if (sawDone) return false;
+  const stopReason = String(options.lastStreamStopReason || '').trim();
+  // stream_end / usage_without_done / local_stop_after_text all mean the stream
+  // closed without the model signalling a clean turn boundary.
+  if (stopReason !== 'stream_end'
+    && stopReason !== 'usage_without_done'
+    && stopReason !== 'local_stop_after_text') {
+    return false;
+  }
+  return true;
 }
 
 function stripCjkAndAsciiPunctuation(text = '') {
@@ -5230,6 +5331,11 @@ function shouldContinueIncompleteWork(session = {}, finalText = '', toolCalls = 
   if (maxContinuations > 0 && continuationCount >= maxContinuations) return false;
   const incompleteTodos = getIncompleteTodos(session);
   if (incompleteTodos.length > 0) return true;
+  // Trigger a continuation nudge when the stream ended without a reliable
+  // `done` signal and without emitting a tool call — a hard protocol-level
+  // gap, not a text-intent guess. This handles the case where the model
+  // produces text but the turn boundary was never properly signalled.
+  if (streamEndedWithoutReliableCompletion(options)) return true;
   const incompleteText = looksLikeIncompleteContinuationText(finalText);
   if (incompleteText) return true;
   if (looksLikeReadOnlyExplorationStillInProgress(session, finalText, options)) return true;
@@ -5284,6 +5390,7 @@ function buildModeRuntimeHelpers(session = {}) {
   return {
     getIncompleteTodos,
     looksLikeIncompleteContinuationText,
+    streamEndedWithoutReliableCompletion,
     looksLikeReadOnlyExplorationStillInProgress,
     getMaxReadOnlyExplorationContinuationCount,
     getMaxIncompleteContinuationCount,
@@ -5436,11 +5543,26 @@ function hasIncompleteWorkAtEndByMode(session = {}, finalText = '', toolCalls = 
   if (typeof handler.hasIncompleteWorkAtEnd === 'function') {
     return handler.hasIncompleteWorkAtEnd(session, finalText, toolCalls, upstreamError, options, helpers);
   }
-  return !upstreamError
-    && !toolCalls.length
+  const incompleteTodos = getIncompleteTodos(session);
+  const streamIncomplete = streamEndedWithoutReliableCompletion(options);
+  // When the upstream errored mid-turn, the work was interrupted, not failed.
+  // Treat it as unfinished whenever there is concrete structural evidence the
+  // task was still in progress: executed mutation/read-only tools, pending tool
+  // calls, incomplete todos. No natural-language intent guessing.
+  if (upstreamError) {
+    return Boolean(toolCalls.length)
+      || Boolean(options.sawMutationTool)
+      || Boolean(options.sawReadOnlyTool)
+      || incompleteTodos.length > 0
+      || looksLikeReadOnlyExplorationStillInProgress(session, finalText, options);
+  }
+  // No error path: the turn is unfinished only when there are pending tool
+  // calls, incomplete todos, OR the stream ended without a reliable completion
+  // signal and without emitting a tool call (protocol-level structural gap).
+  return !toolCalls.length
     && (
-      getIncompleteTodos(session).length > 0
-      || looksLikeIncompleteContinuationText(finalText)
+      incompleteTodos.length > 0
+      || streamIncomplete
       || looksLikeReadOnlyExplorationStillInProgress(session, finalText, options)
     );
 }
@@ -6181,6 +6303,11 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
   let durationMs = 0;
   let eventTypes = '';
   let stopReason = '';
+  // 检测缓存回放：伪 Response 上有 _fromCache 标记
+  if (upstream && typeof upstream === 'object' && upstream._fromCache) {
+    session._cacheHit = { layer: upstream._cacheLayer || 'unknown', cachedAt: upstream._cachedAt || Date.now() };
+    logger?.info?.(`agent local relay cache replay detected requestId=${session.requestId || '-'} phase=${phase} layer=${upstream._cacheLayer}`);
+  }
   session.logger?.info?.(`agent local relay upstream stream start requestId=${session.requestId || '-'} phase=${phase}`);
   try {
     session.currentUpstreamToolState = toolState;
@@ -6306,6 +6433,20 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
     if (options.emit !== false && textParts.join('').trim() && !shouldSuppressVisiblePlanText(session, options)) {
       flushAgentTextToHistory(session);
     }
+    // ---- 响应缓存：写入（仅完整成功的响应） ----
+    if (upstream && upstream._cacheKeys && !session.aborted && !upstreamError) {
+      try {
+        responseCache.set(upstream._cacheKeys, {
+          text: textParts.join(''),
+          reasoning: reasoningParts.join(''),
+          upstreamError,
+          toolCalls: normalizeCollectedToolCalls(toolState),
+          model: String(session.configuredModel || session.modelName || options.model || ''),
+        });
+      } catch {
+        /* ignore cache write errors */
+      }
+    }
   }
   return {
     text: textParts.join(''),
@@ -6322,7 +6463,18 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
 }
 
 function isRecoverableStreamError(errorText) {
-  return /idle timeout|max duration exceeded|upstream timeout|暂时无响应/i.test(String(errorText || ''));
+  const text = String(errorText || '');
+  if (!text) return false;
+  // Timeout / idle-class interruptions (original coverage). "暂时无响应" and
+  // "upstream timeout" are our own structured summaries from summarizeFetchError.
+  if (/idle timeout|max duration exceeded|upstream timeout|暂时无响应/i.test(text)) return true;
+  // Transient gateway / network errors: retryable. Match ONLY structured
+  // protocol-level identifiers — HTTP status codes, Node.js errno codes, the
+  // canonical Node "fetch failed" error name, and our own summary prefixes
+  // ("上游服务异常（HTTP 5xx）" from summarizeUpstreamFailure). No vague natural
+  // language ("network", "terminated", "aborted") to avoid false positives.
+  if (/HTTP\s*5(?:02|03|04)|上游服务异常|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|connection reset|connection refused/i.test(text)) return true;
+  return false;
 }
 
 function shouldRecoverPostToolStream(upstreamError, finalText, toolCalls = [], recoveryCount = 0) {
@@ -7223,6 +7375,10 @@ async function continueAgentStreamLoop(session, options = {}) {
     rememberUnfinishedAgentTask(session, userText, upstreamError);
     logger?.warn?.(`agent local relay tool round guard reached requestId=${requestId} toolStep=${toolStep} pendingTools=${toolCalls.length}`);
   } else if (upstreamError && isRecoverableStreamError(upstreamError)) {
+    // A transient gateway/network error is an interruption, not a hard failure.
+    // Mark the turn as unfinished so the client can resume instead of treating
+    // it as a completed (but empty) or failed round.
+    session.unfinishedWorkAtEnd = true;
     rememberUnfinishedAgentTask(session, userText, upstreamError);
     logger?.warn?.(`agent local relay recoverable upstream interruption requestId=${requestId} toolStep=${toolStep} error=${JSON.stringify(upstreamError)}`);
   } else if (!upstreamError) {
@@ -8672,6 +8828,13 @@ function startProxy(config) {
 
   proxyServer.listen(config.port, '127.0.0.1', () => {
     logger.info(`cursor relay proxy listening on 127.0.0.1:${config.port}`);
+    // 异步预热响应缓存（从历史对话目录加载），不阻塞启动
+    responseCache.warmupFromHistory().then(() => {
+      const stats = responseCache.getStats();
+      if (stats.entries > 0) {
+        logger.info(`response cache warmed up: ${stats.entries} entries (exact=${stats.exactEntries} fuzzy=${stats.fuzzyEntries})`);
+      }
+    }).catch(() => { /* ignore warmup errors */ });
   });
 
   process.on('SIGTERM', shutdown);

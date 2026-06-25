@@ -601,18 +601,29 @@ function buildIncompleteContinuationMessage(session = {}, finalText = '', contin
 
 function hasIncompleteWorkAtEnd(session = {}, finalText = '', toolCalls = [], upstreamError = '', options = {}, helpers = {}) {
   if (session?.modeTurnHandoff || session?.planTurnHandoff) return false;
-  if (upstreamError) return false;
   if (Array.isArray(toolCalls) && toolCalls.length) return false;
 
   const phase = String(session?.planWorkflow?.phase || '').trim();
   const incompleteTodos = Array.isArray(helpers.getIncompleteTodos?.(session))
     ? helpers.getIncompleteTodos(session)
     : [];
+  const streamIncomplete = helpers.streamEndedWithoutReliableCompletion?.(options) === true;
+  // When the upstream errored mid-turn, treat it as unfinished (not failed)
+  // whenever there is concrete structural evidence the task was still in
+  // progress. No natural-language intent guessing.
+  if (upstreamError) {
+    return Boolean(options.sawMutationTool)
+      || Boolean(options.sawReadOnlyTool)
+      || incompleteTodos.length > 0
+      || streamIncomplete
+      || phase === 'answers_collected'
+      || phase === 'exploring';
+  }
   if (incompleteTodos.length > 0) return true;
 
   if (phase === 'answers_collected' || phase === 'exploring') return true;
   if (!hasCreatePlanResult(session)) return true;
-  if (helpers.looksLikeIncompleteContinuationText?.(finalText)) return true;
+  if (streamIncomplete) return true;
   if (helpers.looksLikeReadOnlyExplorationStillInProgress?.(session, finalText, options)) return true;
   return !helpers.textLooksLikeSubstantiveFinalAnswer?.(finalText);
 }
