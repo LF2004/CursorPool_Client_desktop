@@ -30,6 +30,14 @@ function makeWriteToolCall(path, content) {
   };
 }
 
+function makePatchEditToolCall(path, oldStr, newStr, id = 'call_6') {
+  return {
+    id,
+    type: 'function',
+    function: { name: 'patchedit', arguments: JSON.stringify({ path, old_string: oldStr, new_string: newStr }) },
+  };
+}
+
 function makeGrepToolCall(pattern) {
   return {
     id: 'call_3',
@@ -78,8 +86,8 @@ test('1. 读文件+分析: 命中 tool_cache', () => {
   assert.strictEqual(hit.layer, 'exact');
 });
 
-// 场景2：写文件 + 确认 → 不缓存（副作用工具）
-test('2. 写文件+确认: 不缓存', () => {
+// 场景2：写文件 + 确认 → exact 不缓存，但 fuzzy/ultra 可缓存（文件编辑类放宽）
+test('2. 写文件+确认: exact 不缓存，fuzzy 放宽', () => {
   cache.clear();
   const messages = [
     { role: 'user', content: '写配置到 config.json' },
@@ -88,9 +96,10 @@ test('2. 写文件+确认: 不缓存', () => {
     { role: 'user', content: '确认' },
   ];
   const keys = cache.buildCacheKeys('deepseek-v4', messages, { phase: 'upstream' });
-  assert.strictEqual(keys.fuzzy, null, 'fuzzy 应为 null（含 write 副作用工具）');
-  assert.strictEqual(keys.ultra, null, 'ultra 应为 null');
-  assert.strictEqual(keys.exact, null, 'exact 也应为 null');
+  assert.strictEqual(keys.exact, null, 'exact 仍应为 null（含 write 副作用工具）');
+  // fuzzy/ultra 放宽：文件编辑类不再阻断，指纹分段后只剩 "U:确认"
+  assert.ok(keys.fuzzy, 'fuzzy 应生成（文件编辑类放宽）');
+  assert.ok(keys.ultra, 'ultra 应生成');
 });
 
 // 场景3：纯对话 → 命中 fuzzy/ultra
@@ -196,6 +205,19 @@ test('D3. reasoning 参数不同 → exact key 不同', () => {
   assert.strictEqual(k1.ultra, k2.ultra, 'ultra 不应受 reasoning 影响');
 });
 
+test('Agent 阶段 initial/post_tool 应启用 fuzzy/ultra', () => {
+  cache.clear();
+  const messages = [{ role: 'user', content: '继续优化缓存' }];
+  const initialKeys = cache.buildCacheKeys('deepseek-v4', messages, { phase: 'initial' });
+  const postToolKeys = cache.buildCacheKeys('deepseek-v4', messages, { phase: 'post_tool_2_recover_1' });
+  assert.ok(initialKeys.fuzzy, 'initial 应生成 fuzzy key');
+  assert.ok(initialKeys.ultra, 'initial 应生成 ultra key');
+  assert.ok(postToolKeys.fuzzy, 'post_tool 应生成 fuzzy key');
+  assert.strictEqual(initialKeys.fuzzy, postToolKeys.fuzzy, '同上下文 fuzzy 应一致');
+  assert.strictEqual(initialKeys.ultra, postToolKeys.ultra, '同上下文 ultra 应一致');
+  assert.notStrictEqual(initialKeys.exact, postToolKeys.exact, '不同 phase 归一化后 exact 仍应区分');
+});
+
 console.log('');
 console.log('=== 工具分类边界测试 ===');
 
@@ -290,6 +312,101 @@ test('T6. shell + 幂等工具混合：shell 使整段不缓存', () => {
   assert.strictEqual(keys.fuzzy, null, '含 shell 应不生成 fuzzy');
   assert.strictEqual(keys.ultra, null);
   assert.strictEqual(keys.exact, null);
+});
+
+console.log('');
+console.log('=== 分段指纹测试（文件编辑类放宽） ===');
+
+// 核心场景：PatchEdit 后 Read 同一文件，应能命中缓存
+test('S1. PatchEdit后Read: 分段指纹命中', () => {
+  cache.clear();
+  // 第一轮对话：user → PatchEdit → Read → user(分析)
+  const msgs1 = [
+    { role: 'user', content: '优化这段代码' },
+    { role: 'assistant', content: '', tool_calls: [makePatchEditToolCall('foo.js', 'old', 'new', 'call_pe1')] },
+    { role: 'tool', tool_call_id: 'call_pe1', content: 'ok' },
+    { role: 'assistant', content: '', tool_calls: [makeReadToolCall('foo.js')] },
+    { role: 'tool', tool_call_id: 'call_1', content: '新内容' },
+    { role: 'user', content: '分析' },
+  ];
+  const keys1 = cache.buildCacheKeys('gpt-4', msgs1, { phase: 'upstream' });
+  assert.ok(keys1.fuzzy, 'fuzzy 应生成（PatchEdit 是文件编辑类，不阻断）');
+  assert.ok(keys1.ultra, 'ultra 应生成');
+  assert.strictEqual(keys1.exact, null, 'exact 仍为 null（含副作用工具）');
+  cache.set(keys1, { text: '分析结果', reasoning: '', upstreamError: '', toolCalls: [], model: 'gpt-4' });
+
+  // 第二轮对话：不同上下文，但 PatchEdit 之后的部分（Read foo.js + 分析）相同
+  const msgs2 = [
+    { role: 'user', content: '另一个任务' },
+    { role: 'assistant', content: '', tool_calls: [makePatchEditToolCall('bar.js', 'x', 'y', 'call_pe2')] },
+    { role: 'tool', tool_call_id: 'call_pe2', content: 'ok' },
+    { role: 'assistant', content: '', tool_calls: [makeReadToolCall('foo.js')] },
+    { role: 'tool', tool_call_id: 'call_1', content: '新内容' },
+    { role: 'user', content: '分析' },
+  ];
+  const keys2 = cache.buildCacheKeys('gpt-4', msgs2, { phase: 'upstream' });
+  assert.strictEqual(keys2.fuzzy, keys1.fuzzy, '分段指纹应相同（PatchEdit 之后的部分一致）');
+  const hit = cache.get(keys2);
+  assert.ok(hit, '应命中缓存');
+  assert.strictEqual(hit.entry.text, '分析结果');
+});
+
+// PatchEdit 后 Read 不同文件，不应命中
+test('S2. PatchEdit后Read不同文件: 不命中', () => {
+  cache.clear();
+  const msgs1 = [
+    { role: 'user', content: '优化' },
+    { role: 'assistant', content: '', tool_calls: [makePatchEditToolCall('a.js', 'o', 'n', 'call_pe1')] },
+    { role: 'tool', tool_call_id: 'call_pe1', content: 'ok' },
+    { role: 'assistant', content: '', tool_calls: [makeReadToolCall('a.js')] },
+    { role: 'tool', tool_call_id: 'call_1', content: '内容A' },
+    { role: 'user', content: '分析' },
+  ];
+  const msgs2 = [
+    { role: 'user', content: '优化' },
+    { role: 'assistant', content: '', tool_calls: [makePatchEditToolCall('b.js', 'o', 'n', 'call_pe2')] },
+    { role: 'tool', tool_call_id: 'call_pe2', content: 'ok' },
+    { role: 'assistant', content: '', tool_calls: [makeReadToolCall('b.js')] },
+    { role: 'tool', tool_call_id: 'call_1', content: '内容B' },
+    { role: 'user', content: '分析' },
+  ];
+  const k1 = cache.buildCacheKeys('gpt-4', msgs1, { phase: 'upstream' });
+  const k2 = cache.buildCacheKeys('gpt-4', msgs2, { phase: 'upstream' });
+  assert.notStrictEqual(k1.fuzzy, k2.fuzzy, '不同文件 Read 应不同 fuzzy');
+});
+
+// 无文件编辑工具时，指纹应取完整对话（向后兼容）
+test('S3. 无文件编辑: 完整指纹（向后兼容）', () => {
+  cache.clear();
+  const msgs = [
+    { role: 'user', content: '读 foo.js' },
+    { role: 'assistant', content: '', tool_calls: [makeReadToolCall('foo.js')] },
+    { role: 'tool', tool_call_id: 'call_1', content: '代码内容' },
+    { role: 'user', content: '分析' },
+  ];
+  const k1 = cache.buildCacheKeys('gpt-4', msgs, { phase: 'upstream' });
+  cache.set(k1, { text: '分析结果', reasoning: '', upstreamError: '', toolCalls: [], model: 'gpt-4' });
+  const hit = cache.get(k1);
+  assert.ok(hit, '无文件编辑时应正常命中（完整指纹）');
+});
+
+// findLastFileEditToolResultIndex 单元测试
+test('S4. findLastFileEditToolResultIndex 定位', () => {
+  const { _internal } = cache;
+  // 无编辑工具
+  assert.strictEqual(_internal.findLastFileEditToolResultIndex([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', tool_calls: [makeReadToolCall('a.js')] },
+    { role: 'tool', tool_call_id: 'call_1', content: 'x' },
+  ]), -1, '无编辑工具应返回 -1');
+  // 有编辑工具
+  assert.strictEqual(_internal.findLastFileEditToolResultIndex([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', tool_calls: [makePatchEditToolCall('a.js', 'o', 'n', 'call_pe')] },
+    { role: 'tool', tool_call_id: 'call_pe', content: 'ok' },
+    { role: 'assistant', tool_calls: [makeReadToolCall('a.js')] },
+    { role: 'tool', tool_call_id: 'call_1', content: 'x' },
+  ]), 2, '应返回编辑工具结果的索引 2');
 });
 
 console.log('');

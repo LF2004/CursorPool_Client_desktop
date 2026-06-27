@@ -17,6 +17,14 @@ const LEAF_SANS = [
   'agentn.api5.cursor.sh',
   'localhost',
   '127.0.0.1',
+  // Cursor 附属服务域名（MITM 证书需要覆盖，否则 ERR_CERT_COMMON_NAME_INVALID）
+  'marketplace.cursorapi.com',
+  'prod.authentication.cursor.sh',
+  'downloads.cursor.com',
+  'cursor-cdn.com',
+  '*.cursor.com',
+  '*.cursorapi.com',
+  '*.authentication.cursor.sh',
 ];
 
 function getRelayDataDir(customRoot) {

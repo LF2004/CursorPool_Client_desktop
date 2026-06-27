@@ -3,12 +3,18 @@ const { getSessionAgentMode } = require('./common/policy');
 const agentMode = require('./agent-mode');
 const askMode = require('./ask-mode');
 const planMode = require('./plan-mode');
+const debugMode = require('./debug-mode');
+const triageMode = require('./triage-mode');
+const projectMode = require('./project-mode');
 const multitaskMode = require('./multitask-mode');
 
 const MODE_HANDLERS = {
   AGENT_MODE_AGENT: agentMode,
   AGENT_MODE_ASK: askMode,
   AGENT_MODE_PLAN: planMode,
+  AGENT_MODE_DEBUG: debugMode,
+  AGENT_MODE_TRIAGE: triageMode,
+  AGENT_MODE_PROJECT: projectMode,
   AGENT_MODE_MULTITASK: multitaskMode,
 };
 

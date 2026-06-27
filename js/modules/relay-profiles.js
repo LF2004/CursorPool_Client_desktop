@@ -36,7 +36,7 @@ export const PROVIDER_ICONS = {
   custom: './assets/icons/providers/custom.svg',
 };
 
-export const DEFAULT_CONTEXT_WINDOW = 250000;
+export const DEFAULT_CONTEXT_WINDOW = 200000;
 export const DEFAULT_REASONING_EFFORT = 'medium';
 export const REASONING_EFFORT_OPTIONS = [
   { value: 'low', label: '低' },
@@ -159,7 +159,7 @@ function normalizeProfile(raw) {
     thinkingMode: providerId === 'deepseek' || providerId === 'mimo'
       ? (['enabled', 'disabled'].includes(raw.thinkingMode) ? raw.thinkingMode : DEFAULT_DEEPSEEK_THINKING_MODE)
       : '',
-    contextWindow: Number(raw.contextWindow) > 0 ? Number(raw.contextWindow) : DEFAULT_CONTEXT_WINDOW,
+    contextWindow: Math.max(1, Math.min(200000, Number(raw.contextWindow) > 0 ? Number(raw.contextWindow) : DEFAULT_CONTEXT_WINDOW)),
     notes: String(raw.notes || '').trim(),
     testStatus: normalizeTestStatus(raw.testStatus),
     createdAt: Number(raw.createdAt) || now,

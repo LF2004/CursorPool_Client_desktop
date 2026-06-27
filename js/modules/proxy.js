@@ -69,53 +69,12 @@ let relayFieldHintEl = null;
 let relayFieldHintTimer = null;
 const CONFIG_PAGE_SIZE = 6;
 const configPageByProvider = { openai: 1, anthropic: 1, deepseek: 1, gemini: 1, mimo: 1, custom: 1 };
-const RELAY_REVIEW_BRIDGE_STORAGE_KEY = 'cursor_relay_review_bridge_enabled_v1';
-
-function loadRelayReviewBridgePreference() {
-  try {
-    const raw = localStorage.getItem(RELAY_REVIEW_BRIDGE_STORAGE_KEY);
-    return raw == null ? false : raw === '1';
-  } catch {
-    return false;
-  }
-}
-
-function saveRelayReviewBridgePreference(enabled) {
-  try {
-    localStorage.setItem(RELAY_REVIEW_BRIDGE_STORAGE_KEY, enabled ? '1' : '0');
-  } catch {
-    /* ignore */
-  }
-}
-
-function isReviewBridgeRequested() {
-  return loadRelayReviewBridgePreference();
-}
-
 function syncReviewBridgeToggleFromStorage() {
-  const toggle = $('relayReviewBridgeToggle');
-  const badge = $('relayReviewBridgeBadge');
-  const hint = $('relayReviewBridgeHint');
-  const enabled = loadRelayReviewBridgePreference();
-  if (toggle) {
-    toggle.checked = enabled;
-    toggle.onchange = () => {
-      saveRelayReviewBridgePreference(toggle.checked);
-      paintReviewBridgeStatus();
-    };
-  }
-  toggle?.closest('.adv-inject-row')?.classList.remove('hidden');
-  badge?.classList.toggle('hidden', !enabled);
-  hint?.classList.remove('hidden');
+  // Review bridge injection is now managed manually in Preferences.
 }
 
 function paintReviewBridgeStatus() {
-  const badgeEl = $('relayReviewBridgeBadge');
-  const hintEl = $('relayReviewBridgeHint');
-  const enabled = loadRelayReviewBridgePreference();
-  badgeEl?.classList.toggle('hidden', !enabled);
-  hintEl?.classList.remove('hidden');
-  badgeEl?.closest('.adv-inject-row')?.classList.remove('hidden');
+  // Review bridge injection is now managed manually in Preferences.
 }
 
 function isRelayAdmin() {
@@ -390,7 +349,6 @@ async function activateProfile(id) {
         await bridge.cursorRelayQuickSwitchModel({ profileId: id });
       });
       void refreshRelayStatus().catch(() => null);
-      void getUpstreamProbeForEnable().catch(() => null);
       const active = getActiveProfile(profilesStore);
       await showAlert(
         `已切换为 ${describeProfile(active)}，Relay 已应用到新模型配置。`,
@@ -570,6 +528,9 @@ function collectModalFormProfile() {
   const inferredEndpointMode = modalProviderId === 'anthropic' || modalProviderId === 'gemini' || modalProviderId === 'mimo'
     ? 'chat'
     : inferEndpointModeFromBaseUrl(rawBaseUrl, selectedEndpointMode);
+  const rawContextWindow = Number(($('relayModalContext')?.value || '').trim() || DEFAULT_CONTEXT_WINDOW);
+  const contextWindow = Math.max(1, Math.min(200000, Number.isFinite(rawContextWindow) ? rawContextWindow : DEFAULT_CONTEXT_WINDOW));
+  if ($('relayModalContext')) $('relayModalContext').value = String(contextWindow);
   return {
     ...base,
     id: existing?.id || base.id,
@@ -583,7 +544,7 @@ function collectModalFormProfile() {
     thinkingMode: modalProviderId === 'deepseek' || modalProviderId === 'mimo'
       ? (($('relayModalThinking')?.value || DEFAULT_DEEPSEEK_THINKING_MODE).trim())
       : '',
-    contextWindow: Number(($('relayModalContext')?.value || '').trim() || DEFAULT_CONTEXT_WINDOW),
+    contextWindow,
     notes: ($('relayModalNotes')?.value || '').trim(),
   };
 }
@@ -867,7 +828,6 @@ function collectRelayRuntimeOptions() {
     localNativeAgentTools: true,
     structuredAgentToolCalls: true,
     emitSyntheticLocalNativeToolFrames: false,
-    enableReviewBridge: isReviewBridgeRequested(),
   };
 }
 
@@ -899,6 +859,9 @@ function validateUpstreamPayload(payload) {
   if (!(Number(payload.contextWindow) > 0)) {
     throw new Error('上下文窗口必须大于 0');
   }
+  if (Number(payload.contextWindow) > 200000) {
+    throw new Error('上下文窗口不能超过 200000，否则无法触发 Cursor 原生上下文压缩');
+  }
 }
 
 async function testLocalUpstream(upstream) {
@@ -927,6 +890,11 @@ function describeRunner(runner) {
 
 function describeCert(cert) {
   if (!cert?.caReady || !cert?.leafReady) return '缺失';
+  // lightweight 模式跳过了证书库检查（caInstalled=null），不显示"未信任"误导用户
+  // 实际信任状态以"证书检查"按钮的结果为准
+  if (cert?.lightweight === true && cert?.caInstalled === null) {
+    return '已生成（轻量模式）';
+  }
   if (cert?.caTrustStale) return '信任不一致';
   if (cert?.caInstalled) return '本地已信任';
   return '已生成，未信任';
@@ -1206,7 +1174,6 @@ async function enableRelayForProfile(profileId) {
 
       relayEnabled = true;
       void refreshRelayStatus().catch(() => null);
-      void getUpstreamProbeForEnable().catch(() => null);
       paintReviewBridgeStatus(local);
       const authApplied = local?.cursorAuthEnsure?.applied;
       const restartRequired = Boolean(local?.requiresCursorRestart) || authApplied;
@@ -1227,6 +1194,8 @@ async function enableRelayForProfile(profileId) {
           restartCursor: false,
           reloadCursor: false,
           clearSystemProxy: false,
+          fast: true,
+          resetActiveAgentConversation: false,
         });
       } catch {
         /* ignore */
@@ -1677,7 +1646,6 @@ export async function refreshProxyStatus() {
   await reloadProfilesStore();
   renderConfigGrid();
   await refreshRelayStatus();
-  await runUpstreamProbe({ silent: true });
 }
 
 export async function bindProxyEvents() {
@@ -1768,15 +1736,15 @@ export async function bindProxyEvents() {
         if (relayDisableInFlight) return;
         relayDisableInFlight = true;
         updateRelayToggleButton(false, false);
-        await withRelayBusy('正在停用 Relay 并重置当前 Agent 对话...', async () => {
+        await withRelayBusy('正在暂停 Relay 并还原本地代理配置...', async () => {
           try {
             await bridge?.cursorRelayDisable?.({
               restartCursor: false,
               reloadCursor: false,
               clearSystemProxy: false,
               stopRunner: true,
-              fast: false,
-              resetActiveAgentConversation: true,
+              fast: true,
+              resetActiveAgentConversation: false,
             });
           } catch (error) {
             await showAlert(error.message || String(error), {

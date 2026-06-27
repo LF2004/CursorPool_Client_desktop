@@ -20,7 +20,6 @@ const AGENT_TOOL_NAMES = [
   'LS',
   'ReadLints',
   'Shell',
-  'TodoWrite',
   'WebFetch',
   'WebSearch',
   'SemanticSearch',

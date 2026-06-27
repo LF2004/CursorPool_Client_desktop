@@ -42,6 +42,20 @@ const {
   extractOpenAiDelta,
 } = require('./cursor-relay-protocol');
 const { encodeMessage: encodeCursorProtoMessage } = require('./cursor-relay-protobuf');
+// v2 解码器（基于 protobufjs，返回兼容结构 + 完整解码对象，含 MCP/Skill 字段）
+const protocolV2 = require('./cursor-relay-protocol-v2');
+// 模型列表注入（拦截 AvailableModels/GetUsableModels 响应，注入本地模型）
+const modelInjection = require('./cursor-relay-model-injection');
+// 对话修复（interaction_resume 重试 + 工具 schema 注入）
+const conversationFix = require('./cursor-relay-conversation-fix');
+// 状态守护（防止 Cursor 官方覆盖账号/模型缓存）
+const stateGuard = require('./cursor-relay-state-guard');
+// MCP/Skill 透传（阶段六：MCP 工具调用与 Skill 透传复刻）
+const mcpSkill = require('./cursor-relay-mcp-skill');
+// StreamCpp 代码补全（阶段七：StreamCpp 代码补全复刻）
+const streamCpp = require('./cursor-relay-streamcpp');
+// 认证/订阅接口拦截（修复 Log in ⚡ / 模型列表问题）
+const authIntercept = require('./cursor-relay-auth-intercept');
 const {
   beginTurn: beginAgentHistoryTurn,
   appendHistoryItem: appendAgentHistoryItem,
@@ -49,6 +63,10 @@ const {
   updateConversationState: updateAgentHistoryConversationState,
   updateUsage: updateAgentHistoryUsage,
 } = require('./cursor-relay-agent-history');
+const {
+  syncRelayComposerWorkspaceBinding,
+  syncRelayContextSnapshotToComposerData,
+} = require('./cursor-relay-composer-sync');
 const {
   DEFAULT_RELAY_MEMORY_MAX_CHARS,
   DEFAULT_RELAY_MEMORY_ITEM_MAX_CHARS,
@@ -59,6 +77,7 @@ const {
   normalizeAgentModeName,
   getCursorModeDirectory,
   getSessionAgentMode,
+  readModeText,
 } = require('../mode/registry');
 const {
   getModeHandler,
@@ -121,6 +140,8 @@ const FORCE_MUTATION_AFTER_READ_ONLY_ROUNDS = 2;
 const DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS = 12000;
 const INITIAL_VISIBLE_PROGRESS_MS = 12000;
 const MAX_TOOL_OUTPUT_CHARS = 16000;
+const APPROX_CHARS_PER_TOKEN = 4;
+const CURSOR_NATIVE_MAX_CONTEXT_TOKENS = 200000;
 const MAX_INLINE_EDIT_RESULT_CONTENT_CHARS = 512 * 1024;
 const MAX_UPSTREAM_IMAGE_BYTES = 20 * 1024 * 1024;
 const EDIT_STREAM_FLUSH_CHARS = 2048;
@@ -133,7 +154,6 @@ const DEFAULT_RELAY_SCAN_IGNORE = Object.freeze(['node_modules', '.git', 'dist',
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
-
 function parseArgs(argv) {
   const out = {};
   for (let i = 2; i < argv.length; i += 1) {
@@ -521,15 +541,42 @@ function filterRelayTools(tools = [], allowedNames = null) {
 
 function buildRelayToolDefinitionsForChat(options = {}) {
   const modeName = normalizeAgentModeName(options.mode || 'AGENT_MODE_AGENT');
-  return filterRelayTools(
+  const modeTools = filterRelayTools(
     buildToolDefinitionsForChatByMode({ ...options, mode: modeName }),
     options.allowedToolNames || null,
   );
+  // 阶段六：合并 MCP 工具（从 session.mcpSkillContext 或 options.extraMcpTools）
+  const mcpTools = options.extraMcpTools || options.mcpTools || [];
+  if (Array.isArray(mcpTools) && mcpTools.length > 0) {
+    const existingNames = new Set(modeTools.map((t) => String(t?.function?.name || '').toLowerCase()));
+    for (const tool of mcpTools) {
+      const name = String(tool?.function?.name || '').toLowerCase();
+      if (name && !existingNames.has(name)) {
+        modeTools.push(tool);
+        existingNames.add(name);
+      }
+    }
+  }
+  return modeTools;
 }
 
 function buildRelayToolDefinitionsForResponses(options = {}) {
   const modeName = normalizeAgentModeName(options.mode || 'AGENT_MODE_AGENT');
-  return buildToolDefinitionsForResponsesByMode({ ...options, mode: modeName });
+  const responsesTools = buildToolDefinitionsForResponsesByMode({ ...options, mode: modeName });
+  // 阶段六：合并 MCP 工具到 Responses API 格式
+  const mcpTools = options.extraMcpTools || options.mcpTools || [];
+  if (Array.isArray(mcpTools) && mcpTools.length > 0) {
+    const existingNames = new Set(responsesTools.map((t) => String(t?.name || t?.function?.name || '').toLowerCase()));
+    for (const tool of mcpTools) {
+      const name = String(tool?.function?.name || tool?.name || '').toLowerCase();
+      if (name && !existingNames.has(name)) {
+        // Responses API 格式可能不同，但 OpenAI 兼容格式通常通用
+        responsesTools.push(tool);
+        existingNames.add(name);
+      }
+    }
+  }
+  return responsesTools;
 }
 
 function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
@@ -725,6 +772,7 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
     const requestId = session.requestId || '';
     const platformBilling = isPlatformBillingEnabled(config);
     const isCacheHit = !!session._cacheHit;
+    const activeUpstream = resolveUpstreamForModel(config, details.model || config.upstream?.modelName || '');
     // 缓存命中：status 标记为 cache_hit，费用/token 归零，上游无消耗
     const effectiveStatus = isCacheHit
       ? 'cache_hit'
@@ -741,8 +789,9 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
       conversationId: session.conversationId || '',
       mode: getSessionAgentMode(session),
       phase: details.phase || '',
-      endpointMode: details.endpointMode || config.upstream?.endpointMode || '',
-      model: details.model || config.upstream?.modelName || '',
+      endpointMode: details.endpointMode || activeUpstream?.endpointMode || config.upstream?.endpointMode || '',
+      displayName: details.displayName || activeUpstream?.displayName || activeUpstream?.modelName || config.upstream?.displayName || config.upstream?.modelName || '',
+      model: details.model || activeUpstream?.modelName || config.upstream?.modelName || '',
       status: effectiveStatus,
       httpStatus: isCacheHit ? 0 : (details.httpStatus || 0),
       error: isCacheHit ? '' : (details.error || ''),
@@ -752,10 +801,10 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
       responseTextChars: details.responseTextChars || 0,
       reasoningChars: details.reasoningChars || 0,
       toolCalls: details.toolCalls || 0,
-      upstreamBaseUrl: config.upstream?.baseUrl || '',
+      upstreamBaseUrl: activeUpstream?.baseUrl || config.upstream?.baseUrl || '',
       meta,
       cursorAgentAccount: resolveCurrentCursorAgentAccount(),
-      reasoningEffort: details.reasoningEffort || config.upstream?.reasoningEffort || '',
+      reasoningEffort: details.reasoningEffort || activeUpstream?.reasoningEffort || config.upstream?.reasoningEffort || '',
       platformBilling,
     });
     // 缓存命中的 meta 已在写入时内嵌（上面的 meta 对象），不需要二次 append
@@ -815,6 +864,9 @@ function markUpstreamUsageCompleted(session, config, status = 'success', error =
 
 async function fetchUpstreamCompletion(upstream, modelName, messages, logger, options = {}) {
   const attempts = buildUpstreamAttempts(upstream, modelName, messages, options);
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : UPSTREAM_FETCH_TIMEOUT_MS;
+  const requestId = String(options.requestId || '-');
+  const phase = String(options.phase || 'upstream');
 
   // ---- 响应缓存：查询（命中则直接回放，跳过上游请求） ----
   const cacheKeys = responseCache.buildCacheKeys(modelName, messages, options);
@@ -830,9 +882,6 @@ async function fetchUpstreamCompletion(upstream, modelName, messages, logger, op
 
   let lastError = null;
   let lastResponse = null;
-  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : UPSTREAM_FETCH_TIMEOUT_MS;
-  const requestId = String(options.requestId || '-');
-  const phase = String(options.phase || 'upstream');
   const allowedToolNames = Array.isArray(options.allowedToolNames) && options.allowedToolNames.length
     ? options.allowedToolNames.join(',')
     : '-';
@@ -1168,7 +1217,12 @@ function buildLocalRelayMessages(userText, session = {}) {
     recentEditedFile,
   });
   const imageParts = buildUpstreamImageParts(session);
-  return buildLocalRelayMessagesForMode(agentMode, {
+  // 阶段六：附加 MCP/Skill 系统提示词上下文
+  const mcpSkillContext = session.lastUserMessageCapture?.mcpSkillContext
+    || session.mcpSkillContext
+    || null;
+  const skillSystemPrompt = mcpSkillContext?.systemPromptContext || '';
+  const messages = buildLocalRelayMessagesForMode(agentMode, {
     userText: user,
     requestId,
     workspaceRoot,
@@ -1178,6 +1232,39 @@ function buildLocalRelayMessages(userText, session = {}) {
     conversationMemory,
     imageParts,
   });
+  // 如果有 Skill/Rules 系统提示词，注入到系统消息中
+  if (skillSystemPrompt) {
+    const sysMsg = messages.find((m) => m.role === 'system');
+    if (sysMsg) {
+      const existingContent = typeof sysMsg.content === 'string' ? sysMsg.content : '';
+      sysMsg.content = existingContent
+        ? `${existingContent}\n\n${skillSystemPrompt}`
+        : skillSystemPrompt;
+    } else {
+      messages.unshift({ role: 'system', content: skillSystemPrompt });
+    }
+  }
+  return messages;
+}
+
+function capturePromptContextForSession(session = {}, messages = []) {
+  const usageMeta = {
+    messageChars: (Array.isArray(messages) ? messages : []).reduce((sum, message) => {
+      if (Array.isArray(message?.content)) {
+        return sum + message.content.reduce((inner, part) => inner + String(part?.text || part?.image_url || '').length, 0);
+      }
+      return sum + String(message?.content || '').length;
+    }, 0),
+  };
+  syncRootPromptMessages(session, messages);
+  const snapshot = buildContextUsageSnapshot(session, usageMeta);
+  session.contextUsageSnapshot = snapshot;
+  updateSessionHistoryState(session, {
+    token_details_used_tokens: snapshot.usedTokens,
+    token_details_max_tokens: snapshot.maxTokens,
+  });
+  syncCursorComposerContextUsage(session, snapshot);
+  return snapshot;
 }
 
 function normalizeWorkspacePath(value) {
@@ -1266,7 +1353,7 @@ function writeRecentWorkspaceRoot(root = '', logger = null, source = '') {
   }
 }
 
-function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = null, requestId = '-') {
+function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = null, requestId = '-', userText = '') {
   const decodedRoot = normalizeWorkspaceRoot(decodedWorkspaceRoot || '');
   const recentRoot = readRecentWorkspaceRoot();
   const cwdRoot = normalizeWorkspaceRoot(process.cwd());
@@ -1282,9 +1369,80 @@ function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = n
       `agent local relay ignored untrusted decoded workspace requestId=${requestId || '-'} decoded=${JSON.stringify(decodedRoot)} fallback=${JSON.stringify(cwdRoot)}`,
     );
   }
-  const selectedRoot = trustedDecodedRoot || trustedRecentRoot || cwdRoot;
+
+  // 当 decoded workspace 不可信时，尝试从 user message 文本中提取绝对路径，
+  // 推断出正确的项目根目录（解决"在项目B却跑到项目A"的问题）。
+  // 典型场景：Cursor 传来 workspaceStorage 内部路径，用户拖入项目B的文件。
+  let inferredRoot = '';
+  if (!trustedDecodedRoot && userText) {
+    inferredRoot = inferWorkspaceRootFromUserText(userText);
+    if (inferredRoot && isUntrustedWorkspaceRoot(inferredRoot)) {
+      logger?.warn?.(
+        `agent local relay inferred workspace is untrusted, skipped requestId=${requestId || '-'} inferred=${JSON.stringify(inferredRoot)}`,
+      );
+      inferredRoot = '';
+    }
+    if (inferredRoot && inferredRoot !== trustedRecentRoot) {
+      logger?.info?.(
+        `agent local relay inferred workspace from user text requestId=${requestId || '-'} inferred=${JSON.stringify(inferredRoot)} recent=${JSON.stringify(trustedRecentRoot)}`,
+      );
+    }
+  }
+
+  const selectedRoot = trustedDecodedRoot || inferredRoot || trustedRecentRoot || cwdRoot;
   if (selectedRoot) writeRecentWorkspaceRoot(selectedRoot, logger, `user_message:${requestId || '-'}`);
   return selectedRoot;
+}
+
+// 从 user message 文本中提取绝对路径，推断项目根目录。
+// 查找 package.json / .git / .gitignore 等标记文件，向上攀爬到项目根。
+function inferWorkspaceRootFromUserText(userText = '') {
+  const text = String(userText || '');
+  if (!text) return '';
+  // 提取所有 Windows 绝对路径（如 e:\project\xxx\file.js）
+  const pathRegex = /[a-zA-Z]:\\[^\r\n"'<>|*?，。；;\s]+/g;
+  const matches = text.match(pathRegex);
+  if (!matches || !matches.length) return '';
+  // 标记文件：存在任一即认为是项目根
+  const ROOT_MARKERS = ['package.json', '.git', '.gitignore', 'tsconfig.json', 'jsconfig.json', 'Cargo.toml', 'go.mod', 'pom.xml', 'pyproject.toml', 'setup.py'];
+  for (const rawPath of matches) {
+    let dir = normalizeWorkspacePath(rawPath);
+    // 如果是文件，取其目录
+    try {
+      if (fs.existsSync(dir) && fs.statSync(dir).isFile()) {
+        dir = path.dirname(dir);
+      }
+    } catch {
+      // 路径不存在，尝试向上攀爬到存在的目录
+      while (dir && !fs.existsSync(dir)) {
+        const parent = path.dirname(dir);
+        if (!parent || parent === dir) break;
+        dir = parent;
+      }
+      if (!dir || !fs.existsSync(dir)) continue;
+    }
+    // 从该目录向上查找项目根标记
+    let current = dir;
+    for (let depth = 0; depth < 12 && current; depth += 1) {
+      try {
+        for (const marker of ROOT_MARKERS) {
+          if (fs.existsSync(path.join(current, marker))) {
+            return current;
+          }
+        }
+      } catch {
+        // ignore stat errors
+      }
+      const parent = path.dirname(current);
+      if (!parent || parent === current) break;
+      current = parent;
+    }
+    // 没找到标记，返回最接近的存在的目录
+    if (dir && fs.existsSync(dir) && !isUntrustedWorkspaceRoot(dir)) {
+      return dir;
+    }
+  }
+  return '';
 }
 
 function getSessionWorkspaceRoot(session = {}) {
@@ -1485,6 +1643,8 @@ function hashRelayText(value) {
 function getSessionStableConversationId(session = {}) {
   return extractStableConversationId(session.lastUserMessageCapture?.debug || null)
     || String(session.lastUserMessageCapture?.stableConversationId || '').trim()
+    || String(session.conversationId || '').trim()
+    || String(session.agentHistory?.id || '').trim()
     || String(session.requestId || '').trim();
 }
 
@@ -1705,6 +1865,7 @@ function emitPresentedPlanCheckpoint(session = {}, logger = null, options = {}) 
   if (!options.force && checkpointKey && workflow.checkpointEmittedForPlanUri === checkpointKey) return 0;
   const workspaceRoot = getSessionWorkspaceRoot(session);
   const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
+  const contextUsage = session.contextUsageSnapshot || buildContextUsageSnapshot(session, null);
   try {
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
       workspaceRoot,
@@ -1712,6 +1873,10 @@ function emitPresentedPlanCheckpoint(session = {}, logger = null, options = {}) 
       readPaths,
       pendingToolCalls: [],
       plan: planText,
+      usedTokens: contextUsage.usedTokens,
+      maxTokens: contextUsage.maxTokens,
+      breakdown: contextUsage.breakdown,
+      promptContextUsageTree: contextUsage.promptContextUsageTree,
       todos: Array.isArray(planState?.todos) ? planState.todos : [],
     }));
     setPlanWorkflowPhase(session, workflow.phase, {
@@ -2286,6 +2451,7 @@ function sendAgentRunSseBootstrap(session, logger) {
     writeAgentFrame(session, buildAgentKvSetBlobFrame(blobId, blobData, { id: nextKvServerMessageId(session) }));
   });
   session.rootPromptMessagesJson = rootPromptMessagesJson;
+  session.promptMessageBlobIds = new Set(rootPromptMessagesJson);
   logger.info('agent local relay sent KV bootstrap frames');
 }
 
@@ -2378,6 +2544,9 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
   if (!session?.agentHistory || session.historyCompleted) return;
   session.historyCompleted = true;
   try {
+    if (session.contextUsageSnapshot) {
+      syncCursorComposerContextUsage(session, session.contextUsageSnapshot, { force: true });
+    }
     const statePatch = session.waitingForInteraction
       ? {
         current_loop_status: 'waiting_for_interaction',
@@ -2469,6 +2638,7 @@ function finalizeInterceptedAgentSession(session) {
     /* ignore */
   }
   if (session.requestId) session.agentSessions?.delete(session.requestId);
+  try { stateGuard.unregisterSession(session.requestId); } catch { /* ignore */ }
   if (session.agentHistory && !session.historyCompleted) {
     completeSessionHistory(session, session.hadError ? 'failed' : 'completed', `finalize-${session.requestId || ''}`);
   }
@@ -2631,9 +2801,16 @@ function isRepositoryServicePath(pathname) {
 
 function localControlPlaneResponseSpec(pathname, config = {}) {
   const fallbackModelName = String(config.upstream?.modelName || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
-  const availableModelNames = Array.isArray(config.upstream?.availableModels) && config.upstream.availableModels.length
+  const routeModels = getConfiguredModelRoutes(config)
+    .map((item) => String(item.modelName || '').trim())
+    .filter(Boolean);
+  const primaryAvailableModels = Array.isArray(config.upstream?.availableModels) && config.upstream.availableModels.length
     ? config.upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
     : [fallbackModelName];
+  const availableModelNames = Array.from(new Set([
+    ...primaryAvailableModels,
+    ...routeModels,
+  ].filter(Boolean)));
   const modelName = availableModelNames[0] || fallbackModelName;
   const now = Date.now();
   const cycleEnd = now + (30 * 24 * 60 * 60 * 1000);
@@ -2642,25 +2819,32 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
     fallbackModels: availableModelNames.length ? availableModelNames : [modelName],
     bestOfNDefaultModels: availableModelNames.length ? availableModelNames : [modelName],
   };
-  const models = availableModelNames.map((name, index) => ({
-    name,
-    defaultOn: index === 0,
-    supportsAgent: true,
-    supportsThinking: true,
-    supportsImages: true,
-    supportsAutoContext: true,
-    autoContextMaxTokens: 250000,
-    autoContextExtendedMaxTokens: 250000,
-    supportsMaxMode: true,
-    supportsNonMaxMode: true,
-    contextTokenLimit: Number(config.upstream?.contextWindow) || 250000,
-    clientDisplayName: name,
-    serverModelName: name,
-    supportsPlanMode: true,
-    supportsSandboxing: true,
-    inputboxShortModelName: name,
-    supportsCmdK: true,
-  }));
+  const models = availableModelNames.map((name, index) => {
+    const upstreamForModel = resolveUpstreamForModel(config, name);
+    const displayName = String(upstreamForModel?.displayName || name).trim() || name;
+    const contextLimit = clampRelayContextWindowTokens(upstreamForModel?.contextWindow || config.upstream?.contextWindow);
+    return {
+      name,
+      defaultOn: index === 0,
+      supportsAgent: true,
+      supportsThinking: true,
+      supportsImages: true,
+      supportsAutoContext: true,
+      autoContextMaxTokens: contextLimit,
+      autoContextExtendedMaxTokens: contextLimit,
+      supportsMaxMode: true,
+      supportsNonMaxMode: true,
+      contextTokenLimit: contextLimit,
+      clientDisplayName: displayName,
+      serverModelName: name,
+      supportsPlanMode: true,
+      supportsSandboxing: true,
+      inputboxShortModelName: displayName.slice(0, 20) || name,
+      supportsCmdK: true,
+      degradationStatus: 0,
+      isUserAdded: true,
+    };
+  });
 
   const suffix = String(pathname || '').replace(/^.*\/aiserver\.v1\./i, '');
   switch (suffix) {
@@ -3097,6 +3281,7 @@ function emitPlanConversationCheckpointFrames(session, toolCall, execution, logg
   if (!planText) return;
   const workspaceRoot = getSessionWorkspaceRoot(session);
   const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
+  const contextUsage = session.contextUsageSnapshot || buildContextUsageSnapshot(session, null);
   try {
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
       workspaceRoot,
@@ -3104,6 +3289,10 @@ function emitPlanConversationCheckpointFrames(session, toolCall, execution, logg
       readPaths,
       pendingToolCalls: [buildToolCallCheckpointJson(toolCall, execution, 'pending')],
       plan: planText,
+      usedTokens: contextUsage.usedTokens,
+      maxTokens: contextUsage.maxTokens,
+      breakdown: contextUsage.breakdown,
+      promptContextUsageTree: contextUsage.promptContextUsageTree,
       todos: planTodos,
     }));
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
@@ -3112,6 +3301,10 @@ function emitPlanConversationCheckpointFrames(session, toolCall, execution, logg
       readPaths,
       pendingToolCalls: [],
       plan: planText,
+      usedTokens: contextUsage.usedTokens,
+      maxTokens: contextUsage.maxTokens,
+      breakdown: contextUsage.breakdown,
+      promptContextUsageTree: contextUsage.promptContextUsageTree,
       todos: planTodos,
     }));
     logger?.info?.(`agent local relay plan checkpoint emitted requestId=${session.requestId || '-'} planChars=${planText.length} planPath=${JSON.stringify(execution?.planPath || '')}`);
@@ -3525,13 +3718,22 @@ function beginSessionHistoryTurn(session, config, options = {}) {
     includeRequestContext = false,
     includeModePromptContexts = false,
   } = options;
+  const stableConversationId = getSessionStableConversationId(session);
+  const historyCapture = session?.lastUserMessageCapture
+    ? {
+      ...session.lastUserMessageCapture,
+      stableConversationId,
+    }
+    : null;
   const { conversation, turnSeq } = beginAgentHistoryTurn(
     config,
     session?.requestId || '',
     getSessionWorkspaceRoot(session),
-    session?.lastUserMessageCapture || null,
+    historyCapture,
   );
   session.agentHistory = conversation;
+  if (historyCapture) session.lastUserMessageCapture = historyCapture;
+  session.conversationId = String(conversation?.id || stableConversationId || session.requestId || '').trim();
   session.agentTurnSeq = turnSeq;
   session.historyCompleted = false;
   if (
@@ -3646,6 +3848,75 @@ function updateSessionHistoryState(session, patch = {}) {
   }
 }
 
+function buildContextUsageSyncSignature(conversationId = '', snapshot = null) {
+  const stableConversationId = String(conversationId || '').trim();
+  if (!stableConversationId || !snapshot || typeof snapshot !== 'object') return '';
+  const breakdown = snapshot.breakdown && typeof snapshot.breakdown === 'object'
+    ? snapshot.breakdown
+    : null;
+  const tree = snapshot.promptContextUsageTree && typeof snapshot.promptContextUsageTree === 'object'
+    ? snapshot.promptContextUsageTree
+    : null;
+  return JSON.stringify({
+    stableConversationId,
+    usedTokens: Number(snapshot.usedTokens) || 0,
+    maxTokens: Number(snapshot.maxTokens) || 0,
+    categories: Array.isArray(breakdown?.categories)
+      ? breakdown.categories.map((item) => ({
+        id: String(item?.id || '').trim(),
+        estimatedTokens: Number(item?.estimatedTokens) || 0,
+      }))
+      : [],
+    nodeCount: Array.isArray(tree?.nodes) ? tree.nodes.length : 0,
+  });
+}
+
+function syncCursorComposerContextUsage(session = {}, snapshot = null, options = {}) {
+  const stableConversationId = getSessionStableConversationId(session);
+  const normalizedSnapshot = snapshot && typeof snapshot === 'object'
+    ? snapshot
+    : session.contextUsageSnapshot;
+  if (!stableConversationId || !normalizedSnapshot) return null;
+  const signature = buildContextUsageSyncSignature(stableConversationId, normalizedSnapshot);
+  if (!signature) return null;
+  const force = options.force === true;
+  if (!force && signature === String(session.cursorComposerContextUsageSyncSignature || '')) {
+    return session.cursorComposerContextUsageLastResult || null;
+  }
+  try {
+    const result = syncRelayContextSnapshotToComposerData({
+      relayConversationId: stableConversationId,
+      snapshot: normalizedSnapshot,
+    });
+    const workspaceRoot = String(session.workspaceRoot || session.lastUserMessageCapture?.workspaceRoot || '').trim()
+      || String(session.agentHistory?.state?.workspace_root || '').trim();
+    if (workspaceRoot) {
+      result.workspaceBinding = syncRelayComposerWorkspaceBinding({
+        relayConversationId: stableConversationId,
+        workspaceRoot,
+      });
+    }
+    session.cursorComposerContextUsageLastResult = result;
+    if (result?.ok) {
+      session.cursorComposerContextUsageSyncSignature = signature;
+    }
+    return result;
+  } catch (error) {
+    const failure = {
+      ok: false,
+      skipped: true,
+      reason: 'sync_error',
+      error: error.message,
+      relayConversationId: stableConversationId,
+    };
+    session.cursorComposerContextUsageLastResult = failure;
+    session?.logger?.warn?.(
+      `cursor composer context usage sync failed requestId=${session?.requestId || '-'} conversationId=${stableConversationId}: ${error.message}`,
+    );
+    return failure;
+  }
+}
+
 function appendInteractionQueryToHistory(session = {}, pendingInteraction = {}) {
   const handler = getModeHandlerForSession(session);
   const helpers = buildModeRuntimeHelpers(session);
@@ -3679,6 +3950,228 @@ function appendLatestEditReminder(session, filePath) {
       ].join('\n'),
     },
   });
+}
+
+function clampRelayContextWindowTokens(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return CURSOR_NATIVE_MAX_CONTEXT_TOKENS;
+  return Math.max(1, Math.min(CURSOR_NATIVE_MAX_CONTEXT_TOKENS, Math.floor(parsed)));
+}
+
+function estimateUsedTokensFromUsageMeta(usageMeta = {}) {
+  const chars = Number(usageMeta?.messageChars) || 0;
+  return Math.max(1, Math.ceil(chars / APPROX_CHARS_PER_TOKEN));
+}
+
+function estimateTextTokens(text = '') {
+  return Math.max(0, Math.ceil(String(text || '').length / APPROX_CHARS_PER_TOKEN));
+}
+
+function buildPromptTokenBreakdownAndTree(session = {}, usageMeta = null) {
+  const totalChars = Number(usageMeta?.messageChars) || 0;
+  const userText = String(session?.lastUserMessageCapture?.userText || '').trim();
+  const conversationMemory = buildRelayConversationMemory(session, {
+    maxChars: Number(session.config?.relayMemoryMaxChars) || DEFAULT_RELAY_MEMORY_MAX_CHARS,
+    itemMaxChars: Number(session.config?.relayMemoryItemMaxChars) || DEFAULT_RELAY_MEMORY_ITEM_MAX_CHARS,
+    recentEditedFile: getRecentEditedFilePath(session),
+  });
+  const modeName = getSessionAgentMode(session);
+  const cursorAgentPrompt = readModeText(modeName, 'system_prompt.txt');
+  const cursorModeReminder = readModeText(modeName, 'system_reminder.txt');
+  const systemPromptText = [
+    cursorAgentPrompt,
+    cursorModeReminder,
+  ].filter(Boolean).join('\n');
+  const recentTools = getRecentToolResultContext(session, 8).join('\n');
+
+  const systemPromptTokens = estimateTextTokens(systemPromptText);
+  const memoryTokens = estimateTextTokens(conversationMemory);
+  const toolTokens = estimateTextTokens(recentTools);
+  const conversationTokens = Math.max(1, estimateTextTokens(userText));
+  const categorizedUsed = systemPromptTokens + memoryTokens + toolTokens + conversationTokens;
+  const totalUsedTokens = Math.max(
+    Math.max(1, estimateUsedTokensFromUsageMeta(usageMeta || {})),
+    categorizedUsed,
+  );
+  const uncategorizedTokens = Math.max(0, totalUsedTokens - categorizedUsed);
+
+  const categories = [];
+  const nodes = [];
+
+  const pushCategory = ({ id, label, estimatedTokens, characterCount }) => {
+    if (estimatedTokens <= 0) return;
+    categories.push({
+      id,
+      label,
+      estimatedTokens,
+      characterCount,
+    });
+  };
+
+  const pushNode = ({
+    id,
+    parentId,
+    kind = 'segment',
+    label,
+    categoryId,
+    inlineContent = '',
+  }) => {
+    const text = String(inlineContent || '');
+    const estimatedTokens = estimateTextTokens(text);
+    const characterCount = text.length;
+    if (estimatedTokens <= 0 && !text) return;
+    nodes.push({
+      id,
+      ...(parentId ? { parentId } : {}),
+      kind,
+      label,
+      categoryId,
+      estimatedTokens,
+      characterCount,
+      contentAvailable: Boolean(text),
+      ...(text ? { inlineContent: text } : {}),
+    });
+  };
+
+  if (systemPromptTokens > 0) {
+    pushCategory({
+      id: 'system_prompt',
+      label: 'System Prompt',
+      estimatedTokens: systemPromptTokens,
+      characterCount: systemPromptText.length,
+    });
+    pushNode({
+      id: 'relay:system_prompt',
+      label: 'Relay System Prompt',
+      categoryId: 'system_prompt',
+      inlineContent: systemPromptText,
+    });
+  }
+
+  if (memoryTokens > 0) {
+    pushCategory({
+      id: 'summarized_conversation',
+      label: 'Summarized Conversation',
+      estimatedTokens: memoryTokens,
+      characterCount: conversationMemory.length,
+    });
+    pushNode({
+      id: 'relay:summarized_conversation',
+      label: 'Conversation Memory',
+      categoryId: 'summarized_conversation',
+      inlineContent: conversationMemory,
+    });
+  }
+
+  if (toolTokens > 0) {
+    pushCategory({
+      id: 'tools',
+      label: 'Tools',
+      estimatedTokens: toolTokens,
+      characterCount: recentTools.length,
+    });
+    pushNode({
+      id: 'relay:tools',
+      label: 'Recent Tool Results',
+      categoryId: 'tools',
+      inlineContent: recentTools,
+    });
+  }
+
+  if (conversationTokens > 0) {
+    pushCategory({
+      id: 'conversation',
+      label: 'Conversation',
+      estimatedTokens: conversationTokens,
+      characterCount: userText.length,
+    });
+    pushNode({
+      id: 'relay:conversation',
+      label: 'Current User Message',
+      categoryId: 'conversation',
+      inlineContent: userText,
+    });
+  }
+
+  if (uncategorizedTokens > 0) {
+    pushCategory({
+      id: 'uncategorized',
+      label: 'Other',
+      estimatedTokens: uncategorizedTokens,
+      characterCount: Math.max(0, totalChars - (
+        systemPromptText.length
+        + conversationMemory.length
+        + recentTools.length
+        + userText.length
+      )),
+    });
+  }
+
+  return {
+    breakdown: {
+      totalUsedTokens,
+      maxTokens: clampRelayContextWindowTokens(session?.config?.upstream?.contextWindow),
+      categories,
+    },
+    promptContextUsageTree: {
+      schemaVersion: 1,
+      nodes,
+    },
+  };
+}
+
+function syncRootPromptMessages(session = {}, messages = []) {
+  if (!session?.active) return [];
+  const normalized = Array.isArray(messages) ? messages.filter(Boolean) : [];
+  if (!normalized.length) return Array.isArray(session.rootPromptMessagesJson) ? session.rootPromptMessagesJson : [];
+  const nextIds = [];
+  const knownBlobs = session.promptMessageBlobIds instanceof Set
+    ? session.promptMessageBlobIds
+    : new Set(Array.isArray(session.rootPromptMessagesJson) ? session.rootPromptMessagesJson : []);
+  session.promptMessageBlobIds = knownBlobs;
+  normalized.forEach((message) => {
+    const blobText = JSON.stringify(message);
+    const blobId = crypto.createHash('sha256').update(blobText, 'utf8').digest('base64');
+    nextIds.push(blobId);
+    if (knownBlobs.has(blobId)) return;
+    const blobData = Buffer.from(blobText, 'utf8').toString('base64');
+    writeAgentFrame(session, buildAgentKvSetBlobFrame(blobId, blobData, { id: nextKvServerMessageId(session) }));
+    knownBlobs.add(blobId);
+  });
+  session.rootPromptMessagesJson = nextIds;
+  return nextIds;
+}
+
+function buildContextUsageSnapshot(session = {}, usageMeta = null) {
+  const maxTokens = clampRelayContextWindowTokens(session?.config?.upstream?.contextWindow);
+  const { breakdown, promptContextUsageTree } = buildPromptTokenBreakdownAndTree(session, usageMeta);
+  const usedTokens = Math.min(maxTokens, Math.max(
+    estimateUsedTokensFromUsageMeta(usageMeta || {}),
+    Number(breakdown?.totalUsedTokens) || 0,
+  ));
+  return {
+    usedTokens,
+    maxTokens,
+    breakdown: breakdown
+      ? {
+        ...breakdown,
+        totalUsedTokens: usedTokens,
+        maxTokens,
+      }
+      : null,
+    promptContextUsageTree,
+  };
+}
+
+function syncSessionContextUsage(session = {}, usageMeta = null) {
+  const snapshot = buildContextUsageSnapshot(session, usageMeta);
+  updateSessionHistoryState(session, {
+    token_details_used_tokens: snapshot.usedTokens,
+    token_details_max_tokens: snapshot.maxTokens,
+  });
+  session.contextUsageSnapshot = snapshot;
+  syncCursorComposerContextUsage(session, snapshot);
+  return snapshot;
 }
 
 function canonicalToolName(name) {
@@ -3745,6 +4238,7 @@ function emitAgentMutationCheckpointFrames(session, toolCall, execution, logger)
   ].filter(Boolean)));
   session.readPaths = readPaths;
   try {
+    const contextUsage = session.contextUsageSnapshot || buildContextUsageSnapshot(session, null);
     writeAgentFrame(session, buildAgentKvSetBlobFrame(beforeBlob.idBase64, beforeBlob.dataBase64, { id: nextKvServerMessageId(session) }));
     if (afterBlob.idBase64 !== beforeBlob.idBase64) {
       writeAgentFrame(session, buildAgentKvSetBlobFrame(afterBlob.idBase64, afterBlob.dataBase64, { id: nextKvServerMessageId(session) }));
@@ -3755,6 +4249,10 @@ function emitAgentMutationCheckpointFrames(session, toolCall, execution, logger)
       readPaths,
       fileStates,
       pendingToolCalls: [buildToolCallCheckpointJson(toolCall, execution, 'pending')],
+      usedTokens: contextUsage.usedTokens,
+      maxTokens: contextUsage.maxTokens,
+      breakdown: contextUsage.breakdown,
+      promptContextUsageTree: contextUsage.promptContextUsageTree,
     }));
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
       workspaceRoot,
@@ -3762,6 +4260,10 @@ function emitAgentMutationCheckpointFrames(session, toolCall, execution, logger)
       readPaths,
       fileStates,
       pendingToolCalls: [],
+      usedTokens: contextUsage.usedTokens,
+      maxTokens: contextUsage.maxTokens,
+      breakdown: contextUsage.breakdown,
+      promptContextUsageTree: contextUsage.promptContextUsageTree,
     }));
     logger?.info?.(`agent local relay checkpoint emitted file=${JSON.stringify(filePath)} readPaths=${readPaths.length} contentBlob=${afterBlob.idBase64}`);
   } catch (error) {
@@ -3857,13 +4359,63 @@ function canUseNativePatchEditForTool(toolCall, session) {
   const oldString = String(args.old_string ?? args.oldStr ?? '');
   if (!oldString) return false;
   try {
-    return fs.readFileSync(filePath, 'utf8').includes(oldString);
+    return Boolean(buildFlexibleTextReplacement(fs.readFileSync(filePath, 'utf8'), oldString, '', false));
   } catch {
     return false;
   }
 }
 
+function detectPreferredLineEnding(text = '') {
+  return String(text || '').includes('\r\n') ? '\r\n' : '\n';
+}
+
+function normalizeLineEndings(text = '') {
+  return String(text || '').replace(/\r\n/g, '\n');
+}
+
+function buildFlexibleTextReplacement(beforeContent = '', oldString = '', newString = '', replaceAll = false) {
+  const source = String(beforeContent || '');
+  const oldValue = String(oldString || '');
+  const newValue = String(newString || '');
+  if (!oldValue) return null;
+  if (source.includes(oldValue)) {
+    const afterContent = replaceAll
+      ? source.split(oldValue).join(newValue)
+      : source.replace(oldValue, newValue);
+    return {
+      afterContent,
+      matchedOldString: oldValue,
+      usedNormalizedLineEndings: false,
+    };
+  }
+  const normalizedSource = normalizeLineEndings(source);
+  const normalizedOldValue = normalizeLineEndings(oldValue);
+  if (!normalizedOldValue || !normalizedSource.includes(normalizedOldValue)) return null;
+  const normalizedNewValue = normalizeLineEndings(newValue);
+  const normalizedAfterContent = replaceAll
+    ? normalizedSource.split(normalizedOldValue).join(normalizedNewValue)
+    : normalizedSource.replace(normalizedOldValue, normalizedNewValue);
+  const preferredLineEnding = detectPreferredLineEnding(source);
+  return {
+    afterContent: preferredLineEnding === '\r\n'
+      ? normalizedAfterContent.replace(/\n/g, '\r\n')
+      : normalizedAfterContent,
+    matchedOldString: normalizedOldValue,
+    usedNormalizedLineEndings: true,
+  };
+}
+
 function shouldUseNativeExecForTool(session, toolCall) {
+  // 阶段六：MCP 工具调用需要由 Cursor 客户端执行
+  const mcpSkillContext = session?.lastUserMessageCapture?.mcpSkillContext
+    || session?.mcpSkillContext
+    || null;
+  if (mcpSkillContext?.mcpToolMap) {
+    const toolName = String(toolCall?.name || '').trim();
+    if (mcpSkill.isMcpToolCall({ function: { name: toolName } }, mcpSkillContext.mcpToolMap)) {
+      return true; // MCP 工具走 native exec（发送到 Cursor 客户端执行）
+    }
+  }
   return shouldUseNativeExecForModeTool(session, toolCall, { canUseNativePatchEditForTool });
 }
 
@@ -5285,23 +5837,10 @@ function looksLikeReadOnlyExplorationStillInProgress(session = {}, finalText = '
   const summaries = Array.isArray(session?.toolResultSummaries) ? session.toolResultSummaries : [];
   const readOnlyCount = summaries.filter((entry) => isReadOnlyContextToolName(entry?.tool)).length;
   const mutationCount = summaries.filter((entry) => isMutationToolName(entry?.tool)).length;
-  const continuationTargetPath = getReadOnlyContinuationTargetPath(session);
-  const value = String(finalText || '').trim();
   const sawReliableCompletion = options.lastStreamSawDone === true;
-  const stopReason = String(options.lastStreamStopReason || '').trim();
-  if (!sawReliableCompletion && (stopReason === 'local_stop_after_text' || stopReason === 'local_timeout' || stopReason === 'usage_without_done' || stopReason === 'stream_end')) {
-    return readOnlyCount > 0 && mutationCount === 0;
-  }
-  if (sawReliableCompletion) return false;
-  if (!value) return readOnlyCount > 0 && mutationCount === 0;
-  if (isPlaceholderFinalText(value)) return true;
-  const compact = stripCjkAndAsciiPunctuation(value);
-  if (!compact) return true;
-  if (continuationTargetPath && readOnlyCount >= 1 && mutationCount === 0) {
-    return compact.length <= 140 && countWordsAndCjkChars(value) <= 32;
-  }
-  if ((compact.length <= 80 || countWordsAndCjkChars(value) <= 18) && readOnlyCount >= 2 && mutationCount === 0) return true;
-  return readOnlyCount >= 2 && mutationCount === 0 && compact.length <= 140;
+  if (readOnlyCount <= 0 || mutationCount > 0) return false;
+  if (!sawReliableCompletion) return true;
+  return !textLooksLikeSubstantiveFinalAnswer(finalText);
 }
 
 function isPlatformBillingEnabled(config = {}) {
@@ -5425,10 +5964,16 @@ function buildFetchUpstreamOptionsForSession(session = {}, baseOptions = {}, con
     planWorkflowPhase,
     planPhase: planWorkflowPhase,
   };
+  // 阶段六：传递 MCP 工具到上游请求
+  const mcpSkillContext = session.lastUserMessageCapture?.mcpSkillContext
+    || session.mcpSkillContext
+    || null;
+  const extraMcpTools = mcpSkillContext?.openaiTools || [];
   return {
     ...getUpstreamRequestOptionsByMode(session, mergedContext),
     planWorkflowPhase,
     planPhase: planWorkflowPhase,
+    ...(extraMcpTools.length > 0 ? { extraMcpTools } : {}),
     ...baseOptions,
   };
 }
@@ -5857,10 +6402,11 @@ async function executeRelayTool(toolCall, session, logger) {
           durationMs: Date.now() - startedAt,
         };
       }
-      if (!oldString || !beforeContent.includes(oldString)) {
+      const replacement = buildFlexibleTextReplacement(beforeContent, oldString, newString, replaceAll);
+      if (!replacement) {
         return { ok: false, tool: canonicalToolName(tool), args: { ...args, path: filePath, workspaceRoot }, resultText: 'old_string was not found in the file.', durationMs: Date.now() - startedAt };
       }
-      const afterContent = replaceAll ? beforeContent.split(oldString).join(newString) : beforeContent.replace(oldString, newString);
+      const afterContent = replacement.afterContent;
       fs.writeFileSync(filePath, afterContent, 'utf8');
       session.readPaths = Array.from(new Set([...(Array.isArray(session.readPaths) ? session.readPaths : []), filePath]));
       return {
@@ -6306,7 +6852,7 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
   // 检测缓存回放：伪 Response 上有 _fromCache 标记
   if (upstream && typeof upstream === 'object' && upstream._fromCache) {
     session._cacheHit = { layer: upstream._cacheLayer || 'unknown', cachedAt: upstream._cachedAt || Date.now() };
-    logger?.info?.(`agent local relay cache replay detected requestId=${session.requestId || '-'} phase=${phase} layer=${upstream._cacheLayer}`);
+    session.logger?.info?.(`agent local relay cache replay detected requestId=${session.requestId || '-'} phase=${phase} layer=${upstream._cacheLayer}`);
   }
   session.logger?.info?.(`agent local relay upstream stream start requestId=${session.requestId || '-'} phase=${phase}`);
   try {
@@ -6983,6 +7529,7 @@ async function continueAgentStreamLoop(session, options = {}) {
         compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: postToolPhase });
         upstreamMessages = compacted.messages;
         usageMeta = compacted.usage;
+        session.contextUsageSnapshot = capturePromptContextForSession(session, upstreamMessages);
         let upstream;
         let resumedMode = upstreamMode;
         try {
@@ -7119,6 +7666,7 @@ async function continueAgentStreamLoop(session, options = {}) {
         compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: completionPhase });
         upstreamMessages = compacted.messages;
         usageMeta = compacted.usage;
+        session.contextUsageSnapshot = capturePromptContextForSession(session, upstreamMessages);
         let upstream;
         let resumedMode = upstreamMode;
         try {
@@ -7251,6 +7799,7 @@ async function continueAgentStreamLoop(session, options = {}) {
       compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: continuationPhase });
       upstreamMessages = compacted.messages;
       usageMeta = compacted.usage;
+      session.contextUsageSnapshot = capturePromptContextForSession(session, upstreamMessages);
       let upstream;
       let resumedMode = upstreamMode;
       try {
@@ -7526,6 +8075,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
   const upstreamMessages = buildPendingInteractionResumeMessages(session, pendingInteraction, interactionResponse);
   const compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'interaction_resume' });
   const usageMeta = compacted.usage;
+  session.contextUsageSnapshot = capturePromptContextForSession(session, compacted.messages);
   const promptChars = usageMeta.messageChars;
 
   stats.chatTotal = (stats.chatTotal || 0) + 1;
@@ -7536,75 +8086,168 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
 
   let upstream;
   let upstreamMode = '';
-  try {
-    ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-      activeUpstream,
-      configuredModel,
-      compacted.messages,
-      logger,
-      buildFetchUpstreamOptionsForSession(session, {
-        signal: session.abortController?.signal || null,
-        requestId,
+  const maxRetryAttempts = Number(config.interactionResumeMaxRetries) || 3;
+  let fetchAttempt = 0;
+  // interaction_resume fetch 重试循环（修复"对话被自己结束"问题）
+  while (true) {
+    try {
+      ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+        activeUpstream,
+        configuredModel,
+        compacted.messages,
+        logger,
+        buildFetchUpstreamOptionsForSession(session, {
+          signal: session.abortController?.signal || null,
+          requestId,
+          phase: 'interaction_resume',
+          mode: agentMode,
+          outboundProxy: config.outboundProxy || null,
+          localProxyPort: config.port,
+        }, { phase: 'interaction_resume', agentMode }),
+      ));
+      session.activeUpstreamResponse = upstream;
+      break; // 成功，退出重试循环
+    } catch (error) {
+      if (session.aborted) return;
+      fetchAttempt += 1;
+      // 用 conversation-fix 模块判断是否该重试
+      const retryDecision = conversationFix.shouldRetryInteractionResume(error, fetchAttempt - 1, config);
+      if (retryDecision.shouldRetry && !session.aborted) {
+        logger?.info?.(`agent local relay interaction resume retry requestId=${requestId} attempt=${fetchAttempt}/${maxRetryAttempts} delayMs=${retryDecision.delayMs} error=${error.message}`);
+        await new Promise((r) => setTimeout(r, retryDecision.delayMs));
+        continue; // 重试
+      }
+      // 不再重试，按原逻辑处理（但记录是重试耗尽还是不可重试错误）
+      const summarized = summarizeFetchError(error);
+      recordUpstreamUsagePhase(session, config, {
         phase: 'interaction_resume',
-        mode: agentMode,
-        outboundProxy: config.outboundProxy || null,
-        localProxyPort: config.port,
-      }, { phase: 'interaction_resume', agentMode }),
-    ));
-    session.activeUpstreamResponse = upstream;
-  } catch (error) {
-    if (session.aborted) return;
-    const summarized = summarizeFetchError(error);
-    recordUpstreamUsagePhase(session, config, {
-      phase: 'interaction_resume',
-      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-      model: configuredModel,
-      status: 'fetch_error',
-      error: error.message || String(error),
-      promptChars,
-      meta: usageMeta,
-    });
-    logger?.error?.(`agent local relay interaction resume fetch failed requestId=${requestId}: ${error.message}`);
-    appendSessionHistory(session, {
-      role: 'assistant',
-      kind: 'assistant_text',
-      payload: { text: summarized, error: true },
-    });
-    writeAgentTextFrame(session, summarized);
-    writeAgentFrame(session, buildAgentTurnEndedFrame());
-    session.turnEnded = true;
-    completeSessionHistory(session, 'failed', `interaction-resume-fetch-${requestId}`);
-    finalizeInterceptedAgentSession(session);
-    return;
+        endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+        model: configuredModel,
+        status: 'fetch_error',
+        error: error.message || String(error),
+        promptChars,
+        meta: usageMeta,
+      });
+      logger?.error?.(`agent local relay interaction resume fetch failed requestId=${requestId} attempts=${fetchAttempt}: ${error.message}`);
+      appendSessionHistory(session, {
+        role: 'assistant',
+        kind: 'assistant_text',
+        payload: { text: summarized, error: true },
+      });
+      writeAgentTextFrame(session, summarized);
+      writeAgentFrame(session, buildAgentTurnEndedFrame());
+      session.turnEnded = true;
+      completeSessionHistory(session, 'failed', `interaction-resume-fetch-${requestId}`);
+      finalizeInterceptedAgentSession(session);
+      return;
+    }
   }
 
   if (!upstream.ok) {
     session.activeUpstreamResponse = null;
     if (session.aborted) return;
     const errorText = await upstream.text().catch(() => '');
-    const summarized = summarizeUpstreamFailure(upstream.status, errorText);
-    recordUpstreamUsagePhase(session, config, {
-      phase: 'interaction_resume',
-      endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
-      model: configuredModel,
-      status: 'http_error',
-      httpStatus: upstream.status,
-      error: errorText,
-      promptChars,
-      meta: usageMeta,
-    });
-    logger?.error?.(`agent local relay interaction resume HTTP ${upstream.status} requestId=${requestId} bodyPreview=${JSON.stringify(errorText.slice(0, 300))}`);
-    appendSessionHistory(session, {
-      role: 'assistant',
-      kind: 'assistant_text',
-      payload: { text: summarized, error: true },
-    });
-    writeAgentTextFrame(session, summarized);
-    writeAgentFrame(session, buildAgentTurnEndedFrame());
-    session.turnEnded = true;
-    completeSessionHistory(session, 'failed', `interaction-resume-http-${requestId}`);
-    finalizeInterceptedAgentSession(session);
-    return;
+    // 用 conversation-fix 模块判断 HTTP 错误是否该重试或降级
+    const httpDecision = conversationFix.handleInteractionResumeHttpError(upstream.status, fetchAttempt, config);
+    if (httpDecision.shouldRetry && !session.aborted) {
+      logger?.info?.(`agent local relay interaction resume http retry requestId=${requestId} status=${upstream.status} attempt=${fetchAttempt + 1} delayMs=${httpDecision.delayMs}`);
+      await new Promise((r) => setTimeout(r, httpDecision.delayMs));
+      fetchAttempt += 1;
+      // 重新发起 fetch（回到上面的 while 循环逻辑不方便，这里直接 continue 外层需要重构；
+      // 简化处理：对于 HTTP 错误的重试，我们直接在这里重试一次 fetch）
+      try {
+        ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+          activeUpstream,
+          configuredModel,
+          compacted.messages,
+          logger,
+          buildFetchUpstreamOptionsForSession(session, {
+            signal: session.abortController?.signal || null,
+            requestId,
+            phase: 'interaction_resume',
+            mode: agentMode,
+            outboundProxy: config.outboundProxy || null,
+            localProxyPort: config.port,
+          }, { phase: 'interaction_resume', agentMode }),
+        ));
+        session.activeUpstreamResponse = upstream;
+        if (upstream.ok) {
+          // 重试成功，继续往下走
+        } else {
+          // 重试后仍失败，走降级
+          const retryErrorText = await upstream.text().catch(() => '');
+          const retrySummarized = summarizeUpstreamFailure(upstream.status, retryErrorText);
+          recordUpstreamUsagePhase(session, config, {
+            phase: 'interaction_resume',
+            endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+            model: configuredModel,
+            status: 'http_error',
+            httpStatus: upstream.status,
+            error: retryErrorText,
+            promptChars,
+            meta: usageMeta,
+          });
+          logger?.error?.(`agent local relay interaction resume HTTP ${upstream.status} (after retry) requestId=${requestId}`);
+          appendSessionHistory(session, {
+            role: 'assistant',
+            kind: 'assistant_text',
+            payload: { text: retrySummarized, error: true },
+          });
+          writeAgentTextFrame(session, retrySummarized);
+          // 修复：不再立即 turn_ended，发友好提示让用户可重试
+          if (httpDecision.shouldEndTurn) {
+            writeAgentFrame(session, buildAgentTurnEndedFrame());
+            session.turnEnded = true;
+          }
+          completeSessionHistory(session, 'failed', `interaction-resume-http-${requestId}`);
+          if (httpDecision.shouldEndTurn) finalizeInterceptedAgentSession(session);
+          return;
+        }
+      } catch (retryError) {
+        if (session.aborted) return;
+        const retrySummarized = summarizeFetchError(retryError);
+        logger?.error?.(`agent local relay interaction resume retry fetch failed requestId=${requestId}: ${retryError.message}`);
+        appendSessionHistory(session, {
+          role: 'assistant',
+          kind: 'assistant_text',
+          payload: { text: retrySummarized, error: true },
+        });
+        writeAgentTextFrame(session, retrySummarized);
+        writeAgentFrame(session, buildAgentTurnEndedFrame());
+        session.turnEnded = true;
+        completeSessionHistory(session, 'failed', `interaction-resume-retry-${requestId}`);
+        finalizeInterceptedAgentSession(session);
+        return;
+      }
+    } else {
+      // 不重试，发友好提示
+      const summarized = summarizeUpstreamFailure(upstream.status, errorText);
+      recordUpstreamUsagePhase(session, config, {
+        phase: 'interaction_resume',
+        endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+        model: configuredModel,
+        status: 'http_error',
+        httpStatus: upstream.status,
+        error: errorText,
+        promptChars,
+        meta: usageMeta,
+      });
+      logger?.error?.(`agent local relay interaction resume HTTP ${upstream.status} requestId=${requestId} bodyPreview=${JSON.stringify(errorText.slice(0, 300))}`);
+      appendSessionHistory(session, {
+        role: 'assistant',
+        kind: 'assistant_text',
+        payload: { text: summarized, error: true },
+      });
+      writeAgentTextFrame(session, summarized);
+      // 修复：不再立即 turn_ended（除非 httpDecision.shouldEndTurn）
+      if (httpDecision.shouldEndTurn) {
+        writeAgentFrame(session, buildAgentTurnEndedFrame());
+        session.turnEnded = true;
+      }
+      completeSessionHistory(session, 'failed', `interaction-resume-http-${requestId}`);
+      if (httpDecision.shouldEndTurn) finalizeInterceptedAgentSession(session);
+      return;
+    }
   }
 
   const streamed = await streamAgentUpstreamResponse(upstream, session, {
@@ -7719,6 +8362,7 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     const compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: 'initial' });
     upstreamMessages = compacted.messages;
     const usageMeta = compacted.usage;
+    session.contextUsageSnapshot = capturePromptContextForSession(session, upstreamMessages);
     const promptChars = usageMeta.messageChars;
 
     stats.chatTotal = (stats.chatTotal || 0) + 1;
@@ -8027,6 +8671,8 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
         abortAgentSession(previous, logger, 'runsse_replaced');
       }
       agentSessions.set(requestId, session);
+      // 注册到状态守护：定期推送模型列表 KV
+      stateGuard.registerSession(requestId, session);
       const pending = pendingAgentMessages.get(requestId);
       if (pending?.userText) {
         pendingAgentMessages.delete(requestId);
@@ -8062,8 +8708,12 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
 
 async function handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const rawBody = await readRequestBody(req);
-  const decoded = decodeBidiAppendRequest(rawBody);
-  const protocolOneof = decoded.debug?.agentClientMessage?.oneof || '-';
+  // 优先用 protobufjs v2 解码（返回完整 clientMessage + MCP/Skill 字段），失败兜底手写版
+  let decoded = protocolV2.decodeBidiAppendRequest(rawBody, { fallbackToLegacy: true });
+  if (!decoded) decoded = decodeBidiAppendRequest(rawBody);
+  const protocolOneof = decoded.debug?.agentClientMessage?.oneof
+    || decoded.debug?.agentClientMessage?.message
+    || '-';
   const userTextPreview = String(decoded.userText || '').slice(0, 300);
 
   stats.seenBidiAppend = (stats.seenBidiAppend || 0) + 1;
@@ -8246,6 +8896,47 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         }
         return;
       }
+      // conversationAction.userMessageAction — 后续用户消息
+      // 某些 Cursor 版本会通过 conversationAction.userMessageAction 发送后续消息，
+      // 而不是发新的 runRequest。把它当作普通 user_message 处理。
+      if (actionKind === 'user_message_action' && decoded.userText) {
+        const normalizedUserText = trimRelayText(decoded.userText, 12000);
+        const userWorkspaceRoot = selectWorkspaceRootForUserMessage(decoded.debug?.workspaceRoot || '', logger, decoded.requestId, normalizedUserText);
+        const userStableConvId = extractStableConversationId(decoded.debug || null)
+          || String(action.requestContext?.stableConversationId || '').trim();
+        logger.info(
+          `agent local relay conversation_action user_message_action requestId=${decoded.requestId} sessionActive=${session?.active ? '1' : '0'} textLen=${normalizedUserText.length} workspaceRoot=${JSON.stringify(userWorkspaceRoot)}`,
+        );
+        if (session?.active && !session.relaying) {
+          // 把 conversationAction 的 requestContext 也喂给 MCP/Skill 提取
+          try {
+            const ctxMsg = { runRequest: { action: { userMessageAction: action } } };
+            const ctx = mcpSkill.buildMcpSkillContext(ctxMsg);
+            if (ctx && (ctx.mcpToolCount > 0 || ctx.systemPromptContext)) {
+              session.mcpSkillContext = ctx;
+              logger.info(`conversation_action user_message MCP/Skill ctx mcpTools=${ctx.mcpToolCount} sysPromptLen=${ctx.systemPromptContext.length}`);
+            }
+          } catch {}
+          session.lastUserMessageCapture = {
+            capturedAt: new Date().toISOString(),
+            requestId: decoded.requestId,
+            kind: 'user_message',
+            userText: normalizedUserText,
+            workspaceRoot: userWorkspaceRoot,
+            stableConversationId: userStableConvId,
+            debug: decoded.debug || null,
+          };
+          session.workspaceRoot = userWorkspaceRoot || session.workspaceRoot || '';
+          beginInterceptedAgentSession(session, logger);
+          relayAgentUserMessage(session, normalizedUserText, config, logger, stats)
+            .catch((error) => failAgentRelaySession(session, logger, error, 'conversation_action_user_message'));
+          ack();
+          return;
+        }
+      }
+      logger.info(
+        `agent local relay conversation_action unhandled kind=${actionKind || '-'} requestId=${decoded.requestId || '-'} acked`,
+      );
       ack();
       return;
     }
@@ -8391,8 +9082,25 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
 
     if (decoded.kind === 'user_message' && decoded.requestId && decoded.userText) {
       const normalizedUserText = trimRelayText(decoded.userText, 12000);
-      const workspaceRoot = selectWorkspaceRootForUserMessage(decoded.debug?.workspaceRoot || '', logger, decoded.requestId);
+      const workspaceRoot = selectWorkspaceRootForUserMessage(decoded.debug?.workspaceRoot || '', logger, decoded.requestId, normalizedUserText);
       const stableConversationId = extractStableConversationId(decoded.debug || null);
+      // 提取 MCP/Skill 上下文（阶段六：MCP 工具调用与 Skill 透传）
+      const mcpSkillContext = (() => {
+        try {
+          const clientMsg = decoded.debug?.agentClientMessage || decoded.clientMessage;
+          if (!clientMsg) return null;
+          const ctx = mcpSkill.buildMcpSkillContext(clientMsg);
+          if (ctx.mcpToolCount > 0 || ctx.systemPromptContext) {
+            logger.info(
+              `MCP/Skill context extracted requestId=${decoded.requestId} mcpTools=${ctx.mcpToolCount} openaiTools=${ctx.openaiTools.length} rules=${ctx.skills?.rules?.length || 0} agentSkills=${ctx.skills?.agentSkills?.length || 0} mcpInstr=${ctx.mcpInstructions?.length || 0} sysPromptLen=${ctx.systemPromptContext.length}`,
+            );
+            return ctx;
+          }
+        } catch (e) {
+          logger?.warn?.(`MCP/Skill context extraction failed: ${e.message}`);
+        }
+        return null;
+      })();
       const capture = {
         capturedAt: new Date().toISOString(),
         requestId: decoded.requestId,
@@ -8405,6 +9113,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         workspaceRoot,
         stableConversationId,
         debug: decoded.debug || null,
+        mcpSkillContext,
       };
       const completedTurn = getCompletedAgentTurn(completedAgentTurns, decoded.requestId, normalizedUserText, workspaceRoot, decoded.debug || null);
       if (completedTurn) {
@@ -8546,6 +9255,11 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
     return;
   }
 
+  // ── 认证/订阅接口拦截（修复 Log in ⚡ / stripeMembershipType 缺失） ──
+  if (await authIntercept.handleAuthIntercept(req, res, pathname, config, logger)) {
+    return; // 已处理，不需要转发
+  }
+
   if (isRepositoryServicePath(pathname) && method === 'POST') {
     const rawBody = await readRequestBody(req);
     logger.info(`protocol RepositoryService path=${pathname} rawLen=${rawBody.length}`);
@@ -8553,7 +9267,383 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
     return;
   }
 
+  // 模型列表注入：拦截 AvailableModels / GetUsableModels / GetDefaultModelForCli 响应
+  if (method === 'POST' && modelInjection.isModelListPath(pathname)) {
+    await handleModelListRequest(req, res, config, logger, stats, pathname);
+    return;
+  }
+
+  // 阶段七：StreamCpp 代码补全拦截
+  if (method === 'POST' && streamCpp.isStreamCppPath(pathname)) {
+    await handleStreamCppRequest(req, res, config, logger, stats);
+    return;
+  }
+
+  // 阶段七：CppConfig 补全配置
+  if (method === 'POST' && streamCpp.isCppConfigPath(pathname)) {
+    await handleCppConfigRequest(req, res, config, logger, stats);
+    return;
+  }
+
+  // 阶段七：RecordCppFate 补全结果记录（直接返回空响应）
+  if (method === 'POST' && streamCpp.isRecordCppFatePath(pathname)) {
+    await handleRecordCppFateRequest(req, res, config, logger, stats);
+    return;
+  }
+
   await forwardMitmHttpsRequest(req, res, logger);
+}
+
+/**
+ * 处理模型列表请求：先转发到上游拿到完整响应，注入本地模型后回写客户端
+ * 如果上游失败或返回空列表，直接返回本地模型（确保 Models 页面不显示 "No models available"）
+ */
+async function handleModelListRequest(req, res, config, logger, stats, pathname) {
+  const rawBody = await readRequestBody(req);
+  stats.modelListRequests = (stats.modelListRequests || 0) + 1;
+  logger.info(`protocol model-list path=${pathname} rawLen=${rawBody.length}`);
+
+  // 收集本地模型（无论上游是否成功，我们都要尝试返回这些）
+  const localModels = modelInjection.collectLocalModels();
+  const hasLocalModels = Array.isArray(localModels) && localModels.length > 0;
+
+  // 尝试转发到上游
+  let upstreamResp = null;
+  let respChunks = [];
+  let upstreamOk = false;
+  try {
+    upstreamResp = await fetchUpstreamForModelList(req, pathname, rawBody, config, logger);
+    if (upstreamResp && upstreamResp.ok) {
+      upstreamOk = true;
+    }
+  } catch (err) {
+    logger.error(`model-list upstream fetch failed path=${pathname}: ${err.message}`);
+  }
+
+  // 捕获上游响应体
+  if (upstreamResp) {
+    try {
+      if (upstreamResp.body) {
+        const reader = upstreamResp.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          respChunks.push(Buffer.from(value));
+        }
+      }
+    } catch (e) {
+      logger.warn(`model-list read upstream body failed: ${e.message}`);
+    }
+  }
+
+  const fullBody = Buffer.concat(respChunks);
+
+  // ── 决定最终响应体 ──
+
+  let finalBody;
+  let responseSource = 'upstream';
+
+  if (upstreamOk && fullBody.length > 0) {
+    // 上游成功：尝试注入本地模型
+    try {
+      const injected = modelInjection.injectModelListResponse(pathname, fullBody);
+      if (injected) {
+        finalBody = injected;
+        stats.modelListInjected = (stats.modelListInjected || 0) + 1;
+        logger.info(`model-list injected path=${pathname} original=${fullBody.length} injected=${finalBody.length}`);
+      } else {
+        finalBody = fullBody; // 注入不需要（可能已经有本地模型了）
+      }
+    } catch (err) {
+      logger.error(`model-list inject failed path=${pathname}: ${err.message}`);
+      finalBody = fullBody;
+    }
+
+    // 检查上游响应是否为空（401 可能返回空但 status=200）
+    if (!hasLocalModels || fullBody.length < 50) {
+      // 上游响应太短或没有本地模型需要补充，直接用上游的
+    }
+  } else if (hasLocalModels) {
+    // 上游失败但有本地模型：生成纯本地模型的伪造响应
+    logger.info(`model-list upstream failed (${upstreamResp?.status || 'no-response'}), using ${localModels.length} local models only`);
+    finalBody = buildFakeModelListResponse(pathname, localModels);
+    responseSource = 'local-only';
+  } else {
+    // 上游失败且无本地模型
+    if (!res.headersSent) {
+      res.writeHead(upstreamResp?.status || 502, { 'Content-Type': 'text/plain' });
+      res.end(`model list unavailable: ${upstreamResp?.status || 'no response from upstream'}`);
+    }
+    return;
+  }
+
+  // 回写客户端
+  if (!res.headersSent) {
+    const headers = { 'Content-Type': upstreamResp?.headers?.get('content-type') || 'application/proto' };
+    if (responseSource === 'local-only') {
+      headers['Content-Type'] = 'application/proto';
+    }
+    res.writeHead(upstreamResp ? (upstreamResp.ok ? 200 : (upstreamResp.status || 200)) : 200, headers);
+  }
+  res.end(finalBody);
+}
+
+/**
+ * 当上游不可用时，构建纯本地模型的伪造响应
+ * 注意：这些模型相关 RPC 都是 unary application/proto，不是 Connect stream frame。
+ */
+function buildFakeModelListResponse(pathname, localModels) {
+  try {
+    const { encodeMessageSync } = require('./cursor-relay-protobuf');
+
+    if (pathname === modelInjection.AVAILABLE_MODELS_PATH) {
+      // [FIX #3] AvailableModelsResponse.models 用正确的 AvailableModel 字段（非 ModelDetails 占位）
+      const payload = encodeMessageSync('aiserver.v1.AvailableModelsResponse', {
+        modelNames: localModels.map((m) => m.modelName),
+        // Cursor UI 从每个 AvailableModel 读: name, supportsAgent(=#5), clientDisplayName(=#17), serverModelName(=#18)
+        // 缺少 supportsAgent → 模型不出现在 Agent 下拉框
+        models: localModels.map((m) => ({
+          name: m.modelName,                                    // #1
+          defaultOn: false,                                      // #2
+          supportsAgent: true,                                   // #5 ← **关键！**
+          supportsThinking: true,                                // #9
+          supportsImages: true,                                  // #10
+          supportsAutoContext: true,                             // #11 支持自动上下文
+          autoContextMaxTokens: 200000,                          // #12
+          autoContextExtendedMaxTokens: 200000,                  // #13
+          supportsMaxMode: true,                                 // #14
+          contextTokenLimit: 200000,                             // #15 上下文 token 限制
+          supportsNonMaxMode: true,                              // #19
+          supportsPlanMode: true,                                // #22
+          supportsSandboxing: true,                              // #25
+          supportsCmdK: true,                                    // #26 支持 Cmd+K
+          clientDisplayName: m.displayName || m.modelName,       // #17
+          serverModelName: m.modelName,                          // #18
+          inputboxShortModelName: m.displayNameShort || m.displayName || m.modelName, // #24
+          degradationStatus: 0,                                  // #6 UNSPECIFIED
+        })),
+      });
+      return payload;
+    }
+
+    if (pathname === modelInjection.GET_USABLE_MODELS_PATH) {
+      // GetUsableModelsResponse: { models: ModelDetails[] }
+      const payload = encodeMessageSync('agent.v1.GetUsableModelsResponse', {
+        models: localModels.map((m) => ({
+          modelId: m.modelId,
+          displayModelId: m.modelId,
+          displayName: m.displayName,
+          displayNameShort: m.displayNameShort,
+          aliases: [m.modelName],
+        })),
+      });
+      return payload;
+    }
+
+    if (pathname === modelInjection.GET_DEFAULT_MODEL_PATH) {
+      const store = require('./cursor-relay-profile-store').loadRelayProfileStore('');
+      const activeProfile = Array.isArray(store.configs)
+        ? store.configs.find((c) => String(c.id) === String(store.activeId))
+        : null;
+      // GetDefaultModelForCliResponse { ModelDetails model = 1; } — model 是嵌套消息
+      const defaultModelName = activeProfile?.modelName || (localModels[0]?.modelName || 'default');
+      const defaultDisplayName = activeProfile?.name || defaultModelName;
+      const payload = encodeMessageSync('agent.v1.GetDefaultModelForCliResponse', {
+        model: {
+          modelId: defaultModelName,
+          displayModelId: defaultModelName,
+          displayName: defaultDisplayName,
+          displayNameShort: String(defaultDisplayName).slice(0, 20),
+          aliases: [defaultModelName],
+        },
+      });
+      return payload;
+    }
+
+    // 兜底：返回 JSON 格式
+    return JSON.stringify({ models: localModels });
+  } catch (e) {
+    return JSON.stringify({ models: localModels });
+  }
+}
+
+/**
+ * 用 fetch 转发模型列表请求到 Cursor 官方 API
+ */
+async function fetchUpstreamForModelList(req, pathname, rawBody, config, logger) {
+  const host = 'api3.cursor.sh';
+  const url = `https://${host}${pathname}`;
+  const headers = {};
+  // 透传客户端请求头
+  const reqHeaders = req.headers || {};
+  for (const key of ['authorization', 'content-type', 'user-agent', 'x-cursor-checksum', 'x-cursor-client-version', 'x-ghost-mode']) {
+    if (reqHeaders[key]) headers[key] = reqHeaders[key];
+  }
+  if (!headers['content-type']) headers['content-type'] = 'application/proto';
+  return fetch(url, {
+    method: 'POST',
+    headers,
+    body: rawBody,
+  });
+}
+
+// ── 阶段七：StreamCpp 代码补全处理 ──────────────────────────
+
+/**
+ * 处理 StreamCpp 请求：解码 Cursor 请求 → 转换为 OpenAI 请求 → 流式返回补全
+ */
+async function handleStreamCppRequest(req, res, config, logger, stats) {
+  const rawBody = await readRequestBody(req);
+  stats.streamCppRequests = (stats.streamCppRequests || 0) + 1;
+  logger.info(`protocol StreamCpp rawLen=${rawBody.length}`);
+
+  // 解码 StreamCpp 请求
+  const decoded = streamCpp.decodeStreamCppRequest(rawBody);
+  if (!decoded) {
+    logger.warn('StreamCpp decode failed, forwarding to upstream');
+    await forwardMitmHttpsRequest(req, res, logger, rawBody);
+    return;
+  }
+
+  logger.info(
+    `StreamCpp decoded file=${decoded.currentFile.relativeWorkspacePath || '-'} lang=${decoded.languageId} cursor=${decoded.cursorPosition.line}:${decoded.cursorPosition.column} prefixLen=${decoded.prefix.length} suffixLen=${decoded.suffix.length}`,
+  );
+
+  // 如果不是本地 relay 模式，直接转发
+  if (!isLocalRelayMode(config)) {
+    await forwardMitmHttpsRequest(req, res, logger, rawBody);
+    return;
+  }
+
+  // 解析上游配置
+  const configuredModel = resolveRequestedUpstreamModel(config, {
+    requestedModel: decoded.modelName || '',
+  });
+  const upstream = resolveUpstreamForModel(config, configuredModel);
+  // 代码补全用单独的模型（如果有配置）
+  const completionUpstream = {
+    baseUrl: upstream.baseUrl,
+    apiKey: upstream.apiKey,
+    completionModel: config.completionModel || configuredModel,
+    model: config.completionModel || configuredModel,
+  };
+
+  const openaiReq = streamCpp.buildStreamCppOpenAIRequest(decoded, completionUpstream);
+  const bindingId = streamCpp.generateBindingId();
+  const cursorLine = decoded.cursorPosition.line || 1;
+
+  // 写入响应头
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Transfer-Encoding': 'chunked',
+  });
+
+  try {
+    // 写入初始帧（模型信息 + 替换范围）
+    res.write(streamCpp.buildRangeToReplaceFrame(cursorLine, cursorLine, bindingId, true));
+
+    // 请求上游模型
+    const upstreamFetch = createProxyAwareFetch(config.outboundProxy || null, {
+      localProxyPorts: [config.port].filter(Boolean),
+    });
+    const upstreamResp = await upstreamFetch(openaiReq.url, openaiReq.options);
+
+    if (!upstreamResp.ok) {
+      logger.warn(`StreamCpp upstream error: ${upstreamResp.status} ${upstreamResp.statusText}`);
+      res.write(streamCpp.buildDoneStreamFrame(bindingId));
+      res.write(streamCpp.buildStreamCppEndFrame());
+      res.end();
+      return;
+    }
+
+    // 解析 SSE 流，转发补全文本
+    const reader = upstreamResp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let totalText = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+        const parsed = streamCpp.parseOpenAISSEDelta(trimmed);
+        if (parsed.text) {
+          totalText += parsed.text;
+          res.write(streamCpp.buildTextDeltaFrame(parsed.text, bindingId));
+        }
+        if (parsed.done) break;
+      }
+    }
+
+    // 处理剩余 buffer
+    if (buffer.trim().startsWith('data: ')) {
+      const parsed = streamCpp.parseOpenAISSEDelta(buffer.trim());
+      if (parsed.text) {
+        totalText += parsed.text;
+        res.write(streamCpp.buildTextDeltaFrame(parsed.text, bindingId));
+      }
+    }
+
+    // 写入完成帧
+    res.write(streamCpp.buildDoneStreamFrame(bindingId));
+    res.write(streamCpp.buildStreamCppEndFrame());
+    res.end();
+
+    logger.info(`StreamCpp completed bindingId=${bindingId} textLen=${totalText.length}`);
+  } catch (err) {
+    logger.error(`StreamCpp error: ${err.message}`);
+    try {
+      res.write(streamCpp.buildDoneStreamFrame(bindingId));
+      res.write(streamCpp.buildStreamCppEndFrame());
+    } catch {}
+    try { res.end(); } catch {}
+  }
+}
+
+/**
+ * 处理 CppConfig 请求：返回默认配置
+ */
+async function handleCppConfigRequest(req, res, config, logger, stats) {
+  const rawBody = await readRequestBody(req);
+  stats.cppConfigRequests = (stats.cppConfigRequests || 0) + 1;
+  logger.info(`protocol CppConfig rawLen=${rawBody.length}`);
+
+  // 本地 relay 模式：返回默认配置
+  if (isLocalRelayMode(config)) {
+    res.writeHead(200, { 'Content-Type': 'application/proto' });
+    res.end(streamCpp.buildDefaultCppConfigResponse());
+    logger.info('CppConfig returned default config');
+    return;
+  }
+
+  // 非 relay 模式：转发
+  await forwardMitmHttpsRequest(req, res, logger, rawBody);
+}
+
+/**
+ * 处理 RecordCppFate 请求：直接返回空响应
+ */
+async function handleRecordCppFateRequest(req, res, config, logger, stats) {
+  const rawBody = await readRequestBody(req);
+  stats.recordCppFateRequests = (stats.recordCppFateRequests || 0) + 1;
+  logger.info(`protocol RecordCppFate rawLen=${rawBody.length}`);
+
+  // RecordCppFate 不需要上报，直接返回空响应
+  if (isLocalRelayMode(config)) {
+    res.writeHead(200, { 'Content-Type': 'application/proto' });
+    res.end(streamCpp.buildRecordCppFateResponse());
+    return;
+  }
+
+  // 非 relay 模式：转发
+  await forwardMitmHttpsRequest(req, res, logger, rawBody);
 }
 
 function trackRunnerEvent(stats, kind, value) {
@@ -8574,6 +9664,170 @@ function getConfigCustomRoot(config = {}) {
   const logPath = String(config.logPath || '').trim();
   if (logPath) return path.dirname(logPath);
   return '';
+}
+
+/**
+ * [DIAG] 构建运行时缓存诊断信息 — 用于排查账号/模型/模式问题
+ * 通过 /__cursorpool__/diagnostics 端点暴露，renderer.js init 时自动调用并打印
+ */
+function buildRuntimeDiagnostics(config, logger) {
+  const diag = {
+    timestamp: new Date().toISOString(),
+    pid: process.pid,
+    uptimeSec: Math.round(process.uptime()),
+    // ── 1. Protobuf root 状态 ──
+    proto: { loaded: false, error: null },
+    // ── 2. Auth 拦截统计 ──
+    authIntercept: { interceptedCount: 0, endpoints: [] },
+    // ── 3. 模型注入状态 ──
+    modelInjection: { localModels: [], collectError: null, injectStats: {} },
+    // ── 4. State Guard 状态 ──
+    stateGuard: { dbMembershipType: null, dbPath: null, guardRunning: false },
+    // ── 5. Relay Profile Store ──
+    profileStore: { activeId: null, configCount: 0, configs: [] },
+    // ── 6. Account Store / 模板 ──
+    accountStore: { templateEmail: null, templateMembership: null, dbEmail: null },
+    // ── 7. Mode Registry ──
+    modeRegistry: {},
+  };
+
+  try {
+    // 1. Proto root
+    try {
+      const { getRootSync } = require('./cursor-relay-protobuf');
+      const root = getRootSync();
+      if (root && root.lookupType) {
+        diag.proto.loaded = true;
+        // 验证关键类型可解析
+        try {
+          const amr = root.lookupType('aiserver.v1.AvailableModelsResponse');
+          diag.proto.availableModelsResponse = !!amr;
+          if (amr) {
+            for (const [, f] of Object.entries(amr.fields || {})) {
+              if (f.name === 'models') {
+                diag.proto.modelsFieldType = f.resolvedType ? f.resolvedType.name : 'UNRESOLVED';
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          diag.proto.typeLookupError = e.message;
+        }
+      } else {
+        diag.proto.error = 'getRootSync returned null/undefined';
+      }
+    } catch (e) {
+      diag.proto.error = e.message;
+    }
+
+    // 2. Auth intercept stats
+    try {
+      const ai = require('./cursor-relay-auth-intercept');
+      diag.authIntercept.interceptedCount = ai.stats?.authIntercepted || 0;
+      diag.authIntercept.endpoints = [
+        ...Object.keys(ai.AUTH_ENDPOINTS || {}),
+        ...Object.keys(ai.HEALTH_CHECK_ENDPOINTS || {}),
+      ];
+    } catch (e) {
+      diag.authIntercept.error = e.message;
+    }
+
+    // 3. Model injection — collectLocalModels()
+    try {
+      const mi = require('./cursor-relay-model-injection');
+      const localModels = mi.collectLocalModels();
+      diag.modelInjection.localModels = Array.isArray(localModels) ? localModels : [];
+      // 尝试读取 modelRoutes 配置中的所有模型名
+      diag.modelInjection.configuredModelNames = getConfiguredModelRoutes(config).map((r) => r.modelName);
+      diag.modelInjection.upstreamAvailableModels = Array.isArray(config.upstream?.availableModels)
+        ? config.upstream.availableModels
+        : [config.upstream?.modelName].filter(Boolean);
+    } catch (e) {
+      diag.modelInjection.collectError = e.message;
+    }
+
+    // 4. State Guard — DB membership type
+    try {
+      const sg = require('./cursor-relay-state-guard');
+      diag.stateGuard.guardRunning = typeof sg.isStateGuardActive === 'function'
+        ? sg.isStateGuardActive()
+        : typeof sg.getGuardStatus === 'function'
+          ? sg.getGuardStatus()?.running || false
+          : !!guardTimers.dbPoll || false; // fallback: check if timer exists
+      // 直接读 DB（复用 state-guard 的 readCurrentDbMembershipType 或手动查）
+      try {
+        const { getStateVscdbPath, readItemSafe } = require('./cursor-local-state');
+        const Database = require('better-sqlite3');
+        const dbPath = getStateVscdbPath();
+        diag.stateGuard.dbPath = dbPath;
+        if (dbPath && require('fs').existsSync(dbPath)) {
+          const db = new Database(dbPath, { readonly: true });
+          const mt = readItemSafe(db, 'ItemTable', 'cursorAuth/stripeMembershipType')
+            || readItemSafe(db, 'ItemTable', 'stripeMembershipType');
+          diag.stateGuard.dbMembershipType = mt == null ? null : String(mt);
+          const email = readItemSafe(db, 'ItemTable', 'cursorAuth/cachedEmail')
+            || readItemSafe(db, 'ItemTable', 'cursor.email');
+          diag.stateGuard.dbEmail = email == null ? null : String(email);
+          db.close();
+        }
+      } catch (e2) {
+        diag.stateGuard.dbReadError = e2.message;
+      }
+    } catch (e) {
+      diag.stateGuard.error = e.message;
+    }
+
+    // 5. Profile store
+    try {
+      const ps = require('./cursor-relay-profile-store').loadRelayProfileStore('');
+      diag.profileStore.activeId = ps.activeId;
+      diag.profileStore.configCount = Array.isArray(ps.configs) ? ps.configs.length : 0;
+      if (Array.isArray(ps.configs)) {
+        diag.profileStore.configs = ps.configs.slice(0, 10).map((c) => ({
+          id: c.id,
+          name: c.name || '(unnamed)',
+          modelName: c.modelName || '',
+          baseUrl: (c.upstream || {}).baseUrl || '',
+          enabled: c.enabled !== false,
+        }));
+      }
+    } catch (e) {
+      diag.profileStore.error = e.message;
+    }
+
+    // 6. Account store / defult_user.json 模板
+    try {
+      const as = require('./cursor-relay-account-store');
+      const tmpl = as.readDefaultUserTemplate();
+      if (tmpl) {
+        diag.accountStore.templateEmail = tmpl['cursorAuth/cachedEmail'] || tmpl['cursor.email'] || null;
+        diag.accountStore.templateMembership = tmpl['cursorAuth/stripeMembershipType'] || tmpl['stripeMembershipType'] || null;
+      }
+    } catch (e) {
+      diag.accountStore.templateError = e.message;
+    }
+
+    // 7. Mode registry — 所有已注册的模式
+    try {
+      const registry = require('../mode/registry');
+      const modeNames = ['AGENT_MODE_AGENT','AGENT_MODE_ASK','AGENT_MODE_PLAN','AGENT_MODE_DEBUG','AGENT_MODE_TRIAGE','AGENT_MODE_PROJECT','AGENT_MODE_MULTITASK'];
+      diag.modeRegistry.registered = {};
+      for (const mn of modeNames) {
+        const dir = registry.getCursorModeDirectory(mn);
+        const hasPrompt = registry.readModeText(mn, 'system_prompt.txt') ? true : false;
+        const hasReminder = registry.readModeText(mn, 'system_reminder.txt') ? true : false;
+        const hasTools = registry.getCursorModeFilePath(mn, 'tools.json')
+          && require('fs').existsSync(registry.getCursorModeFilePath(mn, 'tools.json'));
+        diag.modeRegistry.registered[mn] = { dir, hasPrompt, hasReminder, hasTools };
+      }
+    } catch (e) {
+      diag.modeRegistry.error = e.message;
+    }
+  } catch (e) {
+    diag._buildError = e.message;
+  }
+
+  return diag;
 }
 
 function startProxy(config) {
@@ -8620,6 +9874,7 @@ function startProxy(config) {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info('shutting down cursor relay proxy');
+    try { stateGuard.stopStateGuard(); } catch { /* ignore */ }
     try {
       for (const session of Array.from(agentSessions.values())) {
         abortAgentSession(session, logger, 'runner_shutdown');
@@ -8673,6 +9928,28 @@ function startProxy(config) {
     logger.info(`tls CONNECT-bridge listening on 127.0.0.1:${connectBridgePort}`);
   });
 
+  // ── 启动状态守护：防止 Cursor 官方覆盖账号/模型缓存 ──
+  stateGuard.startStateGuard({
+    initialDelay: Number(config.stateGuardInitialDelay) || 5000,
+    config: {
+      dbPollInterval: Number(config.stateGuardDbPollInterval) || 10000,
+      kvPushInterval: Number(config.stateGuardKvPushInterval) || 15000,
+    },
+    onReady: (result) => {
+      logger.info(
+        `state-guard ready email=${result.email || '-'} source=${result.source || '-'} written=${!!result.written}`,
+      );
+      // 同时同步到 defult_user.json 模板（反向缓存）
+      try { stateGuard.syncCursorLoginToTemplate?.(); } catch {}
+    },
+  }).then((stateGuardResult) => {
+    logger.info(
+      `state-guard started status=${JSON.stringify(stateGuardResult)} initialDelay=${stateGuardResult.initialDelay}ms`,
+    );
+  }).catch((err) => {
+    logger.error(`state-guard start failed: ${err.message}`);
+  });
+
   let directMitmServer = null;
   if (stats.directMitmPort) {
     directMitmServer = http2.createSecureServer(tlsOptions, (req, res) => {
@@ -8709,6 +9986,7 @@ function startProxy(config) {
         directMitmPort: stats.directMitmPort,
         mode,
         upstreamBaseUrl: String(config.upstream?.baseUrl || ''),
+        upstreamDisplayName: String(config.upstream?.displayName || config.upstream?.modelName || ''),
         upstreamModelName: String(config.upstream?.modelName || ''),
         upstreamAvailableModels: Array.isArray(config.upstream?.availableModels)
           ? config.upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
@@ -8722,12 +10000,12 @@ function startProxy(config) {
         upstreamEndpointMode: String(config.upstream?.endpointMode || 'responses'),
         upstreamReasoningEffort: String(config.upstream?.reasoningEffort || 'medium'),
         upstreamThinkingMode: String(config.upstream?.thinkingMode || ''),
-        upstreamContextWindow: Number(config.upstream?.contextWindow) || 250000,
+        upstreamContextWindow: clampRelayContextWindowTokens(config.upstream?.contextWindow),
         outboundProxy: config.outboundProxy || null,
         mockAgentTools: Boolean(config.mockAgentTools),
         mockAgentProtoTools: Boolean(config.mockAgentProtoTools),
-        localNativeAgentTools: Boolean(config.localNativeAgentTools),
-        structuredAgentToolCalls: Boolean(config.structuredAgentToolCalls),
+        localNativeAgentTools: config.localNativeAgentTools !== false,
+        structuredAgentToolCalls: config.structuredAgentToolCalls !== false,
         emitLocalToolInteractionFrames: config.emitLocalToolInteractionFrames !== false,
         emitLocalStepFrames: Boolean(config.emitLocalStepFrames),
         emitSyntheticLocalNativeToolFrames: Boolean(config.emitSyntheticLocalNativeToolFrames),
@@ -8742,6 +10020,19 @@ function startProxy(config) {
         localControlPlane: isLocalRelayMode(config),
         stats,
       }));
+      return;
+    }
+
+    // ── [DIAG] 完整运行时缓存状态端点 ──
+    if (req.url === '/__cursorpool__/diagnostics') {
+      try {
+        const diag = buildRuntimeDiagnostics(config, logger);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(diag, null, 2));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: e.message, stack: e.stack }, null, 2));
+      }
       return;
     }
 
@@ -8806,8 +10097,9 @@ function startProxy(config) {
       writeConnectError(clientSocket, 'MITM bridge not ready');
       return;
     }
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    // 修复竞态条件：等 bridge 连接成功后再发 200，避免 bridge 失败时客户端已开始 TLS 握手导致 WRONG_VERSION_NUMBER
     const bridgeSocket = net.connect(connectBridgePort, '127.0.0.1', () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head?.length) bridgeSocket.write(head);
       clientSocket.pipe(bridgeSocket);
       bridgeSocket.pipe(clientSocket);
@@ -8855,6 +10147,19 @@ function main() {
   const args = parseArgs(process.argv);
   if (!args.configPath) throw new Error('Missing --config path');
   const config = loadConfig(args.configPath);
+
+  // [FIX #1] 预加载 protobuf root — 模型注入的同步编解码依赖此
+  const { loadCursorProtoRoot } = require('./cursor-relay-protobuf');
+  loadCursorProtoRoot()
+    .then(() => {
+      const logger = createLogger(getConfigCustomRoot(config));
+      logger.info('protobuf root pre-loaded successfully (sync encode/decode ready)');
+    })
+    .catch((err) => {
+      const logger = createLogger(getConfigCustomRoot(config));
+      logger.error(`protobuf root pre-load failed (model injection may not work): ${err.message}`);
+    });
+
   startProxy(config);
 }
 

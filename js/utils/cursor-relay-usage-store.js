@@ -1,14 +1,14 @@
 const fs = require('fs');
 const path = require('path');
 const { getRelayDataDir } = require('./cursor-relay-cert');
-const { matchModelPrice, getAllPriceSources, PRICE_SOURCES } = require('./model-pricing');
+const { matchModelPrice } = require('./model-pricing');
 
 const DB_FILE_NAME = 'usage.db';
-const PRICE_SOURCE = 'multi_provider_api_pricing_2026-06-10';
-const PRICE_SOURCE_URL = 'multi-provider official API pricing';
 const USD_PER_POINT = 0.02;
 
 let dbCache = new Map();
+let historySyncCache = new Map();
+const HISTORY_SYNC_MIN_INTERVAL_MS = 30000;
 let Database = null;
 
 function loadDatabaseCtor() {
@@ -33,6 +33,7 @@ function ensureRelayUsageSchema(db) {
     ['cursor_agent_account', 'ALTER TABLE relay_usage ADD COLUMN cursor_agent_account TEXT'],
     ['reasoning_effort', 'ALTER TABLE relay_usage ADD COLUMN reasoning_effort TEXT'],
     ['platform_billing', 'ALTER TABLE relay_usage ADD COLUMN platform_billing INTEGER NOT NULL DEFAULT 0'],
+    ['display_name', 'ALTER TABLE relay_usage ADD COLUMN display_name TEXT'],
   ];
   for (const [column, sql] of migrations) {
     if (!columns.has(column)) db.prepare(sql).run();
@@ -56,6 +57,7 @@ function openUsageDb(customRoot) {
       mode TEXT,
       phase TEXT,
       endpoint_mode TEXT,
+      display_name TEXT,
       model TEXT,
       model_label TEXT,
       status TEXT NOT NULL,
@@ -215,6 +217,7 @@ function recordRelayUsage(customRoot, payload = {}) {
     mode: String(payload.mode || ''),
     phase: String(payload.phase || ''),
     endpoint_mode: String(payload.endpointMode || ''),
+    display_name: String(payload.displayName || payload.model || '').trim(),
     model: String(payload.model || ''),
     model_label: cost.modelLabel,
     status,
@@ -251,7 +254,7 @@ function recordRelayUsage(customRoot, payload = {}) {
   };
   const stmt = db.prepare(`
     INSERT INTO relay_usage (
-      created_at, request_id, conversation_id, mode, phase, endpoint_mode, model, model_label,
+      created_at, request_id, conversation_id, mode, phase, endpoint_mode, display_name, model, model_label,
       status, http_status, error, input_tokens, cached_input_tokens, output_tokens, total_tokens,
       input_price_per_million, cached_input_price_per_million, output_price_per_million,
       input_cost_usd, cached_input_cost_usd, output_cost_usd, total_cost_usd, points, billed_points,
@@ -259,7 +262,7 @@ function recordRelayUsage(customRoot, payload = {}) {
       upstream_base_url, price_source, price_source_url, raw_usage_json, meta_json, cursor_agent_account,
       reasoning_effort, platform_billing
     ) VALUES (
-      @created_at, @request_id, @conversation_id, @mode, @phase, @endpoint_mode, @model, @model_label,
+      @created_at, @request_id, @conversation_id, @mode, @phase, @endpoint_mode, @display_name, @model, @model_label,
       @status, @http_status, @error, @input_tokens, @cached_input_tokens, @output_tokens, @total_tokens,
       @input_price_per_million, @cached_input_price_per_million, @output_price_per_million,
       @input_cost_usd, @cached_input_cost_usd, @output_cost_usd, @total_cost_usd, @points, @billed_points,
@@ -342,13 +345,16 @@ function syncUsageFromHistory(customRoot) {
         candidate?.request_id === requestId
         && candidate?.kind === 'user_message'
       ));
-      const exists = db.prepare('SELECT id FROM relay_usage WHERE request_id = ? LIMIT 1').get(requestId);
+      const exists = db.prepare('SELECT id, model, display_name FROM relay_usage WHERE request_id = ? LIMIT 1').get(requestId);
       if (exists) {
         if (upstream.modelName || request?.payload?.mode) {
+          const shouldBackfillDisplayName = !String(exists.display_name || '').trim()
+            && (!String(exists.model || '').trim() || String(exists.model || '').trim() === String(upstream.modelName || '').trim());
           db.prepare(`
             UPDATE relay_usage
             SET
               mode = CASE WHEN COALESCE(mode, '') = '' THEN @mode ELSE mode END,
+              display_name = CASE WHEN COALESCE(display_name, '') = '' AND @shouldBackfillDisplayName = 1 THEN @displayName ELSE display_name END,
               model = CASE WHEN COALESCE(model, '') = '' THEN @model ELSE model END,
               endpoint_mode = CASE WHEN COALESCE(endpoint_mode, '') = '' THEN @endpointMode ELSE endpoint_mode END,
               upstream_base_url = CASE WHEN COALESCE(upstream_base_url, '') = '' THEN @baseUrl ELSE upstream_base_url END,
@@ -357,6 +363,8 @@ function syncUsageFromHistory(customRoot) {
           `).run({
             id: exists.id,
             mode: String(request?.payload?.mode || ''),
+            displayName: String(upstream.displayName || upstream.modelName || ''),
+            shouldBackfillDisplayName: shouldBackfillDisplayName ? 1 : 0,
             model: String(upstream.modelName || ''),
             endpointMode: String(upstream.endpointMode || ''),
             baseUrl: String(upstream.baseUrl || ''),
@@ -378,6 +386,7 @@ function syncUsageFromHistory(customRoot) {
         mode: String(request?.payload?.mode || ''),
         phase: 'history',
         endpointMode: String(upstream.endpointMode || ''),
+        displayName: String(upstream.displayName || upstream.modelName || ''),
         model: String(upstream.modelName || ''),
         status: item.payload.value.status === 'failed' ? 'failed' : 'success',
         usage: {},
@@ -414,7 +423,7 @@ function buildWhere(filters = {}) {
     params.status = String(filters.status);
   }
   if (filters.model) {
-    where.push('model LIKE @model');
+    where.push('(model LIKE @model OR display_name LIKE @model)');
     params.model = `%${String(filters.model)}%`;
   }
   if (filters.requestId) {
@@ -432,7 +441,13 @@ function buildWhere(filters = {}) {
 }
 
 function listRelayUsage(customRoot, options = {}) {
-  syncUsageFromHistory(customRoot);
+  const dbPath = getUsageDbPath(customRoot);
+  const forceHistorySync = options.syncHistory === true;
+  const lastHistorySyncAt = historySyncCache.get(dbPath) || 0;
+  if (forceHistorySync || Date.now() - lastHistorySyncAt >= HISTORY_SYNC_MIN_INTERVAL_MS) {
+    syncUsageFromHistory(customRoot);
+    historySyncCache.set(dbPath, Date.now());
+  }
   const db = openUsageDb(customRoot);
   const pageSize = Math.min(100, Math.max(1, toInt(options.pageSize) || 20));
   const page = Math.max(1, toInt(options.page) || 1);
@@ -468,10 +483,6 @@ function listRelayUsage(customRoot, options = {}) {
     total,
     list: rows,
     summary,
-    dbPath: getUsageDbPath(customRoot),
-    priceSource: PRICE_SOURCE,
-    priceSourceUrl: PRICE_SOURCE_URL,
-    priceSources: getAllPriceSources(),
   };
 }
 
@@ -520,8 +531,6 @@ function clearRelayUsage(customRoot) {
 }
 
 module.exports = {
-  PRICE_SOURCE,
-  PRICE_SOURCE_URL,
   getUsageDbPath,
   estimateCost,
   recordRelayUsage,

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
+const http = require('http');
 const { fork } = require('child_process');
 const { getCursorAppDataDir } = require('./cursor-local-state');
 const { resolveMainJsPath } = require('../../paths');
@@ -35,6 +36,8 @@ const {
 } = require('./cursor-relay-runner-manager');
 const { writeUtf8FileWithBom } = require('./cursor-relay-log');
 const { ensureCursorAuthIfNeeded } = require('../../update_cursor_auth');
+// 新的账号缓存统一入口：defult_user.json ←→ state.vscdb
+const { ensureCursorAccount, readDefaultUserTemplate, parseTemplateToAccount } = require('./cursor-relay-account-store');
 const {
   applyRelaySystemProxy,
   clearRelaySystemProxy,
@@ -48,11 +51,13 @@ const {
   clearTransparentHosts,
   readTransparentHostsStatus,
   snapshotCursorTcpConnections,
+  snapshotCursorTcpConnectionsAsync,
 } = require('./cursor-relay-transparent');
 const {
   patchRelayReviewBridgeInWorkbench,
   restoreRelayReviewBridgeInWorkbench,
   readRelayReviewBridgePatchStatus,
+  resolveWorkbenchDesktopMainJsPath,
 } = require('./cursor-relay-review-bridge');
 const { runRelayAgentConnectionTest } = require('./cursor-relay-agent-test');
 
@@ -272,6 +277,7 @@ function sanitizeRelayUpstream(upstream = null) {
   if (!baseUrl || !apiKey || !modelName) return null;
   return {
     providerId: String(upstream.providerId || 'custom').trim() || 'custom',
+    displayName: String(upstream.displayName || upstream.name || modelName).trim() || modelName,
     baseUrl,
     apiKey,
     modelName,
@@ -310,6 +316,7 @@ function relayProfileToUpstream(profile = null) {
   if (!modelName || !baseUrl || !apiKey) return null;
   return {
     providerId: String(profile.providerId || 'custom').trim() || 'custom',
+    displayName: String(profile.name || profile.modelName || '').trim() || modelName,
     baseUrl,
     apiKey,
     modelName,
@@ -621,12 +628,45 @@ async function readCursorRelayProxyConfig(options = {}) {
   const argv = readArgvJson();
   const systemProxy = readRelayProxyState({ skipWindows: lightweight });
   const mainJsPath = resolveMainJsPath();
-  const mainJsAllowsProxy = Boolean(
-    mainJsPath &&
-    fs.existsSync(mainJsPath) &&
-    hasProxyWhitelist(fs.readFileSync(mainJsPath, 'utf8')),
-  );
-  const cert = getRelayCertStatusReadonly();
+  // lightweight 模式跳过 readFileSync(main.js) — 文件可能数 MB，includes 搜索会阻塞事件循环
+  const mainJsAllowsProxy = lightweight
+    ? null // 轻量模式不读取 main.js 内容，补丁状态未知
+    : Boolean(
+      mainJsPath &&
+      fs.existsSync(mainJsPath) &&
+      hasProxyWhitelist(fs.readFileSync(mainJsPath, 'utf8')),
+    );
+  // lightweight 模式跳过 getRelayCertStatusReadonly — 内部 listInstalledRelayCas 用 spawnSync 调 PowerShell 无 timeout
+  const cert = lightweight
+    ? (() => {
+      try {
+        const { getRelayCertPaths, ensureRelayCertificates } = require('./cursor-relay-cert');
+        ensureRelayCertificates();
+        const paths = getRelayCertPaths();
+        const fileExists = (p) => { try { return fs.existsSync(p) && fs.statSync(p).size > 0; } catch { return false; } };
+        return {
+          dataDir: paths.dataDir,
+          caCertPath: paths.caCertPath,
+          caKeyPath: paths.caKeyPath,
+          leafCertPath: paths.leafCertPath,
+          leafKeyPath: paths.leafKeyPath,
+          fullChainCertPath: paths.fullChainCertPath,
+          caReady: fileExists(paths.caCertPath) && fileExists(paths.caKeyPath),
+          leafReady: fileExists(paths.leafCertPath) && fileExists(paths.leafKeyPath),
+          caInstalled: null,
+          caTrustMatching: null,
+          caTrustStale: null,
+          caTrustExtraStale: null,
+          caTrustNeedsCleanup: null,
+          caFileThumbprint: null,
+          installHint: '(lightweight 模式跳过证书库检查)',
+          lightweight: true,
+        };
+      } catch {
+        return { caInstalled: null, lightweight: true };
+      }
+    })()
+    : getRelayCertStatusReadonly();
   const mockProxy = getPlanUiMockState();
   const inferredPort = parseLocalProxyPort(argv.data['proxy-server'])
     || parseLocalProxyPort(systemProxy?.cursorSettings?.httpProxy)
@@ -650,7 +690,22 @@ async function readCursorRelayProxyConfig(options = {}) {
     ? null
     : await readModelProxyConfig({ quick: true }).catch(() => null);
   const transparent = readTransparentHostsStatus({ skipElevation: lightweight });
-  const reviewBridgePatch = readRelayReviewBridgePatchStatus(mainJsPath);
+  // lightweight 模式跳过 readRelayReviewBridgePatchStatus — 内部 readFileSync(workbench.desktop.main.js) 44MB
+  const reviewBridgePatch = lightweight
+    ? (() => {
+      try {
+        const workbenchPath = resolveWorkbenchDesktopMainJsPath(mainJsPath);
+        return {
+          exists: Boolean(workbenchPath),
+          workbenchPath: String(workbenchPath || ''),
+          reviewBridgePatched: null,
+          lightweight: true,
+        };
+      } catch {
+        return { exists: false, workbenchPath: '', reviewBridgePatched: null, lightweight: true };
+      }
+    })()
+    : readRelayReviewBridgePatchStatus(mainJsPath);
   const reviewBridgeRuntime = lightweight
     ? {
       exists: Boolean(reviewBridgePatch.exists),
@@ -727,9 +782,10 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   const frontProxyPort = Number(payload.frontProxyPort || payload.proxyPort || payload.runnerPort || DEFAULT_PORT);
   const disableHttp2 = payload.disableHttp2 !== false;
   const proxyStrictSSL = payload.proxyStrictSSL === true;
+  const reviewBridgeStatus = readRelayReviewBridgePatchStatus(resolveMainJsPath());
   const enableReviewBridge = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge')
     ? payload.enableReviewBridge === true
-    : DEFAULT_ENABLE_REVIEW_BRIDGE;
+    : Boolean(reviewBridgeStatus.reviewBridgePatched);
   const restartCursor = requestedRestartCursor;
   let proxyServer = '';
   let proxyPacUrl = '';
@@ -778,11 +834,24 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   let runner = null;
   let cursorAuthEnsure = null;
   if (upstream && runnerMode !== 'official_passthrough' && payload.ensureCursorAuth !== false && payload.skipCursorAuthEnsure !== true) {
-    cursorAuthEnsure = await ensureCursorAuthIfNeeded(
-      payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
-    );
-    if (cursorAuthEnsure?.reason === 'missing_local_guest') {
-      throw new Error('Cursor 未登录且未找到本地免登账号，请配置 desktop/js/utils/users.json（email + token）');
+    // 优先用新的 account-store（defult_user.json 模板 → state.vscdb）
+    cursorAuthEnsure = await ensureCursorAccount({
+      credentials: payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
+      allowRunningCursor: false,
+    }).catch(async (err) => {
+      // account-store 失败时兜底走旧的 ensureCursorAuthIfNeeded
+      return ensureCursorAuthIfNeeded(
+        payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
+      );
+    });
+    // 兼容旧字段名
+    if (cursorAuthEnsure?.reason === 'no_account_available') {
+      cursorAuthEnsure = await ensureCursorAuthIfNeeded(
+        payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
+      );
+    }
+    if (cursorAuthEnsure?.reason === 'missing_local_guest' || cursorAuthEnsure?.reason === 'no_account_available') {
+      throw new Error('Cursor 未登录且未找到本地免登账号，请配置 js/hook/defult_user.json 或 js/utils/users.json（email + token）');
     }
     if (cursorAuthEnsure?.reason === 'state_vscdb_missing') {
       throw new Error('state.vscdb 不存在，请先启动一次 Cursor');
@@ -883,19 +952,12 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   }
 
   patchResult = patchProxySupportInMainJs();
-  try {
-    reviewBridgePatchResult = enableReviewBridge
-      ? patchRelayReviewBridgeInWorkbench(patchResult.mainJsPath)
-      : restoreRelayReviewBridgeInWorkbench(patchResult.mainJsPath);
-  } catch (error) {
-    reviewBridgePatchResult = {
-      ok: false,
-      changed: false,
-      alreadyPatched: false,
-      workbenchPath: '',
-      error: error?.message || String(error || 'review bridge patch failed'),
-    };
-  }
+  reviewBridgePatchResult = {
+    ok: true,
+    changed: false,
+    alreadyPatched: enableReviewBridge,
+    ...readRelayReviewBridgePatchStatus(patchResult.mainJsPath),
+  };
   const argv = readArgvJson();
   const next = { ...argv.data };
 
@@ -929,7 +991,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   let restarted = false;
   let cursorWindowReady = null;
   let reloaded = false;
-  const runtimePatchChanged = Boolean(patchResult?.changed || reviewBridgePatchResult?.changed);
+  const runtimePatchChanged = Boolean(patchResult?.changed);
   const certNeedsCursorRestart = Boolean(
     !restartCursor
     && certInstallResult?.installed
@@ -959,22 +1021,13 @@ async function applyCursorRelayProxyConfig(payload = {}) {
     });
     restarted = Boolean(launch?.ok);
     cursorWindowReady = null;
-  } else if (runtimePatchChanged && enableReviewBridge && isCursorRunningHeuristic()) {
+  } else if (runtimePatchChanged && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
     if (reloaded) {
-      const patchedWorkbenchPath = String(reviewBridgePatchResult?.workbenchPath || '').trim();
-      let workbenchMtimeMs = 0;
-      if (patchedWorkbenchPath && fs.existsSync(patchedWorkbenchPath)) {
-        try {
-          workbenchMtimeMs = Number(fs.statSync(patchedWorkbenchPath).mtimeMs) || 0;
-        } catch {
-          workbenchMtimeMs = 0;
-        }
-      }
       writeRelayRuntimeState({
         reviewBridgeReloadedAt: Date.now(),
-        reviewBridgeWorkbenchPath: patchedWorkbenchPath,
-        reviewBridgeWorkbenchMtimeMs: workbenchMtimeMs,
+        reviewBridgeWorkbenchPath: '',
+        reviewBridgeWorkbenchMtimeMs: 0,
       });
       await sleep(800);
     }
@@ -1307,13 +1360,18 @@ async function disableCursorRelayProxyConfig(payload = {}) {
       skipped: true,
     };
   const mainJsRestoreResult = restoreProxySupportInMainJs();
-  const reviewBridgeRestoreResult = restoreRelayReviewBridgeInWorkbench();
+  const reviewBridgeRestoreResult = {
+    ok: true,
+    changed: false,
+    alreadyRestored: true,
+    ...readRelayReviewBridgePatchStatus(),
+  };
 
   let restarted = false;
   let reloaded = false;
   let runnerStopped = false;
   let agentConversationReset = { ok: false, skipped: true, message: '未请求切换 Agent 对话' };
-  const runtimePatchChanged = Boolean(mainJsRestoreResult?.changed || reviewBridgeRestoreResult?.changed);
+  const runtimePatchChanged = Boolean(mainJsRestoreResult?.changed);
   if (restartCursor) {
     const launch = launchCursorApp({
       extraCaCertPath: getRelayCertStatusReadonly().caCertPath,
@@ -1361,8 +1419,47 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   };
 }
 
+/**
+ * [DIAG] 代为请求 runner 进程的内部诊断状态
+ * runner 是 fork 的子进程，它的 proto root / auth 拦截 / 模型注入 / state guard /
+ * profile store / mode registry 状态只有 runner 自己知道。
+ * main 进程通过 HTTP fetch runner 的 /__cursorpool__/diagnostics 端点代为获取，
+ * 这样 renderer 只需调 cursorRelay:diagnose IPC 即可拿到全部状态，无需自己探测端口。
+ */
+function fetchRunnerInternals(port, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (val) => {
+      if (!settled) { settled = true; resolve(val); }
+    };
+    const req = http.get({
+      hostname: '127.0.0.1',
+      port,
+      path: '/__cursorpool__/diagnostics',
+      timeout: timeoutMs,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        try {
+          const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          done({ ok: res.statusCode === 200, statusCode: res.statusCode, payload });
+        } catch (e) {
+          done({ ok: false, statusCode: res.statusCode, error: `JSON parse: ${e.message}` });
+        }
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      done({ ok: false, error: `timeout (${timeoutMs}ms)` });
+    });
+    req.on('error', (e) => done({ ok: false, error: e.message }));
+  });
+}
+
 async function buildRelayDiagnostics() {
-  const status = await readCursorRelayProxyConfig();
+  // 用 lightweight 模式避免 getCursorProcessSnapshot(spawnSync 10s) 和 readModelProxyConfig 阻塞 main 事件循环
+  const status = await readCursorRelayProxyConfig({ lightweight: true });
   const log = await readRunnerLogTail('', 60);
   const stats = status.runner?.stats || log.stats || {};
   const connectMitm = Number(stats.connectMitm || 0);
@@ -1372,8 +1469,9 @@ async function buildRelayDiagnostics() {
   const seenBidi = Number(stats.seenBidiAppend || 0);
   const seenUser = Number(stats.seenBidiUserMessage || 0);
   const chatTotal = Number(stats.chatTotal || 0);
-  const transparent = status.transparent || readTransparentHostsStatus();
-  const tcpSnapshot = snapshotCursorTcpConnections();
+  const transparent = status.transparent || {};
+  // 异步 TCP 快照（3s 超时），避免 execFileSync 15s 同步阻塞导致 IPC 8s 超时
+  const tcpSnapshot = await snapshotCursorTcpConnectionsAsync(3000);
 
   const recentPaths = Array.isArray(stats.recentPaths) ? stats.recentPaths : [];
   const connectHosts = stats.connectHosts && typeof stats.connectHosts === 'object'
@@ -1387,8 +1485,10 @@ async function buildRelayDiagnostics() {
 
   if (!status.runner?.running) issues.push('本地 runner 未运行');
   if (!status.enabled) issues.push('argv.json 未配置 proxy-server');
-  if (!status.mainJsAllowsProxy) issues.push('Cursor main.js 未打代理白名单补丁');
-  if (!status.cert?.caInstalled) issues.push('MITM 根证书未安装到系统信任库');
+  // lightweight 模式下 mainJsAllowsProxy=null，不检查补丁状态
+  if (status.mainJsAllowsProxy === false) issues.push('Cursor main.js 未打代理白名单补丁');
+  // lightweight 模式下 caInstalled=null，不检查证书信任
+  if (status.cert?.caInstalled === false) issues.push('MITM 根证书未安装到系统信任库');
   if (status.cursorRunning && !status.argv?.proxyServer) {
     issues.push('Cursor 正在运行但 argv 里没有 proxy-server（需完全重启 Cursor）');
   }
@@ -1505,11 +1605,11 @@ async function buildRelayDiagnostics() {
     `settings cursor.general.disableHttp2: ${String(status.systemProxy?.cursorSettings?.disableHttp2)}`,
     `settings http.proxyStrictSSL: ${String(status.systemProxy?.cursorSettings?.proxyStrictSSL)}`,
     `Windows 系统代理: ${status.systemProxy?.windows?.enabled ? status.systemProxy.windows.server : '未启用'}`,
-    `main.js 补丁: ${status.mainJsAllowsProxy ? '已打' : '未打'}`,
-    `workbench review bridge: ${status.reviewBridgePatch?.reviewBridgePatched ? '已打' : '未打'}`,
-    `workbench 已加载到当前 Cursor: ${status.reviewBridgeRuntime?.loadedInRunningCursor === true ? '是' : status.reviewBridgeRuntime?.requiresCursorRestart ? '否（需重启）' : '-'}`,
-    `MITM 证书: ${status.cert?.caInstalled ? '已信任' : '未信任'}`,
+    `MITM 证书: ${status.cert?.lightweight === true && status.cert?.caInstalled === null ? '已生成（轻量模式）' : status.cert?.caInstalled ? '已信任' : '未信任'}`,
     `Cursor 进程: ${status.cursorRunning ? '运行中' : '未运行'}`,
+    `main.js 补丁: ${status.mainJsAllowsProxy === null ? '（轻量模式跳过）' : status.mainJsAllowsProxy ? '已打' : '未打'}`,
+    `workbench review bridge: ${status.reviewBridgePatch?.reviewBridgePatched === null ? '（轻量模式跳过）' : status.reviewBridgePatch?.reviewBridgePatched ? '已打' : '未打'}`,
+    `workbench 已加载到当前 Cursor: ${status.reviewBridgeRuntime?.loadedInRunningCursor === true ? '是' : status.reviewBridgeRuntime?.requiresCursorRestart ? '否（需重启）' : '-'}`,
     '',
     '[MITM 域名统计]',
     ...Object.entries(connectHosts).sort((a, b) => b[1] - a[1]).map(([host, count]) => `  ${host}: ${count}`),
@@ -1552,6 +1652,21 @@ async function buildRelayDiagnostics() {
     diagnosePath = '';
   }
 
+  // [DIAG] 代为请求 runner 进程的内部诊断状态（proto root / auth 拦截 / 模型注入 /
+  // state guard / profile store / mode registry）— 只有 runner 自己知道这些信息
+  let runnerInternals = null;
+  try {
+    const runnerPort = status.runner?.port;
+    if (runnerPort && status.runner?.running) {
+      const ri = await fetchRunnerInternals(runnerPort, 2000);
+      runnerInternals = ri.ok ? ri.payload : { error: ri.error || `HTTP ${ri.statusCode}` };
+    } else {
+      runnerInternals = { error: status.runner?.running ? 'no port' : 'runner not running' };
+    }
+  } catch (e) {
+    runnerInternals = { error: e.message };
+  }
+
   return {
     ok: true,
     text,
@@ -1565,6 +1680,9 @@ async function buildRelayDiagnostics() {
     connectHosts,
     chatLikelyBypassing: connectMitm > 5 && seenRunSse === 0 && seenBidi === 0,
     hasChatIntercept: chatTotal > 0 || log.hasChatIntercept,
+    runnerInternals,
+    runnerPort: status.runner?.port || 0,
+    runnerRunning: Boolean(status.runner?.running),
   };
 }
 

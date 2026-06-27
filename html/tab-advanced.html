@@ -95,11 +95,22 @@
       <div class="adv-form-row">
         <span class="adv-label-inline">Cursor 自动更新</span>
         <div class="adv-input-with-btn">
-          <button type="button" id="advCheckUpdateBtn" class="ghost-btn">检查更新</button>
-          <button type="button" id="advInstallUpdateBtn" class="primary-btn hidden">下载并安装</button>
+          <button type="button" id="advCursorUpdateRefreshBtn" class="ghost-btn">版本检测</button>
+          <button type="button" id="advDisableCursorUpdateBtn" class="primary-btn">禁用自动更新</button>
+          <button type="button" id="advRestoreCursorUpdateBtn" class="ghost-btn hidden">恢复更新</button>
         </div>
       </div>
-      <p id="advUpdateStatus" class="adv-hint">可检查客户端新版本并自动下载、安装。</p>
+      <p id="advUpdateStatus" class="adv-hint">检测 Cursor 当前版本，并可禁止或恢复客户端自动更新。</p>
+
+      <div class="adv-form-row">
+        <span class="adv-label-inline">Cursor 实验注入</span>
+        <div class="adv-input-with-btn">
+          <button type="button" id="advReviewBridgeRefreshBtn" class="ghost-btn">检测状态</button>
+          <button type="button" id="advReviewBridgeApplyBtn" class="primary-btn">注入功能</button>
+          <button type="button" id="advReviewBridgeRestoreBtn" class="ghost-btn">还原功能</button>
+        </div>
+      </div>
+      <p id="advReviewBridgeStatus" class="adv-hint">仅在手动点击时执行注入/还原；建议先保存工作并完全退出 Cursor 后再操作。</p>
     </div>
   </div>
 
@@ -206,7 +217,7 @@
     </div>
 
     <div id="relayAdminSection" class="adv-pref-block hidden">
-      <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 管理员诊断</h3>
+      <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 诊断</h3>
       <div class="adv-inject-row">
         <span class="adv-label-inline">Runner 进程:</span>
         <span id="relayRunnerBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>

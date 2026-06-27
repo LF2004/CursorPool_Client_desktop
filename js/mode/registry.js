@@ -7,6 +7,9 @@ const MODE_DIRECTORY_BY_NAME = {
   AGENT_MODE_AGENT: 'agent',
   AGENT_MODE_ASK: 'ask',
   AGENT_MODE_PLAN: 'plan',
+  AGENT_MODE_DEBUG: 'debug',
+  AGENT_MODE_TRIAGE: 'triage',
+  AGENT_MODE_PROJECT: 'project',
   AGENT_MODE_MULTITASK: 'multitask',
 };
 
@@ -14,6 +17,9 @@ function normalizeAgentModeName(value = '') {
   const text = String(value || '').trim().toUpperCase();
   if (text === 'AGENT_MODE_ASK' || text === 'ASK') return 'AGENT_MODE_ASK';
   if (text === 'AGENT_MODE_PLAN' || text === 'PLAN') return 'AGENT_MODE_PLAN';
+  if (text === 'AGENT_MODE_DEBUG' || text === 'DEBUG') return 'AGENT_MODE_DEBUG';
+  if (text === 'AGENT_MODE_TRIAGE' || text === 'TRIAGE') return 'AGENT_MODE_TRIAGE';
+  if (text === 'AGENT_MODE_PROJECT' || text === 'PROJECT') return 'AGENT_MODE_PROJECT';
   if (text === 'AGENT_MODE_MULTITASK' || text === 'MULTITASK' || text === 'TASK') return 'AGENT_MODE_MULTITASK';
   return 'AGENT_MODE_AGENT';
 }

@@ -66,7 +66,7 @@ function loadConversation(config = {}, conversationId = '', options = {}) {
     current_request_id: '',
     current_turn_seq: 0,
     token_details_used_tokens: 0,
-    token_details_max_tokens: Number.MAX_SAFE_INTEGER,
+    token_details_max_tokens: 200000,
     latest_request_prefix: null,
     last_provider_call: null,
     created_at: nowIso(),

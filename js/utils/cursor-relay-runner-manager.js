@@ -27,6 +27,20 @@ const runnerOperationState = {
 let runnerChild = null;
 let runnerConfig = null;
 
+// ── Runner 自动重启守护 ───────────────────────────────────
+// intentionalStop: 主动停止标志，exit handler 据此决定是否自动重启
+let intentionalStop = false;
+// 保存上次启动参数，供异常退出后自动重启使用
+let lastStartPayload = null;
+// 重启退避状态
+let restartBackoff = {
+  consecutiveCrashes: 0,
+  lastRestartAt: 0,
+};
+const RESTART_MAX_CONSECUTIVE = 5;
+const RESTART_BASE_DELAY = 1000;
+const RESTART_MAX_DELAY = 30000;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function buildStartOperationKey(options = {}) {
@@ -62,6 +76,7 @@ function buildStartOperationKey(options = {}) {
     outboundProxy: normalizeOutboundProxyForCompare(outboundProxy),
     upstream: {
       providerId: upstream.providerId,
+      displayName: upstream.displayName,
       baseUrl: upstream.baseUrl,
       modelName: upstream.modelName,
       availableModels: upstream.availableModels,
@@ -113,6 +128,7 @@ function normalizeUpstream(upstream = {}) {
   const baseUrl = rawBaseUrl ? normalizeBaseUrl(rawBaseUrl) : '';
   const apiKey = String(upstream.apiKey || '').trim();
   const modelName = String(upstream.modelName || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+  const displayName = String(upstream.displayName || upstream.name || modelName).trim() || modelName;
   const endpointMode = String(upstream.endpointMode || 'responses').trim().toLowerCase();
   const reasoningEffort = String(upstream.reasoningEffort || 'medium').trim().toLowerCase();
   const thinkingMode = String(upstream.thinkingMode || '').trim().toLowerCase();
@@ -127,6 +143,7 @@ function normalizeUpstream(upstream = {}) {
   if (!availableModels.includes(modelName)) availableModels.unshift(modelName);
   return {
     providerId: String(upstream.providerId || 'custom').trim() || 'custom',
+    displayName,
     baseUrl,
     apiKey,
     modelName,
@@ -165,6 +182,7 @@ function normalizeRunnerMode(value) {
 function buildOfficialPassthroughUpstream() {
   return {
     providerId: 'cursor_official',
+    displayName: 'Cursor Official',
     baseUrl: 'https://api2.cursor.sh',
     apiKey: 'official-passthrough',
     modelName: 'cursor-official',
@@ -521,6 +539,7 @@ async function waitForRunnerDown(port, attempts = 10, delayMs = 100) {
 }
 
 async function stopLocalRelayRunner(payload = {}) {
+  intentionalStop = true;
   const port = Number(payload.port || runnerConfig?.port || DEFAULT_PORT);
   const knownChild = runnerChild;
   const knownPid = Number(knownChild?.pid) || 0;
@@ -599,7 +618,68 @@ async function stopLocalRelayRunner(payload = {}) {
   }
 }
 
+async function scheduleRunnerRestart(payload, exitCode, exitSignal) {
+  const now = Date.now();
+  const sinceLast = now - restartBackoff.lastRestartAt;
+
+  // 距上次重启 < 5s 视为连续崩溃
+  if (sinceLast < 5000) {
+    restartBackoff.consecutiveCrashes += 1;
+  } else {
+    restartBackoff.consecutiveCrashes = 1;
+  }
+  restartBackoff.lastRestartAt = now;
+
+  if (restartBackoff.consecutiveCrashes > RESTART_MAX_CONSECUTIVE) {
+    console.error(
+      `[relay-runner] runner 异常退出 (code=${exitCode} signal=${exitSignal})，` +
+      `连续崩溃 ${restartBackoff.consecutiveCrashes} 次已超过上限，停止自动重启`,
+    );
+    return;
+  }
+
+  // 指数退避
+  const delay = Math.min(
+    RESTART_BASE_DELAY * (2 ** (restartBackoff.consecutiveCrashes - 1)),
+    RESTART_MAX_DELAY,
+  );
+
+  console.warn(
+    `[relay-runner] runner 异常退出 (code=${exitCode} signal=${exitSignal})，` +
+    `${delay}ms 后自动重启 (第 ${restartBackoff.consecutiveCrashes}/${RESTART_MAX_CONSECUTIVE} 次)`,
+  );
+
+  await sleep(delay);
+
+  // 延迟期间若被主动停止，取消重启
+  if (intentionalStop) {
+    console.log('[relay-runner] 延迟期间检测到主动停止，取消自动重启');
+    return;
+  }
+  // 已有新 runner 在运行则取消
+  if (runnerChild && !runnerChild.killed) {
+    console.log('[relay-runner] 已有 runner 在运行，取消自动重启');
+    return;
+  }
+
+  try {
+    console.log('[relay-runner] 正在自动重启 runner...');
+    const result = await startLocalRelayRunner({
+      ...payload,
+      forceRestartRunner: false,
+    });
+    if (result?.ok) {
+      restartBackoff.consecutiveCrashes = 0;
+      console.log('[relay-runner] 自动重启成功，pid=' + (result.runner?.pid || '-'));
+    }
+  } catch (e) {
+    console.error('[relay-runner] 自动重启失败:', e.message);
+  }
+}
+
 async function startLocalRelayRunner(payload = {}) {
+  intentionalStop = false;
+  lastStartPayload = { ...payload };
   const operationKey = buildStartOperationKey(payload);
   if (runnerOperationState.startPromise && runnerOperationState.startKey === operationKey) {
     return runnerOperationState.startPromise;
@@ -775,10 +855,18 @@ async function startLocalRelayRunner(payload = {}) {
   });
 
   const childPid = runnerChild.pid;
-  runnerChild.on('exit', () => {
+  const savedPayload = lastStartPayload;
+  runnerChild.on('exit', (code, signal) => {
     if (runnerChild && runnerChild.pid === childPid) {
       runnerChild = null;
-      runnerConfig = null;
+      // 主动停止时才清空 config；异常退出保留以供自动重启参考
+      if (intentionalStop) {
+        runnerConfig = null;
+      }
+    }
+    // 非主动停止 → 尝试自动重启
+    if (!intentionalStop && savedPayload) {
+      scheduleRunnerRestart(savedPayload, code, signal).catch(() => null);
     }
   });
   try {
@@ -901,6 +989,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     upstream: runnerConfig?.upstream
         ? {
             providerId: runnerConfig.upstream.providerId || 'custom',
+            displayName: runnerConfig.upstream.displayName || runnerConfig.upstream.modelName,
             baseUrl: runnerConfig.upstream.baseUrl,
             modelName: runnerConfig.upstream.modelName,
             availableModels: Array.isArray(runnerConfig.upstream.availableModels)
@@ -914,6 +1003,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
           }
         : health.payload
         ? {
+            displayName: health.payload.upstreamDisplayName || health.payload.upstreamModelName,
             baseUrl: health.payload.upstreamBaseUrl,
             modelName: health.payload.upstreamModelName,
             availableModels: Array.isArray(health.payload.upstreamAvailableModels)

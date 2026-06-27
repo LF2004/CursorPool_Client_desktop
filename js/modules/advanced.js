@@ -129,6 +129,7 @@ function setAccentColorPickerValue(hex) {
 
 let updateProgressUnsub = null;
 let pendingUpdateInfo = null;
+let lastCursorUpdateStatus = null;
 
 function formatBytes(bytes) {
   const n = Number(bytes) || 0;
@@ -142,10 +143,26 @@ function setUpdateStatus(text) {
 }
 
 function setUpdateButtonsBusy(busy) {
-  const checkBtn = $('advCheckUpdateBtn');
-  const installBtn = $('advInstallUpdateBtn');
-  if (checkBtn) checkBtn.disabled = Boolean(busy);
-  if (installBtn) installBtn.disabled = Boolean(busy);
+  const refreshBtn = $('advCursorUpdateRefreshBtn');
+  const disableBtn = $('advDisableCursorUpdateBtn');
+  const restoreBtn = $('advRestoreCursorUpdateBtn');
+  if (refreshBtn) refreshBtn.disabled = Boolean(busy);
+  if (disableBtn) disableBtn.disabled = Boolean(busy);
+  if (restoreBtn) restoreBtn.disabled = Boolean(busy);
+}
+
+function setReviewBridgeStatus(text) {
+  const el = $('advReviewBridgeStatus');
+  if (el) el.textContent = text;
+}
+
+function setReviewBridgeButtonsBusy(busy) {
+  const refreshBtn = $('advReviewBridgeRefreshBtn');
+  const applyBtn = $('advReviewBridgeApplyBtn');
+  const restoreBtn = $('advReviewBridgeRestoreBtn');
+  if (refreshBtn) refreshBtn.disabled = Boolean(busy);
+  if (applyBtn) applyBtn.disabled = Boolean(busy);
+  if (restoreBtn) restoreBtn.disabled = Boolean(busy);
 }
 
 function ensureUpdateProgressListener() {
@@ -157,6 +174,96 @@ function ensureUpdateProgressListener() {
     const attempt = Number(p.attempt) > 1 ? `，第 ${p.attempt} 次尝试` : '';
     setUpdateStatus(`正在下载 ${p.version || ''}：${pct}%（${formatBytes(received)} / ${formatBytes(total)}${attempt}）`);
   });
+}
+
+function resolveStoredCursorExePath() {
+  try {
+    const inputValue = String($('advCursorExePath')?.value || '').trim();
+    if (inputValue) return inputValue;
+    return String(localStorage.getItem(CURSOR_EXE_STORAGE) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function renderCursorAutoUpdateStatus(status) {
+  lastCursorUpdateStatus = status || null;
+  const disableBtn = $('advDisableCursorUpdateBtn');
+  const restoreBtn = $('advRestoreCursorUpdateBtn');
+  if (disableBtn) disableBtn.classList.toggle('hidden', Boolean(status?.disabled));
+  if (restoreBtn) restoreBtn.classList.toggle('hidden', !Boolean(status?.disabled));
+
+  if (!status) {
+    setUpdateStatus('未读取到 Cursor 自动更新状态。');
+    return;
+  }
+
+  const version = status.version || 'Unknown';
+  const installRoot = status.installRoot || '未识别安装目录';
+  const stateText = status.disabled ? '已禁用' : '启用中';
+  const missingHint = status.allUpdateFilesMissing ? '；未找到可操作的更新组件文件' : '';
+  setUpdateStatus(`版本 ${version}，自动更新${stateText}。安装目录：${installRoot}${missingHint}`);
+}
+
+async function refreshCursorAutoUpdateStatus(showErrorDialog = false) {
+  try {
+    if (!window.electronBridge?.getCursorAutoUpdateStatus) {
+      throw new Error('当前运行环境不支持 Cursor 自动更新管理');
+    }
+    const status = await window.electronBridge.getCursorAutoUpdateStatus({
+      cursorExePath: resolveStoredCursorExePath(),
+    });
+    renderCursorAutoUpdateStatus(status);
+    return status;
+  } catch (e) {
+    renderCursorAutoUpdateStatus(null);
+    setUpdateStatus(e.message || String(e));
+    if (showErrorDialog) {
+      await showAlert(e.message || String(e), { title: '读取失败', tone: 'danger' });
+    }
+    return null;
+  }
+}
+
+function renderReviewBridgeStatus(status) {
+  const applyBtn = $('advReviewBridgeApplyBtn');
+  const restoreBtn = $('advReviewBridgeRestoreBtn');
+
+  if (applyBtn) applyBtn.classList.toggle('hidden', Boolean(status?.reviewBridgePatched));
+  if (restoreBtn) restoreBtn.classList.toggle('hidden', !Boolean(status?.reviewBridgePatched));
+
+  if (!status) {
+    setReviewBridgeStatus('未读取到 Cursor 实验注入状态。');
+    return;
+  }
+
+  if (!status.exists) {
+    setReviewBridgeStatus('未找到 Cursor workbench.desktop.main.js，请先确认安装位置。');
+    return;
+  }
+
+  const stateText = status.reviewBridgePatched ? '已注入' : '未注入';
+  setReviewBridgeStatus(`状态：${stateText}。文件：${status.workbenchPath || '未识别'}`);
+}
+
+async function refreshReviewBridgeStatus(showErrorDialog = false) {
+  try {
+    if (!window.electronBridge?.cursorRelayReviewBridgeStatus) {
+      throw new Error('当前运行环境不支持 Cursor 实验注入管理');
+    }
+    const status = await window.electronBridge.cursorRelayReviewBridgeStatus({
+      cursorExePath: resolveStoredCursorExePath(),
+    });
+    renderReviewBridgeStatus(status);
+    return status;
+  } catch (e) {
+    renderReviewBridgeStatus(null);
+    setReviewBridgeStatus(e.message || String(e));
+    if (showErrorDialog) {
+      await showAlert(e.message || String(e), { title: '读取失败', tone: 'danger' });
+    }
+    return null;
+  }
 }
 
 const wallpaperAccentCache = new Map();
@@ -460,7 +567,7 @@ async function confirmCloseCursorBeforeProceed(actionText) {
   const status = await window.electronBridge.isCursorRunning();
   if (!status?.running) return true;
   return showConfirm(
-    '检测到 Cursor 正在运行, 请保存尚未更改的项目再继续操作!\n不保存会导致Cursor报错! 报错了请别联系客服!',
+    '检测到 Cursor 正在运行, 请保存尚未更改的项目再继续操作!\n不保存会导致Cursor报错! 报错了请别联系我!',
     {
       title: 'Cursor 正在运行',
       tone: 'danger',
@@ -498,6 +605,8 @@ export function bindAdvancedEvents(_opts = {}) {
         if (getAccentMode() === 'auto') {
           scheduleAutoAccentFromWallpaper(wallpaper);
         }
+        void refreshCursorAutoUpdateStatus(false);
+        void refreshReviewBridgeStatus(false);
       }
       if (tab === 'proxy') {
         refreshProxyStatus().catch(() => {});
@@ -652,6 +761,8 @@ function compressImageFileToDataUrl(file, opts = {}) {
         const inp = $('advCursorExePath');
         if (inp) inp.value = p;
         localStorage.setItem(CURSOR_EXE_STORAGE, p);
+        await refreshCursorAutoUpdateStatus(false);
+        await refreshReviewBridgeStatus(false);
         await showAlert('已保存 Cursor 路径（本机设置）', { tone: 'success' });
       } catch (e) {
         await showAlert(e.message || String(e), { title: '保存失败', tone: 'danger' });
@@ -659,63 +770,172 @@ function compressImageFileToDataUrl(file, opts = {}) {
     };
   }
 
-  const checkUpdateBtn = $('advCheckUpdateBtn');
-  const installUpdateBtn = $('advInstallUpdateBtn');
-  if (checkUpdateBtn) {
-    checkUpdateBtn.onclick = async () => {
+  const refreshCursorUpdateBtn = $('advCursorUpdateRefreshBtn');
+  const disableCursorUpdateBtn = $('advDisableCursorUpdateBtn');
+  const restoreCursorUpdateBtn = $('advRestoreCursorUpdateBtn');
+  const refreshReviewBridgeBtn = $('advReviewBridgeRefreshBtn');
+  const applyReviewBridgeBtn = $('advReviewBridgeApplyBtn');
+  const restoreReviewBridgeBtn = $('advReviewBridgeRestoreBtn');
+  if (refreshCursorUpdateBtn) {
+    refreshCursorUpdateBtn.onclick = async () => {
       try {
-        if (!window.electronBridge?.checkUpdate) throw new Error('当前运行环境不支持自动更新检查');
-        setUpdateButtonsBusy(true);
-        setUpdateStatus('正在检查更新...');
-        const r = await window.electronBridge.checkUpdate();
-        pendingUpdateInfo = r?.update || null;
-        if (!r?.available || !pendingUpdateInfo) {
-          if (installUpdateBtn) installUpdateBtn.classList.add('hidden');
-          setUpdateStatus(`当前已是最新版本（${r?.currentVersion || '-'}）`);
-          return;
+        if (!window.electronBridge?.getCursorAutoUpdateStatus) {
+          throw new Error('当前运行环境不支持 Cursor 自动更新管理');
         }
-        if (installUpdateBtn) installUpdateBtn.classList.remove('hidden');
-        setUpdateStatus(`发现新版本 ${pendingUpdateInfo.version || ''}，点击“下载并安装”开始更新。`);
+        setUpdateButtonsBusy(true);
+        setUpdateStatus('正在检测 Cursor 版本与更新状态...');
+        await refreshCursorAutoUpdateStatus(true);
       } catch (e) {
-        if (installUpdateBtn) installUpdateBtn.classList.add('hidden');
-        pendingUpdateInfo = null;
         setUpdateStatus(e.message || String(e));
-        await showAlert(e.message || String(e), { title: '检查更新失败', tone: 'danger' });
+        await showAlert(e.message || String(e), { title: '检测失败', tone: 'danger' });
       } finally {
         setUpdateButtonsBusy(false);
       }
     };
   }
 
-  if (installUpdateBtn) {
-    installUpdateBtn.onclick = async () => {
+  if (refreshReviewBridgeBtn) {
+    refreshReviewBridgeBtn.onclick = async () => {
       try {
-        if (!window.electronBridge?.downloadUpdate || !window.electronBridge?.installUpdate) {
-          throw new Error('当前运行环境不支持自动下载安装');
+        setReviewBridgeButtonsBusy(true);
+        setReviewBridgeStatus('正在检测注入状态...');
+        await refreshReviewBridgeStatus(true);
+      } finally {
+        setReviewBridgeButtonsBusy(false);
+      }
+    };
+  }
+
+  if (applyReviewBridgeBtn) {
+    applyReviewBridgeBtn.onclick = async () => {
+      try {
+        if (!window.electronBridge?.cursorRelayReviewBridgeApply) {
+          throw new Error('当前运行环境不支持 Cursor 实验注入');
         }
-        if (!pendingUpdateInfo) {
-          await checkUpdateBtn?.onclick?.();
-          if (!pendingUpdateInfo) return;
-        }
+        const allow = await confirmCloseCursorBeforeProceed('我已保存，继续注入');
+        if (!allow) return;
         const ok = await showConfirm(
-          `将下载并安装 ${pendingUpdateInfo.version || '新版本'}。安装时应用会自动退出并重启，是否继续？`,
+          '将把 Cursor 实验注入写入 workbench.desktop.main.js。此操作仅在点击后执行，完成后需重新打开 Cursor 才会生效。是否继续？',
           {
-            title: '安装更新',
-            tone: 'info',
-            confirmText: '下载并安装',
+            title: '注入实验功能',
+            tone: 'warn',
+            confirmText: '继续注入',
             cancelText: '取消',
           },
         );
         if (!ok) return;
-        ensureUpdateProgressListener();
+        setReviewBridgeButtonsBusy(true);
+        setReviewBridgeStatus('正在写入实验注入...');
+        await window.electronBridge.cursorRelayReviewBridgeApply({
+          cursorExePath: resolveStoredCursorExePath(),
+        });
+        await refreshReviewBridgeStatus(false);
+        await showAlert('实验注入已写入。请完全退出并重新打开 Cursor 后再验证。', {
+          title: '操作完成',
+          tone: 'success',
+        });
+      } catch (e) {
+        setReviewBridgeStatus(e.message || String(e));
+        await showAlert(e.message || String(e), { title: '注入失败', tone: 'danger' });
+      } finally {
+        setReviewBridgeButtonsBusy(false);
+      }
+    };
+  }
+
+  if (restoreReviewBridgeBtn) {
+    restoreReviewBridgeBtn.onclick = async () => {
+      try {
+        if (!window.electronBridge?.cursorRelayReviewBridgeRestore) {
+          throw new Error('当前运行环境不支持 Cursor 实验注入还原');
+        }
+        const allow = await confirmCloseCursorBeforeProceed('我已保存，继续还原');
+        if (!allow) return;
+        const ok = await showConfirm(
+          '将还原 Cursor workbench.desktop.main.js 中的实验注入内容。此操作仅在点击后执行，完成后需重新打开 Cursor。是否继续？',
+          {
+            title: '还原实验功能',
+            tone: 'info',
+            confirmText: '继续还原',
+            cancelText: '取消',
+          },
+        );
+        if (!ok) return;
+        setReviewBridgeButtonsBusy(true);
+        setReviewBridgeStatus('正在还原实验注入...');
+        await window.electronBridge.cursorRelayReviewBridgeRestore({
+          cursorExePath: resolveStoredCursorExePath(),
+        });
+        await refreshReviewBridgeStatus(false);
+        await showAlert('实验注入已还原。请完全退出并重新打开 Cursor。', {
+          title: '操作完成',
+          tone: 'success',
+        });
+      } catch (e) {
+        setReviewBridgeStatus(e.message || String(e));
+        await showAlert(e.message || String(e), { title: '还原失败', tone: 'danger' });
+      } finally {
+        setReviewBridgeButtonsBusy(false);
+      }
+    };
+  }
+
+  if (disableCursorUpdateBtn) {
+    disableCursorUpdateBtn.onclick = async () => {
+      try {
+        if (!window.electronBridge?.disableCursorAutoUpdate) {
+          throw new Error('当前运行环境不支持禁用 Cursor 自动更新');
+        }
+        const allow = await confirmCloseCursorBeforeProceed('我已保存，继续禁用');
+        if (!allow) return;
+        const ok = await showConfirm('将尝试禁止 Cursor 客户端自动更新，是否继续？', {
+          title: '禁用自动更新',
+          tone: 'warning',
+          confirmText: '继续禁用',
+          cancelText: '取消',
+        });
+        if (!ok) return;
         setUpdateButtonsBusy(true);
-        setUpdateStatus('正在准备下载...');
-        const downloaded = await window.electronBridge.downloadUpdate();
-        setUpdateStatus(`下载完成：${formatBytes(downloaded?.size)}，正在启动安装...`);
-        await window.electronBridge.installUpdate();
+        setUpdateStatus('正在禁用 Cursor 自动更新...');
+        const result = await window.electronBridge.disableCursorAutoUpdate({
+          cursorExePath: resolveStoredCursorExePath(),
+        });
+        renderCursorAutoUpdateStatus(result);
+        await showAlert('已完成 Cursor 自动更新禁用。', { title: '操作完成', tone: 'success' });
       } catch (e) {
         setUpdateStatus(e.message || String(e));
-        await showAlert(e.message || String(e), { title: '安装更新失败', tone: 'danger' });
+        await showAlert(e.message || String(e), { title: '禁用失败', tone: 'danger' });
+      } finally {
+        setUpdateButtonsBusy(false);
+      }
+    };
+  }
+
+  if (restoreCursorUpdateBtn) {
+    restoreCursorUpdateBtn.onclick = async () => {
+      try {
+        if (!window.electronBridge?.restoreCursorAutoUpdate) {
+          throw new Error('当前运行环境不支持恢复 Cursor 自动更新');
+        }
+        const allow = await confirmCloseCursorBeforeProceed('我已保存，继续恢复');
+        if (!allow) return;
+        const ok = await showConfirm('将恢复 Cursor 客户端自动更新能力，是否继续？', {
+          title: '恢复自动更新',
+          tone: 'info',
+          confirmText: '恢复更新',
+          cancelText: '取消',
+        });
+        if (!ok) return;
+        setUpdateButtonsBusy(true);
+        setUpdateStatus('正在恢复 Cursor 自动更新...');
+        const result = await window.electronBridge.restoreCursorAutoUpdate({
+          cursorExePath: resolveStoredCursorExePath(),
+        });
+        renderCursorAutoUpdateStatus(result);
+        await showAlert('已恢复 Cursor 自动更新。', { title: '操作完成', tone: 'success' });
+      } catch (e) {
+        setUpdateStatus(e.message || String(e));
+        await showAlert(e.message || String(e), { title: '恢复失败', tone: 'danger' });
       } finally {
         setUpdateButtonsBusy(false);
       }

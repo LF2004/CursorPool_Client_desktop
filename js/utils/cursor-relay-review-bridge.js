@@ -455,11 +455,10 @@ function patchRelayReviewBridgeInWorkbench(explicitMainJsPath) {
     if (injected.includes(INLINE_DIFF_SERVICE_DELAYED_REGISTRATION)) {
       injected = injected.replace(INLINE_DIFF_SERVICE_DELAYED_REGISTRATION, INLINE_DIFF_SERVICE_EAGER_REGISTRATION);
     }
-  } else {
-    throw new Error('Unable to find relay review bridge injection point in workbench.desktop.main.js');
   }
+
   if (injected === baseText) {
-    throw new Error('Relay review bridge effect patch did not change workbench.desktop.main.js');
+    throw new Error('Unable to find relay review bridge injection point in workbench.desktop.main.js');
   }
 
   fs.writeFileSync(workbenchPath, injected, 'utf8');

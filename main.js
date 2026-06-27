@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs/promises');
 const fssync = require('fs');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { applyCursorAuth } = require('./update_cursor_auth');
 const { buildLocalCursorSnapshot } = require('./js/utils/cursor-local-state');
 const { isCursorRunningHeuristic } = require('./js/utils/cursor-process');
@@ -63,6 +63,11 @@ const {
   isQuitting,
 } = require('./js/utils/tray');
 const { fetchCursorDashboardSnapshot } = require('./js/utils/cursor-dashboard');
+const {
+  readCursorAutoUpdateStatus,
+  disableCursorAutoUpdate,
+  restoreCursorAutoUpdate,
+} = require('./js/utils/cursor-auto-update');
 
 // GPU-related crashes/hangs can happen on some machines when using CSS filters.
 // Disable hardware acceleration as a safe default for this app.
@@ -77,6 +82,43 @@ try {
 function logMainError(label, error) {
   const detail = error && error.stack ? error.stack : String(error || 'unknown error');
   console.error(`[main] ${label}:`, detail);
+}
+
+
+function runReviewBridgeWorker(action, cursorExePath = '') {
+  return new Promise((resolve, reject) => {
+    const workerPath = path.join(__dirname, 'scripts', 'review-bridge-worker.cjs');
+    execFile(
+      process.execPath,
+      [workerPath, String(action || '').trim(), String(cursorExePath || '').trim()],
+      {
+        cwd: __dirname,
+        windowsHide: true,
+        timeout: 180000,
+        env: {
+          ...process.env,
+          ELECTRON_RUN_AS_NODE: '1',
+        },
+        maxBuffer: 8 * 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(String(stderr || stdout || error.message || error)));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(String(stdout || '').trim() || '{}');
+          if (!parsed || parsed.ok !== true) {
+            reject(new Error(String(stderr || '实验注入任务执行失败')));
+            return;
+          }
+          resolve(parsed.result || null);
+        } catch (parseError) {
+          reject(new Error(`实验注入结果解析失败：${parseError.message || parseError}\n${String(stdout || stderr || '').trim()}`));
+        }
+      },
+    );
+  });
 }
 
 function readBuildSettings() {
@@ -301,6 +343,15 @@ ipcMain.handle('cursorRelay:apply', async (_event, payload = {}) => applyCursorR
 ipcMain.handle('cursorRelay:ensureRunner', async (_event, payload = {}) => ensureCursorRelayRunner(payload));
 ipcMain.handle('cursorRelay:quickSwitchModel', async (_event, payload = {}) => quickSwitchRelayModel(payload));
 ipcMain.handle('cursorRelay:disable', async (_event, payload = {}) => disableCursorRelayProxyConfig(payload));
+ipcMain.handle('cursorRelay:reviewBridgeStatus', async (_event, payload = {}) => (
+  runReviewBridgeWorker('status', payload?.cursorExePath || '')
+));
+ipcMain.handle('cursorRelay:reviewBridgeApply', async (_event, payload = {}) => (
+  runReviewBridgeWorker('apply', payload?.cursorExePath || '')
+));
+ipcMain.handle('cursorRelay:reviewBridgeRestore', async (_event, payload = {}) => (
+  runReviewBridgeWorker('restore', payload?.cursorExePath || '')
+));
 ipcMain.handle('cursorRelay:installCert', async (_event, payload = {}) => installRelayCaCertificateFull(payload));
 ipcMain.handle('cursorRelay:checkCert', async () => checkRelayCertificates());
 ipcMain.handle('cursorRelay:repairCert', async (_event, payload = {}) => repairRelayCertificatesFull(payload));
@@ -360,14 +411,7 @@ ipcMain.handle('cursorRelay:openLogDir', async () => {
 });
 
 ipcMain.handle('cursorRelayUsage:list', async (_event, payload = {}) => {
-  const result = listRelayUsage('', payload);
-  try {
-    const snap = buildLocalCursorSnapshot();
-    result.currentCursorAgentAccount = snap.cursorDbEmail || snap.localEmail || '';
-  } catch {
-    result.currentCursorAgentAccount = '';
-  }
-  return result;
+  return listRelayUsage('', payload);
 });
 ipcMain.handle('cursorRelayUsage:clear', async () => clearRelayUsage(''));
 ipcMain.handle('cursorRelayProfiles:load', async () => loadRelayProfileStore(''));
@@ -529,6 +573,18 @@ ipcMain.handle('tray:refreshMenu', () => {
 ipcMain.handle('app:syncPreferences', (_event, payload = {}) => {
   setCloseMode(payload?.closeMode);
   return { ok: true };
+});
+
+ipcMain.handle('cursorAutoUpdate:getStatus', (_event, payload = {}) => {
+  return readCursorAutoUpdateStatus(payload?.cursorExePath || '');
+});
+
+ipcMain.handle('cursorAutoUpdate:disable', (_event, payload = {}) => {
+  return disableCursorAutoUpdate(payload?.cursorExePath || '');
+});
+
+ipcMain.handle('cursorAutoUpdate:restore', (_event, payload = {}) => {
+  return restoreCursorAutoUpdate(payload?.cursorExePath || '');
 });
 
 ipcMain.handle('win:isMaximized', () => {

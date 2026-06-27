@@ -125,6 +125,10 @@ function encodeInt32Field(field, value) {
   ]);
 }
 
+function encodeBoolField(field, value) {
+  return encodeInt32Field(field, value ? 1 : 0);
+}
+
 function encodeMessage(fields = []) {
   return concatBytes(fields.map((item) => encodeBytesField(item.field, item.value)));
 }
@@ -1853,6 +1857,59 @@ function encodeConversationPlanStructure(planText = '') {
   ]);
 }
 
+function encodePromptTokenBreakdownCategory(category = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, category.id),
+    encodeOptionalStringField(2, category.label),
+    encodeOptionalIntField(3, category.estimatedTokens),
+    encodeOptionalIntField(4, category.characterCount),
+  ]);
+}
+
+function encodePromptTokenBreakdownSnapshot(snapshot = {}) {
+  const categories = Array.isArray(snapshot.categories) ? snapshot.categories : [];
+  return concatBytes([
+    encodeOptionalIntField(1, snapshot.totalUsedTokens),
+    encodeOptionalIntField(2, snapshot.maxTokens),
+    ...categories.map((category) => encodeBytesField(3, encodePromptTokenBreakdownCategory(category))),
+  ]);
+}
+
+function encodePromptContextSourceRef(source = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, source.sourceType),
+    encodeOptionalIntField(3, source.messageIndex),
+    encodeOptionalStringField(4, source.contentPath),
+    encodeOptionalIntField(5, source.startOffset),
+    encodeOptionalIntField(6, source.endOffset),
+  ]);
+}
+
+function encodePromptContextNode(node = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, node.id),
+    encodeOptionalStringField(2, node.parentId),
+    encodeOptionalStringField(3, node.kind),
+    encodeOptionalStringField(4, node.label),
+    encodeOptionalStringField(5, node.categoryId),
+    encodeOptionalIntField(6, node.estimatedTokens),
+    encodeOptionalIntField(7, node.characterCount),
+    typeof node.contentAvailable === 'boolean' ? encodeBoolField(9, node.contentAvailable) : Buffer.alloc(0),
+    node.source && typeof node.source === 'object'
+      ? encodeBytesField(11, encodePromptContextSourceRef(node.source))
+      : Buffer.alloc(0),
+    encodeOptionalStringField(12, node.inlineContent),
+  ]);
+}
+
+function encodePromptContextUsageTree(tree = {}) {
+  const nodes = Array.isArray(tree.nodes) ? tree.nodes : [];
+  return concatBytes([
+    encodeOptionalIntField(1, tree.schemaVersion),
+    ...nodes.map((node) => encodeBytesField(2, encodePromptContextNode(node))),
+  ]);
+}
+
 function buildAgentConversationCheckpointFrame(options = {}) {
   const workspaceRoot = normalizeCheckpointPath(options.workspaceRoot || '');
   const previousWorkspaceUri = options.previousWorkspaceUri || toWorkspaceUri(workspaceRoot);
@@ -1870,9 +1927,19 @@ function buildAgentConversationCheckpointFrame(options = {}) {
       normalizeCheckpointPath(key),
       encodeFileStateStructure(state),
     )));
+  const promptTokenBreakdown = options.breakdown && typeof options.breakdown === 'object'
+    ? options.breakdown
+    : (options.promptTokenBreakdown && typeof options.promptTokenBreakdown === 'object'
+      ? options.promptTokenBreakdown
+      : null);
+  const promptContextUsageTree = options.promptContextUsageTree && typeof options.promptContextUsageTree === 'object'
+    ? options.promptContextUsageTree
+    : null;
   const tokenDetails = concatBytes([
     encodeInt32Field(1, Number(options.usedTokens) || 1),
     encodeInt32Field(2, Number(options.maxTokens) || 200000),
+    promptTokenBreakdown ? encodeBytesField(3, encodePromptTokenBreakdownSnapshot(promptTokenBreakdown)) : Buffer.alloc(0),
+    promptContextUsageTree ? encodeBytesField(4, encodePromptContextUsageTree(promptContextUsageTree)) : Buffer.alloc(0),
   ]);
   const payload = concatBytes([
     ...rootPromptMessagesJson.map((item) => encodeBytesField(1, Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'))),

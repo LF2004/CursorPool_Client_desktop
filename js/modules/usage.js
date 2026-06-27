@@ -4,7 +4,8 @@ import { DEFAULT_PAGE_SIZE, mountPagination, parsePagedResponse } from '../core/
 import { reasoningEffortLabel } from './relay-profiles.js';
 
 const usagePageState = { page: 1, pageSize: 20, total: 0 };
-const USAGE_POLL_INTERVAL_MS = 1000;
+const USAGE_POLL_INTERVAL_MS = 3000;
+const USAGE_HISTORY_SYNC_INTERVAL_MS = 30000;
 const USAGE_VIEW_MODES = {
   compact: 'compact',
   detail: 'detail',
@@ -18,6 +19,7 @@ let usagePollActive = false;
 let usageRefreshInFlight = false;
 let usagePollPaused = false;
 let usageScrollEndTimer = null;
+let usageLastHistorySyncAt = 0;
 let lastUsageFingerprint = '';
 let lastUsageRows = [];
 let pendingUsageRows = null;
@@ -105,7 +107,7 @@ function getBillingScopeFilter() {
   return 'all';
 }
 
-function getFilters(page = usagePageState.page) {
+function getFilters(page = usagePageState.page, { syncHistory = false } = {}) {
   const billingScope = getBillingScopeFilter();
   return {
     page,
@@ -117,26 +119,12 @@ function getFilters(page = usagePageState.page) {
     model: $('usageModelFilter')?.value?.trim() || '',
     cursorAgentAccount: $('usageAccountFilter')?.value?.trim() || '',
     requestId: $('usageRequestFilter')?.value?.trim() || '',
+    syncHistory,
   };
 }
 
 function setTextIfChanged(el, text) {
   if (el && el.textContent !== text) el.textContent = text;
-}
-
-function renderPriceSources(data = {}) {
-  const sources = Array.isArray(data.priceSources) && data.priceSources.length
-    ? data.priceSources
-    : [
-      { label: 'OpenAI', url: 'https://openai.com/api/pricing/' },
-      { label: 'Anthropic', url: 'https://www.anthropic.com/pricing' },
-      { label: 'DeepSeek', url: 'https://api-docs.deepseek.com/quick_start/pricing' },
-      { label: 'Gemini', url: 'https://ai.google.dev/gemini-api/docs/pricing' },
-      { label: 'MiMo', url: 'https://mimo.mi.com/docs/zh-CN/price/pay-as-you-go' },
-    ];
-  const links = sources.map((item) => (
-    `<a href="#" class="usage-link" data-external-url="${escapeHtml(item.url)}">${escapeHtml(item.label)}</a>`
-  )).join(' / ');
 }
 
 const CACHE_GAUGE_ARC_LENGTH = 157.08;
@@ -188,24 +176,6 @@ function renderSummary(data = {}) {
   setTextIfChanged($('usageSummaryCost'), formatUsd(summary.total_cost_usd || 0));
   renderCacheSummary(summary);
   setTextIfChanged($('usageSummaryStatus'), `${success} / ${pending} / ${errors}`);
-  const dbPath = data.dbPath || '-';
-  const dbPathEl = $('usageDbPath');
-  if (dbPathEl) {
-    setTextIfChanged(dbPathEl, dbPath);
-    if (dbPathEl.title !== dbPath) dbPathEl.title = dbPath;
-  }
-  const currentAccount = String(data.currentCursorAgentAccount || '').trim();
-  const accountEl = $('usageCurrentAccountText');
-  const accountChip = $('usageCurrentAccount');
-  setTextIfChanged(accountEl, currentAccount || '未检测到 Cursor 账户');
-  if (accountChip) {
-    accountChip.classList.toggle('usage-account-chip-empty', !currentAccount);
-    const nextTitle = currentAccount
-      ? `当前 Cursor Agent 账户：${currentAccount}`
-      : '未能从 state.vscdb 读取当前 Cursor 账户';
-    if (accountChip.title !== nextTitle) accountChip.title = nextTitle;
-  }
-  renderPriceSources(data);
 }
 
 let usagePopoverEl = null;
@@ -386,14 +356,52 @@ function buildTokenHelpPopoverHtml() {
 
 function buildCacheHelpPopoverHtml() {
   return `
-    <div class="usage-popover-title">缓存命中率说明</div>
+    <div class="usage-popover-title">Prompt 缓存率说明</div>
     <div class="usage-popover-rows">
-      <div class="usage-popover-row"><span>命中率</span><span class="mono">缓存读取 ÷ Prompt 消耗</span></div>
+      <div class="usage-popover-row"><span>Prompt 缓存率</span><span class="mono">缓存读取 ÷ Prompt 消耗</span></div>
       <div class="usage-popover-row"><span>Token 消耗</span><span>输入 + 输出 Token 总量</span></div>
       <div class="usage-popover-row"><span>Prompt 消耗</span><span>全部 Prompt Token</span></div>
+      <div class="usage-popover-row"><span>缓存读取</span><span>上游 API Prompt 缓存命中 Token</span></div>
+      <div class="usage-popover-row"><span>本地回放</span><span>表格「缓存」列中的 ⚡ 标记</span></div>
       <div class="usage-popover-row"><span>非缓存 Prompt</span><span>按官方定价计费的输入 Token</span></div>
     </div>
   `;
+}
+
+function computeRowCacheStatus(row, isLocalCacheHit) {
+  const inputTokens = Number(row.input_tokens) || 0;
+  const cachedInputTokens = Number(row.cached_input_tokens) || 0;
+  const hasUpstreamCache = !isLocalCacheHit && cachedInputTokens > 0 && inputTokens > 0;
+  const upstreamCacheRate = hasUpstreamCache ? (cachedInputTokens / inputTokens) * 100 : null;
+  return { inputTokens, cachedInputTokens, hasUpstreamCache, upstreamCacheRate };
+}
+
+function buildCacheCellHtml(row, { isLocalCacheHit, cacheLayer, compact = false } = {}) {
+  const { cachedInputTokens, hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row, isLocalCacheHit);
+  const parts = [];
+  if (isLocalCacheHit) {
+    const layerLabel = cacheLayer ? cacheLayer.toUpperCase() : 'LOCAL';
+    parts.push(`<span class="usage-cache-detail usage-cache-local" title="本地缓存回放，跳过上游请求"><i class="fa fa-bolt" aria-hidden="true"></i>${compact ? layerLabel : `<strong>${layerLabel}</strong> 回放`}</span>`);
+  }
+  if (hasUpstreamCache) {
+    const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
+    parts.push(`<span class="usage-cache-detail usage-cache-prompt" title="上游 Prompt 缓存读取 ${formatNumber(cachedInputTokens)} tokens"><i class="fa fa-minus-square" aria-hidden="true"></i>${compact ? rateText : `Prompt ${rateText}`}</span>`);
+  }
+  if (!parts.length) return '<span class="usage-muted">-</span>';
+  return `<span class="usage-cache-stack${compact ? ' usage-cache-stack-compact' : ''}">${parts.join('')}</span>`;
+}
+
+function buildCompactCacheTags(row, isLocalCacheHit) {
+  const { hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row, isLocalCacheHit);
+  const tags = [];
+  if (isLocalCacheHit) {
+    tags.push('<button type="button" class="usage-cache-tag usage-cache-tag-local usage-info-btn" data-popover="cache-local" aria-label="本地缓存回放说明">LOCAL</button>');
+  }
+  if (hasUpstreamCache) {
+    const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
+    tags.push(`<button type="button" class="usage-cache-tag usage-cache-tag-prompt usage-info-btn" data-popover="cache-prompt" aria-label="上游 Prompt 缓存说明">PROMPT ${rateText}</button>`);
+  }
+  return tags.join('');
 }
 
 function attachUsagePopoverHandlers() {
@@ -409,6 +417,22 @@ function attachUsagePopoverHandlers() {
       else if (type === 'cost') html = buildCostPopoverHtml(btn.dataset);
       else if (type === 'token-help') html = buildTokenHelpPopoverHtml();
       else if (type === 'cache-help') html = buildCacheHelpPopoverHtml();
+      else if (type === 'cache-local') html = `
+        <div class="usage-popover-title">本地回放说明</div>
+        <div class="usage-popover-rows">
+          <div class="usage-popover-row"><span>含义</span><span>本地 Relay 命中缓存，未发上游请求</span></div>
+          <div class="usage-popover-row"><span>效果</span><span>直接回放已缓存的响应文本</span></div>
+          <div class="usage-popover-row"><span>标记</span><span class="mono">LOCAL / CACHE</span></div>
+        </div>
+      `;
+      else if (type === 'cache-prompt') html = `
+        <div class="usage-popover-title">上游 Prompt 缓存说明</div>
+        <div class="usage-popover-rows">
+          <div class="usage-popover-row"><span>含义</span><span>上游 API 复用了前缀 Prompt token</span></div>
+          <div class="usage-popover-row"><span>效果</span><span>请求仍然发出，但输入 token 更省</span></div>
+          <div class="usage-popover-row"><span>标记</span><span class="mono">PROMPT xx%</span></div>
+        </div>
+      `;
       if (!html) return;
       showUsagePopover(btn, html);
     };
@@ -454,6 +478,11 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
     const phase = String(row.phase || '-');
     const endpointMode = String(row.endpoint_mode || '').trim();
     const modeLabel = formatUsageModeLabel(row.mode);
+    const compactCacheTags = buildCompactCacheTags(row, isCacheHit);
+    const modelId = String(row.model || '').trim();
+    const displayName = String(row.display_name || '').trim();
+    const primaryModelText = displayName || modelId || '-';
+    const showModelIdMeta = Boolean(modelId) && modelId !== primaryModelText;
     // 缓存命中：费用归零显示，token 显示缓存标记
     const displayCost = isCacheHit ? '$0.000000' : formatUsd(row.total_cost_usd);
     // 构建状态单元格（含缓存标记）
@@ -466,10 +495,10 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
       <tr class="${isCacheHit ? 'usage-row-cache-hit' : ''}">
         <td class="mono usage-time">${escapeHtml(formatDate(row.created_at))}</td>
         <td class="usage-model-cell">
-          <div class="usage-model mono" title="${escapeHtml(row.model || '')}">${escapeHtml(row.model || '-')}</div>
+          <div class="usage-model${displayName ? '' : ' mono'}" title="${escapeHtml(primaryModelText)}">${escapeHtml(primaryModelText)}</div>
           <div class="usage-model-meta">
-            ${row.model_label ? `<span class="usage-muted">${escapeHtml(row.model_label)}</span>` : ''}
-            ${isCacheHit && !isDetail ? `<span class="usage-cache-tag usage-muted">CACHE</span>` : ''}
+            ${showModelIdMeta ? `<span class="usage-muted mono">${escapeHtml(modelId)}</span>` : ''}
+            ${compactCacheTags}
           </div>
         </td>
         <td class="usage-mode-cell"><span class="usage-mode-badge">${escapeHtml(modeLabel)}</span></td>
@@ -512,10 +541,7 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
           </div>
         </td>
         <td>${statusCellHtml}</td>
-        ${isDetail ? `<td class="usage-cache-cell">${isCacheHit
-          ? `<span class="usage-cache-detail" title="本地缓存回放，跳过上游请求"><i class="fa fa-bolt" aria-hidden="true"></i> <strong>${cacheLayer.toUpperCase()}</strong> 命中</span>`
-          : '<span class="usage-muted">-</span>'
-        }</td>` : ''}
+        ${isDetail ? `<td class="usage-cache-cell">${buildCacheCellHtml(row, { isLocalCacheHit: isCacheHit, cacheLayer })}</td>` : ''}
         ${isDetail ? `<td class="mono usage-request" title="${escapeHtml(row.request_id || '')}">${escapeHtml(row.request_id || '-')}</td>` : ''}
       </tr>
     `;
@@ -565,13 +591,18 @@ export async function refreshUsage(page = usagePageState.page, { silent = false 
     lastUsageFingerprint = '';
     pendingUsageRows = null;
     pendingUsageApply = null;
+    usageLastHistorySyncAt = 0;
   }
 
   if (silent) usageRefreshInFlight = true;
   else setUsageLoading(true);
 
+  const now = Date.now();
+  const syncHistory = !silent || now - usageLastHistorySyncAt >= USAGE_HISTORY_SYNC_INTERVAL_MS;
+  if (syncHistory) usageLastHistorySyncAt = now;
+
   try {
-    const data = await window.electronBridge.cursorRelayUsageList(getFilters(page));
+    const data = await window.electronBridge.cursorRelayUsageList(getFilters(page, { syncHistory }));
     const paged = parsePagedResponse(data, page, usagePageState.pageSize);
     applyUsageData(data, paged, { silent });
   } catch (error) {
@@ -647,20 +678,6 @@ export function bindUsageEvents() {
       if (event.key === 'Enter') refreshUsage(1);
     };
   });
-  const priceSource = $('usagePriceSource');
-  if (priceSource) {
-    priceSource.onclick = async (event) => {
-      const link = event.target.closest?.('.usage-link[data-external-url]');
-      if (!link) return;
-      event.preventDefault();
-      try {
-        await window.electronBridge?.openExternal?.(link.dataset.externalUrl);
-      } catch (error) {
-        await showAlert(error?.message || String(error), { title: '打开链接失败', tone: 'danger' });
-      }
-    };
-  }
-
   window.addEventListener('scroll', (event) => {
     if (event.target?.closest?.('.usage-table-scroll')) return;
     hideUsagePopover();

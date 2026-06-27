@@ -8,9 +8,9 @@
 //      - 单轮：指纹 = "U:最后用户消息"
 //      - 多轮(仅含幂等工具)：指纹 = 完整对话流(用户+工具调用+工具结果)
 //      - 多轮(含副作用工具)：禁用
-//   3) ultra  —— hash(上下文指纹)，跨模型兜底
+//   3) ultra  —— hash(上下文指纹)，跨模型兜底（默认关闭，需显式开启）
 //
-// 查询顺序：exact → fuzzy → ultra
+// 查询顺序：exact → fuzzy → ultra(可选)
 // 安全约束：
 //   - 只缓存成功、有文本、无错误的响应
 //   - 含副作用工具(Shell/Write/Delete/StrReplace/Task)的对话不缓存
@@ -38,6 +38,22 @@ const MIN_TEXT_LEN = 1;
 const MAX_TEXT_LEN = 64 * 1024;
 const MAX_TOOL_RESULT_LEN = 8192; // 工具结果参与指纹时的截断长度
 const MAX_USER_MSG_LEN = 2048;
+const ENABLE_ULTRA_CACHE = String(process.env.CURSOR_RELAY_ENABLE_ULTRA_CACHE || '').trim() === '1';
+
+// 不参与响应缓存的上游阶段（其余 Agent 阶段均允许 fuzzy/ultra）
+const PHASE_CACHE_BLOCKED = new Set(['history', 'billing', 'test']);
+
+function normalizePhaseForCacheKey(phase) {
+  const value = String(phase || 'upstream');
+  if (/^post_tool_/.test(value)) return 'post_tool';
+  if (/^completion_verify_/.test(value)) return 'completion_verify';
+  if (/^incomplete_continuation_/.test(value)) return 'incomplete_continuation';
+  return value;
+}
+
+function isPhaseCacheAllowed(phase) {
+  return !PHASE_CACHE_BLOCKED.has(String(phase || 'upstream'));
+}
 
 // 幂等工具（GET 类）：可缓存其结果
 const IDEMPOTENT_TOOLS = new Set([
@@ -49,19 +65,31 @@ const IDEMPOTENT_TOOLS = new Set([
   'read_mcp_resource', 'readmcpresource',
 ]);
 
-// 副作用工具（POST/PUT/DELETE 类）：绝不缓存
-const SIDE_EFFECT_TOOLS = new Set([
-  'shell', 'shell_stream', 'shellstream',
+// 文件编辑类副作用工具：修改文件但结果确定。
+// 不阻断 fuzzy/ultra 缓存，但指纹只取最后一个编辑工具之后的片段。
+// 这样 "PatchEdit → Read 同一文件" 的后续请求能命中缓存。
+const FILE_EDIT_TOOLS = new Set([
   'write', 'edit', 'patchedit', 'strreplace', 'str_replace',
-  'delete',
   'todowrite', 'todo_write', 'updatetodo', 'updatetodos',
   'createplan', 'create_plan',
+]);
+
+// 高风险副作用工具：行为不可预测或影响外部状态，绝不缓存。
+const HIGH_RISK_SIDE_EFFECT_TOOLS = new Set([
+  'shell', 'shell_stream', 'shellstream',
+  'delete',
   'task',
   'computer_use', 'computeruse',
   'record_screen', 'recordscreen',
   'write_shell_stdin', 'writeshellstdin',
   'execute_hook', 'executehook',
   'mcp', // MCP 工具行为不可预测，默认按副作用处理
+]);
+
+// 兼容：全部副作用工具（exact 层仍按此判断）
+const SIDE_EFFECT_TOOLS = new Set([
+  ...FILE_EDIT_TOOLS,
+  ...HIGH_RISK_SIDE_EFFECT_TOOLS,
 ]);
 
 const memoryCache = new Map();
@@ -104,8 +132,35 @@ function isSideEffectTool(name) {
   return SIDE_EFFECT_TOOLS.has(normalizeToolName(name));
 }
 
+function isHighRiskSideEffectTool(name) {
+  return HIGH_RISK_SIDE_EFFECT_TOOLS.has(normalizeToolName(name));
+}
+
+function isFileEditTool(name) {
+  return FILE_EDIT_TOOLS.has(normalizeToolName(name));
+}
+
+// 检查 messages 是否包含高风险副作用工具调用（阻断所有缓存）
+function hasHighRiskSideEffectTools(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+      for (const call of msg.tool_calls) {
+        const name = normalizeToolName(call?.function?.name || call?.name || '');
+        if (!name) continue;
+        if (isHighRiskSideEffectTool(name)) return true;
+        // 未知工具保守按高风险处理
+        if (!isIdempotentTool(name) && !isFileEditTool(name)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// 检查 messages 是否包含副作用工具调用（兼容旧调用，含文件编辑类）
 // 检查 messages 是否包含副作用工具调用
-// 任意一个非幂等工具 → 视为副作用，整段对话不缓存
+// 注意：文件编辑类不再阻断 fuzzy/ultra，但 exact 层仍按此判断
 function hasSideEffectTools(messages) {
   if (!Array.isArray(messages)) return false;
   for (const msg of messages) {
@@ -123,13 +178,48 @@ function hasSideEffectTools(messages) {
   return false;
 }
 
-// 判断对话是否可缓存
-// 规则：最后一条必须是 user，且不含副作用工具调用
+// 找到最后一个"文件编辑工具结果"在 messages 中的索引。
+// 用于分段指纹：只取最后一个编辑工具之后的对话片段。
+// 返回 -1 表示没有文件编辑工具。
+function findLastFileEditToolResultIndex(messages) {
+  if (!Array.isArray(messages)) return -1;
+  // 先收集所有文件编辑工具的 call_id
+  const fileEditCallIds = new Set();
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    if (Array.isArray(msg.tool_calls)) {
+      for (const call of msg.tool_calls) {
+        const name = normalizeToolName(call?.function?.name || call?.name || '');
+        if (isFileEditTool(name) && call?.id) {
+          fileEditCallIds.add(String(call.id));
+        }
+      }
+    }
+  }
+  if (!fileEditCallIds.size) return -1;
+  // 找到最后一个 tool 消息，其 tool_call_id 属于文件编辑工具
+  let lastIndex = -1;
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== 'object') continue;
+    if (String(msg.role || '') === 'tool') {
+      const callId = String(msg.tool_call_id || '');
+      if (callId && fileEditCallIds.has(callId)) {
+        lastIndex = i;
+      }
+    }
+  }
+  return lastIndex;
+}
+
+// 判断对话是否可缓存（fuzzy/ultra 层）
+// 规则：最后一条必须是 user，且不含高风险副作用工具调用
+// 文件编辑类工具不阻断，但指纹会分段处理
 function isCacheableConversation(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return false;
   const last = messages[messages.length - 1];
   if (!last || String(last.role || '') !== 'user') return false;
-  if (hasSideEffectTools(messages)) return false;
+  if (hasHighRiskSideEffectTools(messages)) return false;
   return true;
 }
 
@@ -176,10 +266,16 @@ function normalizeMessagesForKey(messages) {
 // 单轮：U:最后用户消息
 // 多轮(仅幂等工具)：U:user1 | T:tool_call | R:tool_result | U:user2 ...
 // 跳过 assistant 文本（那是要被缓存的内容）
+// 分段优化：如果对话含文件编辑工具，只取最后一个编辑工具结果之后的片段，
+// 这样 "PatchEdit → Read" 的后续请求能命中 "Read → 分析" 的缓存。
 function buildContextFingerprint(messages) {
   if (!Array.isArray(messages)) return '';
+  // 分段：找到最后一个文件编辑工具结果的索引，从其后开始取指纹
+  const cutIndex = findLastFileEditToolResultIndex(messages);
+  const start = cutIndex >= 0 ? cutIndex + 1 : 0;
   const parts = [];
-  for (const msg of messages) {
+  for (let i = start; i < messages.length; i += 1) {
+    const msg = messages[i];
     if (!msg || typeof msg !== 'object') continue;
     const role = String(msg.role || '');
     if (role === 'system') continue; // 系统消息通常是 env 信息，跨会话不稳定
@@ -190,7 +286,9 @@ function buildContextFingerprint(messages) {
       if (Array.isArray(msg.tool_calls)) {
         for (const call of msg.tool_calls) {
           const name = normalizeToolName(call?.function?.name || call?.name || '');
-          if (!isIdempotentTool(name)) continue; // 副作用工具不应出现在指纹里（已被拦截）
+          // 文件编辑工具的调用不出现在分段后的指纹里（已被截断）
+          // 高风险工具已被 isCacheableConversation 拦截
+          if (!isIdempotentTool(name)) continue;
           const args = String(call?.function?.arguments || call?.arguments || '');
           parts.push(`T:${name}:${args.slice(0, 1024)}`);
         }
@@ -213,7 +311,8 @@ function buildCacheKeys(model, messages, options = {}) {
   const enableTools = options.enableTools !== false;
   const toolKey = enableTools ? String(options.toolChoice || 'auto') : 'notools';
   const phase = String(options.phase || 'upstream');
-  const phaseAllowed = phase === 'upstream' || phase === 'stream' || phase === '';
+  const phaseAllowed = isPhaseCacheAllowed(phase);
+  const phaseKey = normalizePhaseForCacheKey(phase);
 
   // exact 层：完整 messages + 推理参数
   const norm = normalizeMessagesForKey(messages);
@@ -223,7 +322,7 @@ function buildCacheKeys(model, messages, options = {}) {
     const reasoningKey = options.disableReasoning === true
       ? 'no_reasoning'
       : String(options.reasoningEffort || config_upstream_reasoning(options) || 'default');
-    exact = sha256(`exact|${model}|${toolKey}|${phase}|${reasoningKey}|${norm}`);
+    exact = sha256(`exact|${model}|${toolKey}|${phaseKey}|${reasoningKey}|${norm}`);
   }
 
   // fuzzy/ultra 层：上下文指纹
@@ -233,7 +332,7 @@ function buildCacheKeys(model, messages, options = {}) {
     const fingerprint = buildContextFingerprint(messages);
     if (fingerprint && fingerprint.length >= MIN_TEXT_LEN && fingerprint.length <= 32768) {
       fuzzy = sha256(`fuzzy|${model || ''}|${fingerprint}`);
-      ultra = sha256(`ultra|${fingerprint}`);
+      if (ENABLE_ULTRA_CACHE) ultra = sha256(`ultra|${fingerprint}`);
     }
   }
   return { exact, fuzzy, ultra };
@@ -318,6 +417,7 @@ function _set(key, entry) {
 
 function buildCachedResponse(entry) {
   const text = String(entry.text || '');
+  const reasoning = String(entry.reasoning || '');
   return {
     ok: true,
     status: 200,
@@ -325,12 +425,64 @@ function buildCachedResponse(entry) {
       get: (name) => (String(name || '').toLowerCase() === 'content-type'
         ? 'text/event-stream' : null),
     },
-    body: null,
+    body: createReplayStream(text, reasoning),
     text: async () => text,
     _fromCache: true,
     _cachedAt: entry.ts,
     _cacheLayer: entry.layer,
   };
+}
+
+function createReplayStream(text, reasoning = '') {
+  if (typeof ReadableStream !== 'function') {
+    return null;
+  }
+  const frames = [];
+  for (const chunk of splitReplayText(reasoning)) {
+    frames.push({ type: 'response.reasoning_summary_text.delta', delta: chunk });
+  }
+  for (const chunk of splitReplayText(text)) {
+    frames.push({ type: 'response.output_text.delta', delta: chunk });
+  }
+  frames.push({ type: 'response.output_text.done' });
+  frames.push({ type: 'response.completed', response: { output: [] } });
+
+  return new ReadableStream({
+    start(controller) {
+      let closed = false;
+      const burstSize = 8;
+      let index = 0;
+      const pump = () => {
+        if (closed) return;
+        if (index >= frames.length) {
+          closed = true;
+          controller.close();
+          return;
+        }
+        const end = Math.min(index + burstSize, frames.length);
+        for (; index < end; index += 1) {
+          if (closed) return;
+          controller.enqueue(Buffer.from(`data: ${JSON.stringify(frames[index])}\n\n`, 'utf8'));
+        }
+        if (!closed) setTimeout(pump, 0);
+      };
+      pump();
+    },
+    cancel() {
+      // no-op
+    },
+  });
+}
+
+function splitReplayText(text) {
+  const value = String(text || '');
+  if (!value) return [];
+  const chunks = [];
+  const chunkSize = value.length > 1200 ? 512 : 256;
+  for (let i = 0; i < value.length; i += chunkSize) {
+    chunks.push(value.slice(i, i + chunkSize));
+  }
+  return chunks;
 }
 
 function warmupFromHistory(historyRoot) {
@@ -415,7 +567,7 @@ function _doWarmup(historyRoot) {
         const model = modelMap.get(requestId) || '';
 
         const ultraKey = sha256(`ultra|${fingerprint}`);
-        if (!memoryCache.has(ultraKey)) {
+        if (ENABLE_ULTRA_CACHE && !memoryCache.has(ultraKey)) {
           memoryCache.set(ultraKey, { text: asstText, reasoning: '', ts, hits: 0, layer: 'ultra', model });
           loaded += 1;
         }
@@ -503,6 +655,7 @@ module.exports = {
   get,
   set,
   buildCachedResponse,
+  createReplayStream,
   warmupFromHistory,
   getStats,
   clear,
@@ -510,11 +663,17 @@ module.exports = {
   _internal: {
     isCacheableConversation,
     hasSideEffectTools,
+    hasHighRiskSideEffectTools,
     isIdempotentTool,
     isSideEffectTool,
+    isHighRiskSideEffectTool,
+    isFileEditTool,
+    findLastFileEditToolResultIndex,
     buildContextFingerprint,
     normalizeToolName,
     IDEMPOTENT_TOOLS,
     SIDE_EFFECT_TOOLS,
+    FILE_EDIT_TOOLS,
+    HIGH_RISK_SIDE_EFFECT_TOOLS,
   },
 };

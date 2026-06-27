@@ -1,0 +1,12 @@
+{
+  "packages": 4,
+  "messages": 4603,
+  "enums": 250,
+  "services": 69,
+  "files": [
+    "agent_v1.proto",
+    "aiserver_v1.proto",
+    "anyrun_v1.proto",
+    "internapi_v1.proto"
+  ]
+}
