@@ -44,9 +44,68 @@ const AVAILABLE_MODELS_PATH = '/aiserver.v1.AiService/AvailableModels';
 const GET_USABLE_MODELS_PATH = '/agent.v1.AgentService/GetUsableModels';
 const GET_DEFAULT_MODEL_PATH = '/agent.v1.AgentService/GetDefaultModelForCli';
 
+function buildRelayModelParameterDefinitions() {
+  return [
+    {
+      id: 'thinking',
+      name: 'thinking',
+      markdownTooltip: 'Enable thinking mode for this local relay model.',
+      parameterType: {
+        booleanParameter: {},
+      },
+    },
+    {
+      id: 'reasoning',
+      name: 'reasoning',
+      markdownTooltip: 'Reasoning effort level.',
+      parameterType: {
+        enumParameter: {
+          values: [
+            { value: 'low', displayName: 'Low' },
+            { value: 'medium', displayName: 'Medium' },
+            { value: 'high', displayName: 'High' },
+            { value: 'extra-high', displayName: 'XHigh' },
+          ],
+        },
+      },
+    },
+  ];
+}
+
+function buildRelayModelVariants(displayName, shortName, rawReasoningEffort = 'medium') {
+  const normalizedEffort = (() => {
+    const effort = String(rawReasoningEffort || 'medium').trim().toLowerCase();
+    if (!effort) return 'medium';
+    if (effort === 'xhigh') return 'extra-high';
+    return effort;
+  })();
+  const badgeLabel = normalizedEffort === 'extra-high'
+    ? 'XHigh'
+    : `${normalizedEffort.charAt(0).toUpperCase()}${normalizedEffort.slice(1)}`;
+  const outsidePicker = `${shortName} ${badgeLabel}`.trim();
+  return [
+    {
+      parameterValues: [
+        { id: 'thinking', value: 'true' },
+        { id: 'reasoning', value: normalizedEffort },
+      ],
+      displayName: `${displayName} ${badgeLabel}`.trim(),
+      displayNameOutsidePicker: outsidePicker,
+      variantStringRepresentation: `${String(displayName || '').toLowerCase().replace(/\s+/g, '-')}-thinking-${normalizedEffort}`,
+      isMaxMode: false,
+      isDefaultMaxConfig: false,
+      isDefaultNonMaxConfig: true,
+      tooltipData: {
+        markdownContent: `Thinking enabled<br /><br />Reasoning: ${badgeLabel}`,
+      },
+      tagline: 'Reasoning enabled',
+    },
+  ];
+}
+
 /**
  * 从 relay profile store 收集所有本地模型
- * @returns {{modelName, displayName, displayNameShort, profileId, modelId}[]}
+ * @returns {{modelName, displayName, displayNameShort, profileId, modelId, reasoningEffort, thinkingMode}[]}
  */
 function dedupeModels(models = []) {
   const seen = new Set();
@@ -61,6 +120,8 @@ function dedupeModels(models = []) {
       displayNameShort: String(item?.displayNameShort || item?.displayName || modelName).trim().slice(0, 20) || modelName.slice(0, 20),
       profileId: String(item?.profileId || '').trim(),
       modelId: String(item?.modelId || modelName).trim() || modelName,
+      reasoningEffort: String(item?.reasoningEffort || 'medium').trim() || 'medium',
+      thinkingMode: String(item?.thinkingMode || '').trim(),
     });
   }
   return merged;
@@ -87,6 +148,8 @@ function collectModelsFromRunnerConfig(customRoot = '') {
           displayNameShort: (displayName || modelName).slice(0, 20),
           profileId,
           modelId: modelName,
+          reasoningEffort: String(source.reasoningEffort || 'medium').trim() || 'medium',
+          thinkingMode: String(source.thinkingMode || '').trim(),
         });
       }
     };
@@ -122,6 +185,8 @@ function collectLocalModels() {
           displayNameShort: String(c.name || c.modelName || '').trim().slice(0, 20),
           profileId: String(c.id || ''),
           modelId: String(c.modelName || '').trim(), // model_id 用 modelName
+          reasoningEffort: String(c.reasoningEffort || 'medium').trim() || 'medium',
+          thinkingMode: String(c.thinkingMode || '').trim(),
         })));
     }
   } catch {
@@ -217,9 +282,28 @@ function injectAvailableModelsResponse(upstreamResponseBody) {
       const existingModelNames = new Set(existingModels.map((m) => String(m.name || '')));
       const modelsToAdd = localModels
         .filter((m) => !existingModelNames.has(m.modelName))
-        .map((m) => ({
+        .map((m) => {
+          const reasoningEffort = String(m.reasoningEffort || 'medium').trim() || 'medium';
+          const shortName = m.displayNameShort || m.displayName || m.modelName;
+          const reasoningLabel = reasoningEffort === 'xhigh'
+            ? 'XHigh'
+            : reasoningEffort === 'extra-high'
+              ? 'XHigh'
+              : `${reasoningEffort.charAt(0).toUpperCase()}${reasoningEffort.slice(1)}`;
+          const tooltipParts = [
+            `**${m.displayName || m.modelName}**`,
+            `Model: ${m.modelName}`,
+            'Local relay model',
+            '200000 context window',
+            m.thinkingMode === 'disabled' ? 'Thinking: disabled' : 'Thinking: enabled',
+            `Reasoning: ${reasoningLabel}`,
+          ];
+          return ({
           name: m.modelName,                              // #1 模型标识
-          defaultOn: false,                                // #2 非默认（保留上游默认）
+          defaultOn: true,                                 // #2 默认启用，确保对话框可见
+          visibleInRoutedModelView: true,                  // 路由视图与聊天模型选择器都可见
+          namedModelSectionIndex: 99,
+          tagline: 'Local provider model',
           supportsAgent: true,                             // #5 ← **关键！** 出现在 Agent 下拉
           supportsThinking: true,                          // #9 支持推理
           supportsImages: true,                            // #10 支持图片
@@ -232,11 +316,24 @@ function injectAvailableModelsResponse(upstreamResponseBody) {
           supportsPlanMode: true,                          // #22 支持 Plan 模式
           supportsSandboxing: true,                        // #25 支持沙箱
           supportsCmdK: true,                              // #26 支持 Cmd+K
+          parameterDefinitions: buildRelayModelParameterDefinitions(),
+          variants: buildRelayModelVariants(
+            m.displayName || m.modelName,
+            shortName,
+            reasoningEffort,
+          ),
+          legacySlugs: [],
+          idAliases: [],
+          cloudAgentEffortModes: ['low', 'medium', 'high', 'extra-high'],
           clientDisplayName: m.displayName || m.modelName, // #17 UI 显示名
           serverModelName: m.modelName,                    // #18 服务端模型名
-          inputboxShortModelName: m.displayNameShort || m.displayName || m.modelName, // #24 输入框简短名
-          degradationStatus: 0,                                // #6 UNSPECIFIED
-        }));
+          tooltipData: {
+            markdownContent: tooltipParts.join('<br /><br />'),
+          },
+          inputboxShortModelName: shortName, // #24 输入框简短名
+          degradationStatus: 0,                             // #6 UNSPECIFIED
+        });
+        });
 
       if (!namesToAdd.length && !modelsToAdd.length) return resp;
 

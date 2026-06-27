@@ -343,7 +343,17 @@ async function activateProfile(id) {
   if (!(await selectActiveProfile(id))) return;
 
   const bridge = window.electronBridge;
-  if (relayEnabled && bridge?.cursorRelayQuickSwitchModel) {
+  let relayRunning = relayEnabled;
+  if (bridge?.cursorRelayGetConfig) {
+    try {
+      const current = await bridge.cursorRelayGetConfig({ lightweight: true });
+      relayRunning = Boolean(current?.runner?.running || current?.enabled);
+      relayEnabled = relayRunning;
+    } catch {
+      /* ignore runtime state refresh failure */
+    }
+  }
+  if (relayRunning && bridge?.cursorRelayQuickSwitchModel) {
     try {
       await withRelayBusy('正在切换本地代理模型…', async () => {
         await bridge.cursorRelayQuickSwitchModel({ profileId: id });
@@ -360,7 +370,7 @@ async function activateProfile(id) {
     return;
   }
 
-  if (relayEnabled) {
+  if (relayRunning) {
     const active = getActiveProfile(profilesStore);
     await showAlert(
       `已切换为 ${describeProfile(active)}。若 Relay 正在运行，请重新启用后才会应用到正在运行的代理。`,
@@ -1113,7 +1123,7 @@ async function getUpstreamProbeForEnable() {
 
 async function enableRelayForProfile(profileId) {
   const bridge = window.electronBridge;
-  if (!bridge?.cursorRelayApply) {
+  if (!bridge?.cursorRelayApply && !bridge?.cursorRelayQuickSwitchModel) {
     await showAlert('桌面客户端未提供 Relay 桥接能力。', {
       title: 'Relay 不可用',
       tone: 'danger',
@@ -1145,14 +1155,26 @@ async function enableRelayForProfile(profileId) {
     return;
   }
 
-  const wasRunning = relayEnabled;
+  let wasRunning = relayEnabled;
+  if (bridge?.cursorRelayGetConfig) {
+    try {
+      const current = await bridge.cursorRelayGetConfig({ lightweight: true });
+      wasRunning = Boolean(current?.runner?.running || current?.enabled);
+      relayEnabled = wasRunning;
+    } catch {
+      /* ignore runtime state refresh failure */
+    }
+  }
   const busyTitle = wasRunning ? '正在切换 Relay 模型…' : '正在启用 Relay...';
 
   await withRelayBusy(busyTitle, async () => {
     try {
-      const local = wasRunning && bridge.cursorRelayQuickSwitchModel
-        ? (await bridge.cursorRelayQuickSwitchModel({ profileId })).relay
-        : await bridge.cursorRelayApply({
+      let local;
+      if (wasRunning && bridge.cursorRelayQuickSwitchModel) {
+        await bridge.cursorRelayQuickSwitchModel({ profileId });
+        local = await bridge.cursorRelayGetConfig?.({ lightweight: true });
+      } else {
+        local = await bridge.cursorRelayApply({
           upstream,
           modelRoutes: collectRelayModelRoutes(),
           forceRestartRunner: true,
@@ -1162,6 +1184,7 @@ async function enableRelayForProfile(profileId) {
           useSystemProxy: false,
           ...collectRelayRuntimeOptions(),
         });
+      }
       updateRelayToggleButton(true, true);
       {
         const stats = local?.runner?.stats || local?.log?.stats || {};

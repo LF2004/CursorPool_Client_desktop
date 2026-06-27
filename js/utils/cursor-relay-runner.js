@@ -56,6 +56,7 @@ const mcpSkill = require('./cursor-relay-mcp-skill');
 const streamCpp = require('./cursor-relay-streamcpp');
 // 认证/订阅接口拦截（修复 Log in ⚡ / 模型列表问题）
 const authIntercept = require('./cursor-relay-auth-intercept');
+const { loadRelayProfileStore, saveRelayProfileStore } = require('./cursor-relay-profile-store');
 const {
   beginTurn: beginAgentHistoryTurn,
   appendHistoryItem: appendAgentHistoryItem,
@@ -319,6 +320,50 @@ function resolveUpstreamForModel(config = {}, modelName = '') {
   if (!requested) return config.upstream || {};
   const route = getConfiguredModelRoutes(config).find((item) => item.modelName === requested);
   return route?.upstream || config.upstream || {};
+}
+
+function collectRelayProviderModels(config = {}) {
+  const names = new Set();
+  const entries = [];
+  const pushModel = (modelName, upstream = {}) => {
+    const name = String(modelName || '').trim();
+    if (!name || names.has(name)) return;
+    names.add(name);
+    const displayName = String(upstream.displayName || name).trim() || name;
+    const contextLength = clampRelayContextWindowTokens(upstream.contextWindow);
+    entries.push({
+      id: name,
+      object: 'model',
+      created: 0,
+      owned_by: String(upstream.providerId || 'cursor-relay').trim() || 'cursor-relay',
+      permission: [],
+      root: name,
+      parent: null,
+      displayName,
+      contextLength,
+      maxOutputTokens: contextLength,
+      supportsReasoning: String(upstream.reasoningEffort || '').trim().toLowerCase() !== 'disabled',
+      supportsVision: supportsImageContent(upstream, name),
+      endpointMode: String(upstream.endpointMode || '').trim().toLowerCase() || 'responses',
+    });
+  };
+
+  pushModel(config.upstream?.modelName, config.upstream || {});
+  (Array.isArray(config.upstream?.availableModels) ? config.upstream.availableModels : []).forEach((name) => {
+    pushModel(name, config.upstream || {});
+  });
+  for (const item of getConfiguredModelRoutes(config)) {
+    pushModel(item.modelName, item.upstream || {});
+    (Array.isArray(item.upstream?.availableModels) ? item.upstream.availableModels : []).forEach((name) => {
+      pushModel(name, item.upstream || {});
+    });
+  }
+  return entries;
+}
+
+function isLocalProviderModelsPath(urlText = '') {
+  const pathname = String(urlText || '').split('?')[0];
+  return pathname === '/models' || pathname === '/v1/models' || pathname === '/openai/models';
 }
 
 function findTagPrefixSuffixLength(text, tag) {
@@ -2799,6 +2844,34 @@ function isRepositoryServicePath(pathname) {
   return /\/aiserver\.v1\.RepositoryService\//i.test(String(pathname || ''));
 }
 
+const EMPTY_LOCAL_CONTROL_PLANE_SUFFIXES = new Set([
+  'AiService/AvailableDocs',
+  'AiService/CppEditHistoryStatus',
+  'AiService/KnowledgeBaseList',
+  'AiService/ReportProcessMetricsV2',
+  'AiService/UpdateVscodeProfile',
+  'AnalyticsService/SubmitLogs',
+  'AnalyticsService/BootstrapStatsig',
+  'CppService/AvailableModels',
+  'DashboardService/GetEffectiveUserPlugins',
+  'DashboardService/GetGlobalCommands',
+  'DashboardService/GetManagedSkills',
+  'DashboardService/GetMe',
+  'DashboardService/GetP2PReferralStatus',
+  'DashboardService/GetSlackInstallUrl',
+  'DashboardService/GetTeamAdminSettingsOrEmptyIfNotInTeam',
+  'DashboardService/GetTeamCommands',
+  'DashboardService/GetTeamReposOrEmptyIfNotInTeam',
+  'DashboardService/GetUsageLimitStatusAndActiveGrants',
+  'DashboardService/IsOnNewPricing',
+  'DashboardService/ListMarketplacePlugins',
+  'DashboardService/ListMarketplaces',
+  'DashboardService/RegisterMarketplaceAndPlugins',
+  'MCPRegistryService/GetKnownServers',
+  'NetworkService/IsConnected',
+  'RepositoryService/FastRepoInitHandshakeV2',
+]);
+
 function localControlPlaneResponseSpec(pathname, config = {}) {
   const fallbackModelName = String(config.upstream?.modelName || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
   const routeModels = getConfiguredModelRoutes(config)
@@ -2811,7 +2884,7 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
     ...primaryAvailableModels,
     ...routeModels,
   ].filter(Boolean)));
-  const modelName = availableModelNames[0] || fallbackModelName;
+  const modelName = getActiveRelayProfileModelName(availableModelNames, fallbackModelName);
   const now = Date.now();
   const cycleEnd = now + (30 * 24 * 60 * 60 * 1000);
   const modelConfig = {
@@ -2822,10 +2895,24 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
   const models = availableModelNames.map((name, index) => {
     const upstreamForModel = resolveUpstreamForModel(config, name);
     const displayName = String(upstreamForModel?.displayName || name).trim() || name;
+    const providerId = String(upstreamForModel?.providerId || '').trim();
     const contextLimit = clampRelayContextWindowTokens(upstreamForModel?.contextWindow || config.upstream?.contextWindow);
+    const endpointMode = String(upstreamForModel?.endpointMode || '').trim();
+    const reasoningEffort = String(upstreamForModel?.reasoningEffort || '').trim();
+    const tooltipParts = [
+      `**${displayName}**`,
+      `Model: ${name}`,
+      contextLimit ? `${contextLimit} context window` : '',
+      providerId ? `Provider: ${providerId}` : '',
+      endpointMode ? `Mode: ${endpointMode}` : '',
+      reasoningEffort ? `Reasoning: ${reasoningEffort}` : '',
+    ].filter(Boolean);
     return {
       name,
-      defaultOn: index === 0,
+      defaultOn: true,
+      visibleInRoutedModelView: true,
+      namedModelSectionIndex: 99,
+      tagline: 'Local provider model',
       supportsAgent: true,
       supportsThinking: true,
       supportsImages: true,
@@ -2837,10 +2924,22 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
       contextTokenLimit: contextLimit,
       clientDisplayName: displayName,
       serverModelName: name,
+      tooltipData: {
+        markdownContent: tooltipParts.join('<br /><br />'),
+      },
       supportsPlanMode: true,
       supportsSandboxing: true,
       inputboxShortModelName: displayName.slice(0, 20) || name,
       supportsCmdK: true,
+      parameterDefinitions: buildRelayModelParameterDefinitions(),
+      variants: buildRelayModelVariants(
+        displayName,
+        displayName.slice(0, 20) || name,
+        reasoningEffort || 'medium',
+      ),
+      legacySlugs: [],
+      idAliases: [],
+      cloudAgentEffortModes: ['low', 'medium', 'high', 'extra-high'],
       degradationStatus: 0,
       isUserAdded: true,
     };
@@ -2861,7 +2960,7 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
           specModelConfig: modelConfig,
           deepSearchModelConfig: modelConfig,
           quickAgentModelConfig: modelConfig,
-          useModelParameters: false,
+          useModelParameters: true,
         },
       };
     case 'AiService/GetDefaultModel':
@@ -2961,7 +3060,7 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
     case 'OnlineMetricsService/ReportAgentSnapshot':
       return { typeName: 'aiserver.v1.ReportAgentSnapshotResponse', value: {} };
     default:
-      if (/DashboardService\/GetEffectiveUserPlugins$/i.test(suffix)) {
+      if (EMPTY_LOCAL_CONTROL_PLANE_SUFFIXES.has(suffix)) {
         return { typeName: '', value: {} };
       }
       return null;
@@ -2969,18 +3068,129 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
 }
 
 function resolveRequestedUpstreamModel(config = {}, options = {}) {
-  const fallbackModel = String(config.upstream?.modelName || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+  const startupFallbackModel = String(config.upstream?.modelName || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
   const routeModels = getConfiguredModelRoutes(config).map((item) => String(item.modelName || '').trim()).filter(Boolean);
   const availableModels = routeModels.length
     ? routeModels
     : Array.isArray(config.upstream?.availableModels) && config.upstream.availableModels.length
       ? config.upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
-    : [fallbackModel];
+    : [startupFallbackModel];
+  const fallbackModel = getActiveRelayProfileModelName(availableModels, startupFallbackModel);
   const requested = String(options.requestedModel || '').trim();
   if (!requested) return fallbackModel;
   if (requested === 'default' || requested === 'auto') return fallbackModel;
   if (availableModels.includes(requested)) return requested;
   return fallbackModel;
+}
+
+function buildRelayModelParameterDefinitions() {
+  return [
+    {
+      id: 'thinking',
+      name: 'thinking',
+      markdownTooltip: 'Enable thinking mode for this local relay model.',
+      parameterType: {
+        booleanParameter: {},
+      },
+    },
+    {
+      id: 'reasoning',
+      name: 'reasoning',
+      markdownTooltip: 'Reasoning effort level.',
+      parameterType: {
+        enumParameter: {
+          values: [
+            { value: 'low', displayName: 'Low' },
+            { value: 'medium', displayName: 'Medium' },
+            { value: 'high', displayName: 'High' },
+            { value: 'extra-high', displayName: 'XHigh' },
+          ],
+        },
+      },
+    },
+  ];
+}
+
+function buildRelayModelVariants(displayName, shortName, rawReasoningEffort = 'medium') {
+  const normalizedEffort = (() => {
+    const effort = String(rawReasoningEffort || 'medium').trim().toLowerCase();
+    if (!effort) return 'medium';
+    if (effort === 'xhigh') return 'extra-high';
+    return effort;
+  })();
+  const badgeLabel = normalizedEffort === 'extra-high'
+    ? 'XHigh'
+    : `${normalizedEffort.charAt(0).toUpperCase()}${normalizedEffort.slice(1)}`;
+  const outsidePicker = `${shortName} ${badgeLabel}`.trim();
+  return [
+    {
+      parameterValues: [
+        { id: 'thinking', value: 'true' },
+        { id: 'reasoning', value: normalizedEffort },
+      ],
+      displayName: `${displayName} ${badgeLabel}`.trim(),
+      displayNameOutsidePicker: outsidePicker,
+      variantStringRepresentation: `${displayName.toLowerCase().replace(/\s+/g, '-')}-thinking-${normalizedEffort}`,
+      isMaxMode: false,
+      isDefaultNonMaxConfig: true,
+      isDefaultMaxConfig: false,
+      tooltipData: {
+        markdownContent: `Thinking enabled<br /><br />Reasoning: ${badgeLabel}`,
+      },
+    },
+  ];
+}
+
+function getActiveRelayProfileModelName(availableModels = [], fallbackModel = '') {
+  const normalizedAvailableModels = Array.isArray(availableModels)
+    ? availableModels.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  try {
+    const store = loadRelayProfileStore('');
+    const activeProfile = Array.isArray(store?.configs)
+      ? store.configs.find((item) => String(item?.id || '') === String(store?.activeId || ''))
+      : null;
+    const activeModelName = String(activeProfile?.modelName || '').trim();
+    if (activeModelName && normalizedAvailableModels.includes(activeModelName)) return activeModelName;
+  } catch {
+    /* ignore */
+  }
+  return String(fallbackModel || normalizedAvailableModels[0] || '').trim();
+}
+
+async function syncRequestedModelSelection(requestedModel, logger = null) {
+  const modelName = String(requestedModel || '').trim();
+  if (!modelName || modelName === 'default' || modelName === 'auto') return null;
+
+  const store = loadRelayProfileStore('');
+  const targetProfile = Array.isArray(store?.configs)
+    ? store.configs.find((item) => String(item?.modelName || '').trim() === modelName)
+    : null;
+  if (!targetProfile?.id) return null;
+  if (String(store.activeId || '') === String(targetProfile.id)) {
+    return { ok: true, changed: false, profileId: targetProfile.id, modelName };
+  }
+
+  store.activeId = String(targetProfile.id);
+  saveRelayProfileStore(store, '');
+  try {
+    const { syncCursorRelayModelCatalog } = require('./cursor-model-proxy');
+    await syncCursorRelayModelCatalog({
+      modelName,
+      availableModels: Array.isArray(store.configs)
+        ? store.configs.map((item) => String(item?.modelName || '').trim()).filter(Boolean)
+        : [modelName],
+    });
+  } catch {
+    /* ignore */
+  }
+  logger?.info?.(`relay sync active profile switched profileId=${targetProfile.id} model=${modelName}`);
+  return {
+    ok: true,
+    changed: true,
+    profileId: targetProfile.id,
+    modelName,
+  };
 }
 
 async function handleLocalControlPlaneRequest(req, pathname, res, config, logger, stats) {
@@ -3115,13 +3325,24 @@ function writeConnectError(socket, message, statusCode = 502) {
   }
 }
 
-async function proxyHttpAbsoluteRequest(req, res, logger) {
+async function proxyHttpAbsoluteRequest(req, res, logger, config = {}, stats = {}) {
   let target;
   try {
     target = new URL(req.url);
   } catch (error) {
     res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: false, message: error.message || String(error) }));
+    return;
+  }
+
+  const pathname = String(target.pathname || '').split('?')[0];
+  const method = String(req.method || 'GET').toUpperCase();
+
+  if (isLocalRelayMode(config) && method === 'POST' && await handleLocalControlPlaneRequest(req, pathname, res, config, logger, stats)) {
+    return;
+  }
+
+  if (await authIntercept.handleAuthIntercept(req, res, pathname, config, logger)) {
     return;
   }
 
@@ -8064,6 +8285,11 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
   const configuredModel = resolveRequestedUpstreamModel(config, {
     requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
   });
+  try {
+    await syncRequestedModelSelection(configuredModel, logger);
+  } catch (error) {
+    logger?.warn?.(`relay sync switch failed model=${configuredModel}: ${error.message}`);
+  }
   const activeUpstream = resolveUpstreamForModel(config, configuredModel);
   const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
     ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
@@ -8349,6 +8575,11 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     const configuredModel = resolveRequestedUpstreamModel(config, {
       requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
     });
+    try {
+      await syncRequestedModelSelection(configuredModel, logger);
+    } catch (error) {
+      logger?.warn?.(`relay sync switch failed model=${configuredModel}: ${error.message}`);
+    }
     const activeUpstream = resolveUpstreamForModel(config, configuredModel);
     const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
       ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
@@ -9203,6 +9434,11 @@ async function handleCursorChat(req, res, config, logger, stats) {
   const decoded = decodeCursorChatRequest(rawBody);
   const lastMessage = decoded.messages?.[decoded.messages.length - 1];
   const requestedModel = resolveRequestedUpstreamModel(config, { requestedModel: decoded.model || '' });
+  try {
+    await syncRequestedModelSelection(requestedModel, logger);
+  } catch (error) {
+    logger.warn(`relay sync switch failed model=${requestedModel}: ${error.message}`);
+  }
   const routedUpstream = resolveUpstreamForModel(config, requestedModel);
 
   stats.chatTotal = (stats.chatTotal || 0) + 1;
@@ -9404,7 +9640,10 @@ function buildFakeModelListResponse(pathname, localModels) {
         // 缺少 supportsAgent → 模型不出现在 Agent 下拉框
         models: localModels.map((m) => ({
           name: m.modelName,                                    // #1
-          defaultOn: false,                                      // #2
+          defaultOn: true,
+          visibleInRoutedModelView: true,
+          namedModelSectionIndex: 99,
+          tagline: 'Local provider model',
           supportsAgent: true,                                   // #5 ← **关键！**
           supportsThinking: true,                                // #9
           supportsImages: true,                                  // #10
@@ -9417,11 +9656,21 @@ function buildFakeModelListResponse(pathname, localModels) {
           supportsPlanMode: true,                                // #22
           supportsSandboxing: true,                              // #25
           supportsCmdK: true,                                    // #26 支持 Cmd+K
+          parameterDefinitions: buildRelayModelParameterDefinitions(),
+          variants: buildRelayModelVariants(
+            m.displayName || m.modelName,
+            m.displayNameShort || m.displayName || m.modelName,
+            m.reasoningEffort || 'medium',
+          ),
+          legacySlugs: [],
+          idAliases: [],
+          cloudAgentEffortModes: ['low', 'medium', 'high', 'extra-high'],
           clientDisplayName: m.displayName || m.modelName,       // #17
           serverModelName: m.modelName,                          // #18
           inputboxShortModelName: m.displayNameShort || m.displayName || m.modelName, // #24
           degradationStatus: 0,                                  // #6 UNSPECIFIED
         })),
+        useModelParameters: true,
       });
       return payload;
     }
@@ -9968,6 +10217,31 @@ function startProxy(config) {
   }
 
   const proxyServer = http.createServer(async (req, res) => {
+    if (isLocalProviderModelsPath(req.url || '') && ['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || 'GET').toUpperCase())) {
+      const method = String(req.method || 'GET').toUpperCase();
+      const models = collectRelayProviderModels(config);
+      const body = JSON.stringify({ object: 'list', data: models });
+      const headers = {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+      };
+      if (method === 'OPTIONS') {
+        res.writeHead(204, headers);
+        res.end();
+        return;
+      }
+      res.writeHead(200, headers);
+      if (method === 'HEAD') {
+        res.end();
+        return;
+      }
+      res.end(body);
+      return;
+    }
+
     if (req.url === HEALTH_PATH) {
       let runnerStat = null;
       try {
@@ -10044,7 +10318,7 @@ function startProxy(config) {
     }
 
     if (/^https?:\/\//i.test(String(req.url || ''))) {
-      proxyHttpAbsoluteRequest(req, res, logger).catch((error) => {
+      proxyHttpAbsoluteRequest(req, res, logger, config, stats).catch((error) => {
         logger.error(`absolute proxy request failed: ${error.stack || error.message}`);
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });

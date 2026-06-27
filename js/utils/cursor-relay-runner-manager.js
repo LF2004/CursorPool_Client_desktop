@@ -4,7 +4,7 @@ const http = require('http');
 const { execFileSync } = require('child_process');
 const { fork } = require('child_process');
 const { ensureRelayCertificates, getRelayDataDir } = require('./cursor-relay-cert');
-const { initRunnerLogs, getRunnerLogPaths, readRunnerLogTail } = require('./cursor-relay-log');
+const { initRunnerLogs, getRunnerLogPaths, readRunnerLogTail, appendRunnerLog } = require('./cursor-relay-log');
 const { DEFAULT_DIRECT_MITM_PORT } = require('./cursor-relay-transparent');
 const { normalizeBaseUrl } = require('./cursor-model-proxy');
 const { resolveRelayOutboundProxy } = require('./cursor-relay-system-proxy');
@@ -460,6 +460,65 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   return true;
 }
 
+function getRunnerReuseMismatchReason(healthPayload, upstream, options = {}) {
+  if (!healthPayload) return 'health missing';
+  if (!upstream) return 'upstream missing';
+  const fingerprint = getRunnerScriptFingerprint();
+  if (String(healthPayload.runnerScriptPath || '').toLowerCase() !== String(fingerprint.path || '').toLowerCase()) {
+    return 'runnerScriptPath';
+  }
+  if (String(healthPayload.runnerScriptMtime || '') !== fingerprint.mtime) return 'runnerScriptMtime';
+  if (Number(healthPayload.runnerScriptSize) !== Number(fingerprint.size)) return 'runnerScriptSize';
+  if (String(healthPayload.mode || '') !== String(options.mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return 'mode';
+  if (!outboundProxyMatches(healthPayload.outboundProxy || null, options.outboundProxy || null)) return 'outboundProxy';
+  const baseUrl = String(upstream.baseUrl || '').trim().replace(/\/+$/, '');
+  const modelName = String(upstream.modelName || '').trim();
+  if (String(healthPayload.upstreamBaseUrl || '').trim().replace(/\/+$/, '') !== baseUrl) return 'upstreamBaseUrl';
+  if (String(healthPayload.upstreamModelName || '').trim() !== modelName) return 'upstreamModelName';
+  const currentAvailableModels = Array.isArray(healthPayload.upstreamAvailableModels)
+    ? healthPayload.upstreamAvailableModels.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const wantedAvailableModels = Array.isArray(upstream.availableModels)
+    ? upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (currentAvailableModels.join('\n') !== wantedAvailableModels.join('\n')) return 'upstreamAvailableModels';
+  const currentModelRoutes = Array.isArray(healthPayload.modelRoutes)
+    ? healthPayload.modelRoutes.map((item) => JSON.stringify(item)).filter(Boolean)
+    : [];
+  const wantedModelRoutes = Array.isArray(options.modelRoutes)
+    ? options.modelRoutes.map((item) => JSON.stringify(item)).filter(Boolean)
+    : [];
+  if (currentModelRoutes.join('\n') !== wantedModelRoutes.join('\n')) return 'modelRoutes';
+  if (String(healthPayload.upstreamEndpointMode || 'responses') !== String(upstream.endpointMode || 'responses')) {
+    return 'upstreamEndpointMode';
+  }
+  const wantLocalNative = options.localNativeAgentTools !== false;
+  const wantStructured = options.structuredAgentToolCalls !== false;
+  const wantNativeMutation = options.nativeMutationTools !== false;
+  const wantNativeMutationApplyMode = String(options.nativeMutationApplyMode || 'cursor');
+  const wantKvBootstrap = options.emitAgentKvBootstrap === true;
+  const wantLocalMutationCheckpoints = options.emitLocalMutationCheckpoints === true;
+  const wantLocalToolInteractionFrames = options.emitLocalToolInteractionFrames === true;
+  const wantLocalStepFrames = options.emitLocalStepFrames === true;
+  const wantSyntheticFrames = false;
+  const wantExecServerFrames = options.emitAgentExecServerFrames === true;
+  const wantMaxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(options.maxLocalToolCallsPerRound) || 12)));
+  const wantReviewBridge = options.enableReviewBridge === true;
+  if (Boolean(healthPayload.localNativeAgentTools) !== wantLocalNative) return 'localNativeAgentTools';
+  if (Boolean(healthPayload.structuredAgentToolCalls) !== wantStructured) return 'structuredAgentToolCalls';
+  if (Boolean(healthPayload.nativeMutationTools ?? true) !== wantNativeMutation) return 'nativeMutationTools';
+  if (String(healthPayload.nativeMutationApplyMode || 'cursor') !== wantNativeMutationApplyMode) return 'nativeMutationApplyMode';
+  if (Boolean(healthPayload.emitAgentKvBootstrap) !== wantKvBootstrap) return 'emitAgentKvBootstrap';
+  if (Boolean(healthPayload.emitLocalMutationCheckpoints) !== wantLocalMutationCheckpoints) return 'emitLocalMutationCheckpoints';
+  if (Boolean(healthPayload.emitLocalToolInteractionFrames) !== wantLocalToolInteractionFrames) return 'emitLocalToolInteractionFrames';
+  if (Boolean(healthPayload.emitLocalStepFrames) !== wantLocalStepFrames) return 'emitLocalStepFrames';
+  if (Boolean(healthPayload.emitSyntheticLocalNativeToolFrames) !== wantSyntheticFrames) return 'emitSyntheticLocalNativeToolFrames';
+  if (Boolean(healthPayload.emitAgentExecServerFrames) !== wantExecServerFrames) return 'emitAgentExecServerFrames';
+  if (Math.max(1, Math.floor(Number(healthPayload.maxLocalToolCallsPerRound) || 0)) !== wantMaxLocalToolCallsPerRound) return 'maxLocalToolCallsPerRound';
+  if (Boolean(healthPayload.enableReviewBridge) !== wantReviewBridge) return 'enableReviewBridge';
+  return '';
+}
+
 function buildRunnerStartResult({
   port,
   written,
@@ -757,6 +816,15 @@ async function startLocalRelayRunner(payload = {}) {
   };
 
   const existingHealth = await probeRunnerHealth(port, 250);
+  if (!forceRestartRunner && existingHealth.ok) {
+    const mismatchReason = getRunnerReuseMismatchReason(existingHealth.payload, upstream, reuseOptions);
+    appendRunnerLog(
+      mismatchReason
+        ? `[info] runner reuse miss reason=${mismatchReason} requestedModel=${String(upstream.modelName || '')} currentModel=${String(existingHealth.payload?.upstreamModelName || '')}`
+        : `[info] runner reuse hit requestedModel=${String(upstream.modelName || '')} pid=${Number(existingHealth.payload?.pid) || 0}`,
+      customRoot,
+    );
+  }
   if (
     !forceRestartRunner
     && existingHealth.ok
@@ -803,6 +871,10 @@ async function startLocalRelayRunner(payload = {}) {
   }
 
   await stopLocalRelayRunner({ port });
+  appendRunnerLog(
+    `[info] runner restart requested requestedModel=${String(upstream.modelName || '')} forceRestart=${forceRestartRunner ? '1' : '0'} mode=${mode}`,
+    customRoot,
+  );
 
   const logPaths = initRunnerLogs(customRoot);
   const directMitmPort = Number(payload.directMitmPort) || 0;

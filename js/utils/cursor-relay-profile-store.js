@@ -6,10 +6,83 @@ const DB_FILE_NAME = 'model.db';
 
 let Database = null;
 let dbCache = new Map();
+let dbMode = '';
+
+function createStatementAdapter(statement, mode) {
+  if (mode === 'better-sqlite3') return statement;
+  return {
+    all(...params) {
+      return statement.all(...params);
+    },
+    pluck() {
+      return {
+        get: (...params) => {
+          const row = statement.get(...params);
+          if (row == null) return undefined;
+          if (Array.isArray(row)) return row[0];
+          if (typeof row === 'object') {
+            const firstKey = Object.keys(row)[0];
+            return firstKey ? row[firstKey] : undefined;
+          }
+          return row;
+        },
+      };
+    },
+    run(...params) {
+      const result = statement.run(...params);
+      return {
+        changes: Number(result?.changes || 0),
+        lastInsertRowid: result?.lastInsertRowid,
+      };
+    },
+  };
+}
+
+function createDbAdapter(rawDb, mode) {
+  return {
+    pragma(sql) {
+      if (mode === 'better-sqlite3') return rawDb.pragma(sql);
+      return rawDb.exec(`PRAGMA ${sql}`);
+    },
+    exec(sql) {
+      return rawDb.exec(sql);
+    },
+    prepare(sql) {
+      return createStatementAdapter(rawDb.prepare(sql), mode);
+    },
+    transaction(fn) {
+      if (mode === 'better-sqlite3') return rawDb.transaction(fn);
+      return (...args) => {
+        rawDb.exec('BEGIN IMMEDIATE');
+        try {
+          const result = fn(...args);
+          rawDb.exec('COMMIT');
+          return result;
+        } catch (error) {
+          try {
+            rawDb.exec('ROLLBACK');
+          } catch {
+            /* ignore */
+          }
+          throw error;
+        }
+      };
+    },
+    close() {
+      return rawDb.close();
+    },
+  };
+}
 
 function loadDatabaseCtor() {
   if (Database) return Database;
-  Database = require('better-sqlite3');
+  try {
+    Database = require('better-sqlite3');
+    dbMode = 'better-sqlite3';
+  } catch {
+    Database = require('node:sqlite').DatabaseSync;
+    dbMode = 'node:sqlite';
+  }
   return Database;
 }
 
@@ -24,7 +97,19 @@ function openProfileDb(customRoot = '') {
   const cached = dbCache.get(dbPath);
   if (cached) return cached;
   const DatabaseCtor = loadDatabaseCtor();
-  const db = new DatabaseCtor(dbPath);
+  let rawDb;
+  try {
+    rawDb = new DatabaseCtor(dbPath);
+  } catch (error) {
+    const message = String(error?.message || '');
+    if (dbMode !== 'better-sqlite3' || !/NODE_MODULE_VERSION|better_sqlite3\.node|ERR_DLOPEN_FAILED/i.test(message)) {
+      throw error;
+    }
+    Database = require('node:sqlite').DatabaseSync;
+    dbMode = 'node:sqlite';
+    rawDb = new Database(dbPath);
+  }
+  const db = createDbAdapter(rawDb, dbMode);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.exec(`

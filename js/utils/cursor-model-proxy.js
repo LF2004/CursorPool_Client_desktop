@@ -3,13 +3,107 @@
  * 写入 state.vscdb：applicationUser.useOpenAIKey / openAIBaseUrl + cursorAuth/openAIKey
  */
 
-const Database = require('better-sqlite3');
 const fs = require('fs');
 const { getStateVscdbPath } = require('./cursor-local-state');
 const { reloadRunningCursorWindow, isCursorRunningHeuristic, quitCursorAndWait, launchCursorApp } = require('./cursor-process');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let CachedDatabaseCtor = null;
+let cachedDbMode = '';
+
+function createStatementAdapter(statement, mode) {
+  if (mode === 'better-sqlite3') return statement;
+  return {
+    all(...params) {
+      return statement.all(...params);
+    },
+    get(...params) {
+      return statement.get(...params);
+    },
+    run(...params) {
+      const result = statement.run(...params);
+      return {
+        changes: Number(result?.changes || 0),
+        lastInsertRowid: result?.lastInsertRowid,
+      };
+    },
+    pluck() {
+      return {
+        get: (...params) => {
+          const row = statement.get(...params);
+          if (row == null) return undefined;
+          if (Array.isArray(row)) return row[0];
+          if (typeof row === 'object') {
+            const firstKey = Object.keys(row)[0];
+            return firstKey ? row[firstKey] : undefined;
+          }
+          return row;
+        },
+      };
+    },
+  };
+}
+
+function createDbAdapter(rawDb, mode) {
+  return {
+    prepare(sql) {
+      return createStatementAdapter(rawDb.prepare(sql), mode);
+    },
+    pragma(sql) {
+      if (mode === 'better-sqlite3') return rawDb.pragma(sql);
+      return rawDb.exec(`PRAGMA ${sql}`);
+    },
+    exec(sql) {
+      return rawDb.exec(sql);
+    },
+    transaction(fn) {
+      if (mode === 'better-sqlite3') return rawDb.transaction(fn);
+      return (...args) => {
+        rawDb.exec('BEGIN IMMEDIATE');
+        try {
+          const result = fn(...args);
+          rawDb.exec('COMMIT');
+          return result;
+        } catch (error) {
+          try {
+            rawDb.exec('ROLLBACK');
+          } catch {
+            /* ignore */
+          }
+          throw error;
+        }
+      };
+    },
+    close() {
+      return rawDb.close();
+    },
+  };
+}
+
+function loadDatabaseCtor() {
+  if (CachedDatabaseCtor) {
+    return { DatabaseCtor: CachedDatabaseCtor, mode: cachedDbMode };
+  }
+  try {
+    // Prefer the existing native module when its ABI matches.
+    CachedDatabaseCtor = require('better-sqlite3');
+    cachedDbMode = 'better-sqlite3';
+    return { DatabaseCtor: CachedDatabaseCtor, mode: cachedDbMode };
+  } catch {
+    const sqlite = require('node:sqlite');
+    CachedDatabaseCtor = sqlite.DatabaseSync;
+    cachedDbMode = 'node:sqlite';
+    return { DatabaseCtor: CachedDatabaseCtor, mode: cachedDbMode };
+  }
+}
+
+function forceNodeSqliteCtor() {
+  const sqlite = require('node:sqlite');
+  CachedDatabaseCtor = sqlite.DatabaseSync;
+  cachedDbMode = 'node:sqlite';
+  return { DatabaseCtor: CachedDatabaseCtor, mode: cachedDbMode };
+}
 
 /** Cursor 实际读取的 applicationUser（与短键 applicationUser 并存，必须同步写入） */
 const REACTIVE_APP_USER_KEY =
@@ -84,7 +178,19 @@ async function openDbWithRetry(dbPath, tries = 25, delayMs = 400) {
   let lastErr;
   for (let i = 0; i < tries; i += 1) {
     try {
-      const db = new Database(dbPath);
+      let { DatabaseCtor, mode } = loadDatabaseCtor();
+      let rawDb;
+      try {
+        rawDb = new DatabaseCtor(dbPath);
+      } catch (openError) {
+        const msg = String(openError?.message || '');
+        const shouldFallbackToNodeSqlite = mode === 'better-sqlite3'
+          && /NODE_MODULE_VERSION|better_sqlite3\.node|ERR_DLOPEN_FAILED/i.test(msg);
+        if (!shouldFallbackToNodeSqlite) throw openError;
+        ({ DatabaseCtor, mode } = forceNodeSqliteCtor());
+        rawDb = new DatabaseCtor(dbPath);
+      }
+      const db = createDbAdapter(rawDb, mode);
       try {
         db.pragma('journal_mode = WAL');
       } catch {
@@ -656,12 +762,114 @@ function uniqueModelNames(modelNames = [], primaryModel = '') {
   return items;
 }
 
+function normalizeRelayReasoningEffort(rawReasoningEffort = 'extra-high') {
+  const effort = String(rawReasoningEffort || 'extra-high').trim().toLowerCase();
+  if (!effort) return 'extra-high';
+  if (effort === 'xhigh') return 'extra-high';
+  return effort;
+}
+
+function getRelayReasoningBadgeLabel(rawReasoningEffort = 'extra-high') {
+  const effort = normalizeRelayReasoningEffort(rawReasoningEffort);
+  return effort === 'extra-high'
+    ? 'XHigh'
+    : `${effort.charAt(0).toUpperCase()}${effort.slice(1)}`;
+}
+
+function buildRelayModelParameterDefinitions() {
+  return [
+    {
+      id: 'thinking',
+      name: 'thinking',
+      markdownTooltip: 'Enable thinking mode for this local relay model.',
+      parameterType: {
+        booleanParameter: {},
+      },
+    },
+    {
+      id: 'reasoning',
+      name: 'reasoning',
+      markdownTooltip: 'Reasoning effort level.',
+      parameterType: {
+        enumParameter: {
+          values: [
+            { value: 'low', displayName: 'Low' },
+            { value: 'medium', displayName: 'Medium' },
+            { value: 'high', displayName: 'High' },
+            { value: 'extra-high', displayName: 'XHigh' },
+          ],
+        },
+      },
+    },
+  ];
+}
+
+function buildRelayModelVariants(modelName, shortName, rawReasoningEffort = 'extra-high') {
+  const normalizedEffort = normalizeRelayReasoningEffort(rawReasoningEffort);
+  const badgeLabel = getRelayReasoningBadgeLabel(normalizedEffort);
+  return [
+    {
+      parameterValues: [
+        { id: 'thinking', value: 'true' },
+        { id: 'reasoning', value: normalizedEffort },
+      ],
+      displayName: `${modelName} ${badgeLabel}`.trim(),
+      displayNameOutsidePicker: `${shortName} ${badgeLabel}`.trim(),
+      variantStringRepresentation: `${String(modelName || '').toLowerCase().replace(/\s+/g, '-')}-thinking-${normalizedEffort}`,
+      isMaxMode: false,
+      isDefaultMaxConfig: false,
+      isDefaultNonMaxConfig: true,
+      tooltipData: {
+        markdownContent: `Thinking enabled<br /><br />Reasoning: ${badgeLabel}`,
+      },
+      tagline: 'Reasoning enabled',
+    },
+  ];
+}
+
+function buildRelaySelectedModel(modelName, rawReasoningEffort = 'extra-high') {
+  const normalizedEffort = normalizeRelayReasoningEffort(rawReasoningEffort);
+  return {
+    modelId: modelName,
+    parameters: [
+      { id: 'thinking', value: 'true' },
+      { id: 'reasoning', value: normalizedEffort },
+    ],
+  };
+}
+
+function mergeUniqueStrings(...groups) {
+  const seen = new Set();
+  const merged = [];
+  for (const group of groups) {
+    for (const item of Array.isArray(group) ? group : []) {
+      const value = String(item || '').trim();
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      merged.push(value);
+    }
+  }
+  return merged;
+}
+
 function buildRelayModelEntry(name, primaryModel) {
   const modelName = String(name || '').trim();
-  const isPrimary = modelName === String(primaryModel || '').trim();
+  const shortName = modelName;
+  const reasoningLabel = getRelayReasoningBadgeLabel('extra-high');
+  const tooltipParts = [
+    `**${modelName}**`,
+    `Model: ${modelName}`,
+    'Local provider model',
+    '200000 context window',
+    'Thinking: enabled',
+    `Reasoning: ${reasoningLabel}`,
+  ];
   return {
     name: modelName,
-    defaultOn: isPrimary,
+    defaultOn: true,
+    visibleInRoutedModelView: true,
+    namedModelSectionIndex: 99,
+    tagline: 'Local provider model',
     parameterDefinitions: [],
     variants: [],
     legacySlugs: [],
@@ -679,36 +887,52 @@ function buildRelayModelEntry(name, primaryModel) {
     serverModelName: modelName,
     supportsNonMaxMode: true,
     supportsPlanMode: true,
-    inputboxShortModelName: modelName,
+    inputboxShortModelName: shortName,
     supportsSandboxing: true,
     supportsCmdK: true,
+    parameterDefinitions: buildRelayModelParameterDefinitions(),
+    variants: buildRelayModelVariants(modelName, shortName, 'extra-high'),
+    cloudAgentEffortModes: ['low', 'medium', 'high', 'extra-high'],
+    tooltipData: {
+      markdownContent: tooltipParts.join('<br /><br />'),
+    },
+    degradationStatus: 0,
+    isUserAdded: true,
   };
 }
 
-function buildFeatureModelConfig(defaultModel, models) {
+function buildFeatureModelConfig(defaultModel, models, previousConfig = null) {
+  const previous = previousConfig && typeof previousConfig === 'object' ? previousConfig : {};
   return {
     defaultModel,
-    fallbackModels: [...models],
-    bestOfNDefaultModels: [...models],
+    fallbackModels: mergeUniqueStrings(models, previous.fallbackModels),
+    bestOfNDefaultModels: mergeUniqueStrings(models, previous.bestOfNDefaultModels),
   };
 }
 
-function updateModelConfigEntry(entry, defaultModel) {
+function updateModelConfigEntry(entry, defaultModel, rawReasoningEffort = 'extra-high') {
   const next = entry && typeof entry === 'object' ? { ...entry } : {};
   const currentModel = String(next.modelName || '').trim().toLowerCase();
   if (!currentModel || currentModel === 'default') {
     next.modelName = defaultModel;
   }
+  const effectiveModel = String(next.modelName || defaultModel || '').trim() || defaultModel;
   if (Array.isArray(next.selectedModels)) {
     next.selectedModels = next.selectedModels.map((item, index) => {
       if (!item || typeof item !== 'object') return item;
       const nextItem = { ...item };
       const itemModel = String(nextItem.modelId || '').trim().toLowerCase();
       if (index === 0 && (!itemModel || itemModel === 'default')) {
-        nextItem.modelId = defaultModel;
+        nextItem.modelId = effectiveModel;
+        nextItem.parameters = buildRelaySelectedModel(effectiveModel, rawReasoningEffort).parameters;
+      }
+      if (String(nextItem.modelId || '').trim() === effectiveModel && !Array.isArray(nextItem.parameters)) {
+        nextItem.parameters = buildRelaySelectedModel(effectiveModel, rawReasoningEffort).parameters;
       }
       return nextItem;
     });
+  } else if (effectiveModel) {
+    next.selectedModels = [buildRelaySelectedModel(effectiveModel, rawReasoningEffort)];
   }
   return next;
 }
@@ -718,20 +942,44 @@ function applyRelayModelCatalog(appUser, { primaryModel, availableModels }) {
   if (!models.length) return appUser;
 
   const next = appUser && typeof appUser === 'object' ? { ...appUser } : {};
-  next.availableDefaultModels2 = models.map((name) => buildRelayModelEntry(name, primaryModel));
+  const localModelSet = new Set(models);
+  const existingCatalog = Array.isArray(next.availableDefaultModels2) ? next.availableDefaultModels2 : [];
+  const mergedCatalog = [];
+  const seenCatalogNames = new Set();
+  for (const item of existingCatalog) {
+    const modelName = String(item?.name || '').trim();
+    if (!modelName || seenCatalogNames.has(modelName)) continue;
+    seenCatalogNames.add(modelName);
+    if (localModelSet.has(modelName)) {
+      mergedCatalog.push({
+        ...(item && typeof item === 'object' ? item : {}),
+        ...buildRelayModelEntry(modelName, primaryModel),
+      });
+    } else {
+      mergedCatalog.push(item);
+    }
+  }
+  for (const modelName of models) {
+    if (seenCatalogNames.has(modelName)) continue;
+    seenCatalogNames.add(modelName);
+    mergedCatalog.push(buildRelayModelEntry(modelName, primaryModel));
+  }
+  next.availableDefaultModels2 = mergedCatalog;
+  next.localProviderModelIds = [...models];
+  next.useModelParameters = true;
 
   const prevFeatureConfigs = next.featureModelConfigs && typeof next.featureModelConfigs === 'object'
     ? next.featureModelConfigs
     : {};
   next.featureModelConfigs = {
     ...prevFeatureConfigs,
-    composer: buildFeatureModelConfig(primaryModel, models),
-    cmdK: buildFeatureModelConfig(primaryModel, models),
-    backgroundComposer: buildFeatureModelConfig(primaryModel, models),
-    planExecution: buildFeatureModelConfig(primaryModel, models),
-    spec: buildFeatureModelConfig(primaryModel, models),
-    deepSearch: buildFeatureModelConfig(primaryModel, models),
-    quickAgent: buildFeatureModelConfig(primaryModel, models),
+    composer: buildFeatureModelConfig(primaryModel, models, prevFeatureConfigs.composer),
+    cmdK: buildFeatureModelConfig(primaryModel, models, prevFeatureConfigs.cmdK),
+    backgroundComposer: buildFeatureModelConfig(primaryModel, models, prevFeatureConfigs.backgroundComposer),
+    planExecution: buildFeatureModelConfig(primaryModel, models, prevFeatureConfigs.planExecution),
+    spec: buildFeatureModelConfig(primaryModel, models, prevFeatureConfigs.spec),
+    deepSearch: buildFeatureModelConfig(primaryModel, models, prevFeatureConfigs.deepSearch),
+    quickAgent: buildFeatureModelConfig(primaryModel, models, prevFeatureConfigs.quickAgent),
     subagentModels: prevFeatureConfigs.subagentModels && typeof prevFeatureConfigs.subagentModels === 'object'
       ? prevFeatureConfigs.subagentModels
       : { explore: { defaultModel: 'default', fallbackModels: [], bestOfNDefaultModels: [] } },
@@ -741,9 +989,14 @@ function applyRelayModelCatalog(appUser, { primaryModel, availableModels }) {
   const prevModelConfig = prevAiSettings.modelConfig && typeof prevAiSettings.modelConfig === 'object'
     ? prevAiSettings.modelConfig
     : {};
+  const modelOverrideEnabled = mergeUniqueStrings(prevAiSettings.modelOverrideEnabled);
+  const modelOverrideDisabled = mergeUniqueStrings(prevAiSettings.modelOverrideDisabled)
+    .filter((name) => !localModelSet.has(name));
   next.aiSettings = {
     ...prevAiSettings,
-    modelsWithNoDefaultSwitch: [...models],
+    modelsWithNoDefaultSwitch: mergeUniqueStrings(models, prevAiSettings.modelsWithNoDefaultSwitch),
+    modelOverrideEnabled,
+    modelOverrideDisabled,
     modelConfig: {
       ...prevModelConfig,
       composer: updateModelConfigEntry(prevModelConfig.composer, primaryModel),
@@ -812,6 +1065,44 @@ async function syncCursorRelayModelCatalog(payload = {}) {
       dbPath,
       primaryModel,
       availableModels,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+async function syncCursorRelayProviderConfig(payload = {}) {
+  const rawBaseUrl = String(payload.baseUrl || '').trim();
+  const baseUrl = resolveBaseUrl(rawBaseUrl);
+  const apiKey = String(payload.apiKey || '').trim();
+  const enabled = payload.enabled !== false;
+  if (!enabled || !baseUrl || !apiKey) {
+    return { ok: false, skipped: true, reason: 'missing_provider_config' };
+  }
+
+  const dbPath = getStateVscdbPath();
+  if (!fs.existsSync(dbPath)) {
+    return { ok: false, skipped: true, reason: 'state_vscdb_missing' };
+  }
+
+  const db = await openDbWithRetry(dbPath, 6, 250);
+  try {
+    const tableName = detectItemTableName(db);
+    const tx = db.transaction(() => {
+      writeApplicationUserBoth(db, tableName, { enabled: true, baseUrl });
+      upsertItem(db, tableName, 'cursorAuth/openAIKey', apiKey);
+    });
+    tx();
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch {
+      /* ignore */
+    }
+    return {
+      ok: true,
+      dbPath,
+      baseUrl,
+      providerId: guessProviderId(baseUrl),
     };
   } finally {
     db.close();
@@ -1228,6 +1519,7 @@ module.exports = {
   disableModelProxy,
   testModelProxyConnection,
   syncCursorRelayModelCatalog,
+  syncCursorRelayProviderConfig,
   normalizeBaseUrl,
   resolveBaseUrl,
   maskApiKey,

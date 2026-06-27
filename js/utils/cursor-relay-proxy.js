@@ -20,6 +20,7 @@ const {
   readModelProxyConfig,
   clearModelProxyConfigOnly,
   syncCursorRelayModelCatalog,
+  syncCursorRelayProviderConfig,
 } = require('./cursor-model-proxy');
 const {
   loadRelayProfileStore,
@@ -34,7 +35,7 @@ const {
   getRunnerLogPaths,
   readRunnerLogTail,
 } = require('./cursor-relay-runner-manager');
-const { writeUtf8FileWithBom } = require('./cursor-relay-log');
+const { writeUtf8FileWithBom, appendRunnerLog } = require('./cursor-relay-log');
 const { ensureCursorAuthIfNeeded } = require('../../update_cursor_auth');
 // 新的账号缓存统一入口：defult_user.json ←→ state.vscdb
 const { ensureCursorAccount, readDefaultUserTemplate, parseTemplateToAccount } = require('./cursor-relay-account-store');
@@ -891,6 +892,19 @@ async function applyCursorRelayProxyConfig(payload = {}) {
         skipped: false,
         error: error?.message || String(error || 'sync model catalog failed'),
       }));
+      const providerBaseUrl = `http://127.0.0.1:${frontProxyPort}/v1`;
+      const providerApiKey = String(payload.localProviderApiKey || payload.openAIApiKey || 'cursor-relay-local').trim() || 'cursor-relay-local';
+      await syncCursorRelayProviderConfig({
+        enabled: true,
+        baseUrl: providerBaseUrl,
+        apiKey: providerApiKey,
+      }).catch((error) => {
+        modelCatalogSyncResult = {
+          ...(modelCatalogSyncResult && typeof modelCatalogSyncResult === 'object' ? modelCatalogSyncResult : {}),
+          providerSyncError: error?.message || String(error || 'sync provider config failed'),
+        };
+        return null;
+      });
     }
   } else {
     runner = await getLocalRelayRunnerStatus({ port: frontProxyPort });
@@ -1253,6 +1267,7 @@ async function quickSwitchRelayModel(payload = {}) {
     ? store.configs.find((item) => String(item?.id || '') === profileId)
     : null;
   if (!profile) throw new Error('未找到要切换的本地模型配置');
+  appendRunnerLog(`[info] quickSwitch request profileId=${profileId} model=${String(profile?.modelName || '')}`, '');
 
   const upstream = relayProfileToUpstream(profile);
   if (!upstream) throw new Error('目标模型配置不完整，请检查 Base URL、API Key 和模型名');
@@ -1260,12 +1275,48 @@ async function quickSwitchRelayModel(payload = {}) {
   store.activeId = profileId;
   saveRelayProfileStore(store, '');
 
+  await syncCursorRelayModelCatalog({
+    modelName: profile.modelName,
+    availableModels: Array.isArray(store.configs)
+      ? store.configs.map((item) => String(item?.modelName || '').trim()).filter(Boolean)
+      : [profile.modelName],
+  }).catch(() => null);
+
   const modelRoutes = buildRelayModelRoutesFromStore(store);
   const status = await readCursorRelayProxyConfig({ lightweight: true });
   const relayEnabled = Boolean(status?.enabled);
   const currentMode = String(status?.runner?.mode || '').trim();
   const switchingFromOfficialPassthrough = currentMode === 'official_passthrough';
+  const currentRunnerModelNames = new Set([
+    ...(
+      Array.isArray(status?.runner?.modelRoutes)
+        ? status.runner.modelRoutes.map((item) => String(item?.modelName || '').trim()).filter(Boolean)
+        : []
+    ),
+    String(status?.runner?.upstream?.modelName || '').trim(),
+    String(status?.runner?.upstreamModelName || '').trim(),
+  ].filter(Boolean));
+
+  if (
+    relayEnabled
+    && status?.runner?.running
+    && !switchingFromOfficialPassthrough
+    && (currentMode === 'local_relay' || !currentMode)
+    && currentRunnerModelNames.has(String(profile.modelName || '').trim())
+  ) {
+    appendRunnerLog(`[info] quickSwitch hot-switch profileId=${profileId} model=${String(profile.modelName || '')} runnerRestart=0`, '');
+    return {
+      ok: true,
+      hotSwitched: true,
+      enabledFromOff: false,
+      skippedRunnerRestart: true,
+      profile,
+      relay: status,
+    };
+  }
+
   if (!relayEnabled) {
+    appendRunnerLog(`[info] quickSwitch cold-start profileId=${profileId} model=${String(profile.modelName || '')}`, '');
     const applied = await applyCursorRelayProxyConfig({
       upstream,
       modelRoutes,
@@ -1292,10 +1343,14 @@ async function quickSwitchRelayModel(payload = {}) {
     };
   }
 
+  appendRunnerLog(
+    `[info] quickSwitch fallback-apply profileId=${profileId} model=${String(profile.modelName || '')} mode=${switchingFromOfficialPassthrough ? 'official_to_local' : (currentMode || 'local_relay')}`,
+    '',
+  );
   const applied = await applyCursorRelayProxyConfig({
     upstream,
     modelRoutes,
-    forceRestartRunner: relayEnabled,
+    forceRestartRunner: false,
     restartCursor: false,
     reloadCursor: false,
     installCert: false,

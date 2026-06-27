@@ -32,6 +32,8 @@ const {
   DEFAULT_USER_JSON_PATH,
 } = require('./cursor-relay-account-store');
 const { collectLocalModels } = require('./cursor-relay-model-injection');
+const { loadRelayProfileStore } = require('./cursor-relay-profile-store');
+const { syncCursorRelayModelCatalog } = require('./cursor-model-proxy');
 const {
   getStateVscdbPath,
   readItemSafe,
@@ -98,6 +100,33 @@ let guardTimers = {
 let isGuardRunning = false;
 let activeSessions = new Map(); // requestId → { lastKvPush, modelListPushed }
 
+function getLocalModelCatalogSnapshot() {
+  const localModels = collectLocalModels();
+  const availableModels = localModels
+    .map((item) => String(item?.modelName || '').trim())
+    .filter(Boolean);
+  if (!availableModels.length) return null;
+
+  let primaryModel = '';
+  try {
+    const store = loadRelayProfileStore('');
+    const activeProfile = Array.isArray(store?.configs)
+      ? store.configs.find((item) => String(item?.id || '') === String(store?.activeId || ''))
+      : null;
+    primaryModel = String(activeProfile?.modelName || '').trim();
+  } catch {
+    // ignore active profile lookup failure and fall back to first model
+  }
+
+  if (!primaryModel) primaryModel = availableModels[0];
+  if (!primaryModel) return null;
+
+  return {
+    modelName: primaryModel,
+    availableModels,
+  };
+}
+
 // ── 第一层：DB 写入守护 ───────────────────────────────────
 
 /**
@@ -141,16 +170,26 @@ async function performDbGuardCheck(options = {}) {
     }
 
     if (!needsWrite) {
-      return { checked: true, reason: 'values_intact', email: loginState.email || null };
+      const modelCatalog = getLocalModelCatalogSnapshot();
+      const modelSync = modelCatalog ? await syncCursorRelayModelCatalog(modelCatalog) : null;
+      return {
+        checked: true,
+        reason: 'values_intact',
+        email: loginState.email || null,
+        modelSync,
+      };
     }
 
     // 执行写入
     const result = await ensureCursorAccount({ allowRunningCursor: true });
+    const modelCatalog = getLocalModelCatalogSnapshot();
+    const modelSync = modelCatalog ? await syncCursorRelayModelCatalog(modelCatalog) : null;
     return {
       checked: true,
       written: result?.applied || false,
       email: result?.email || null,
       source: result?.source || null,
+      modelSync,
     };
   } catch (e) {
     return { checked: false, error: e.message };
