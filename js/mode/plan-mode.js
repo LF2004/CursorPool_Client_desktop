@@ -52,10 +52,42 @@ const PLAN_LATEST_USER_INTENT = [
   '</system_reminder>',
 ].join('\n');
 
+const VAGUE_INTENT_KEYWORDS = [
+  '帮我看看', '帮我处理', '帮我优化', '帮我改', '帮我做', '帮我实现',
+  '看一下', '处理一下', '优化一下', '改进一下', '修复一下', '调整一下',
+  '整理一下', '梳理一下', '检查一下', '重构一下', '改造一下',
+  '弄一下', '搞一下', '弄个', '搞个', '写个', '写一下',
+  'help me', 'fix it', 'look at', 'check this', 'improve this',
+  'take a look', 'deal with', 'handle this',
+];
+
+const CONCRETE_INTENT_HINTS = [
+  '添加', '新增', '删除', '移除', '修改', '替换', '重命名',
+  '读取', '查看', '在', '于', '中', '文件', '函数', '类', '方法',
+  'add ', 'remove ', 'delete ', 'update ', 'rename ', 'refactor ',
+  'in file', 'in the', '.js', '.ts', '.tsx', '.jsx', '.py', '.json',
+  'api', 'function', 'class', 'method', 'component',
+];
+
+function isVagueUserIntent(userText = '') {
+  const text = String(userText || '').trim();
+  if (!text) return true;
+  // 明确带有具体文件/符号引用的视为清晰意图
+  const hasConcreteHint = CONCRETE_INTENT_HINTS.some((hint) => text.toLowerCase().includes(hint));
+  // 含有代码引用标记（反引号、@符号引用、路径）视为清晰
+  const hasCodeReference = /`[^`]+`/.test(text) || /@[a-zA-Z0-9_\-./\\]+/.test(text) || /[a-zA-Z0-9_\-/\\]+\.[a-zA-Z]{1,5}/.test(text);
+  if (hasConcreteHint || hasCodeReference) return false;
+  // 太短且没有具体细节
+  if (text.length < 20) return true;
+  // 包含模糊动词
+  const lower = text.toLowerCase();
+  return VAGUE_INTENT_KEYWORDS.some((keyword) => lower.includes(keyword));
+}
+
 function buildPlanInitialPromptContexts(input = {}) {
-  void input;
   const planReminder = readModeText('AGENT_MODE_PLAN', 'system_reminder.txt');
-  return [
+  const userText = String(input?.userText || '').trim();
+  const contexts = [
     {
       source: 'mode_change',
       role: 'user',
@@ -80,7 +112,42 @@ function buildPlanInitialPromptContexts(input = {}) {
       role: 'user',
       content: PLAN_LATEST_USER_INTENT,
     },
-  ].filter((entry) => String(entry.content || '').trim());
+  ];
+
+  // 首轮动态引导：当用户意图模糊时，强制优先 AskQuestion
+  const workflowPhase = String(input?.planWorkflowPhase || input?.planPhase || '').trim();
+  const isFreshPlanningTurn = !workflowPhase || workflowPhase === 'planning' || workflowPhase === 'idle';
+  if (isFreshPlanningTurn && isVagueUserIntent(userText)) {
+    contexts.push({
+      source: 'plan_ask_first_guidance',
+      role: 'user',
+      content: [
+        '<system_reminder>',
+        'Plan flow requirement (Ask-before-Build):',
+        'The latest user request appears vague or lacks concrete scope (no specific files, functions, or actionable details).',
+        'Before calling CreatePlan, you MUST first call AskQuestion to clarify the user intent.',
+        'Ask 1-2 critical questions that narrow down scope, target files/modules, and expected outcome.',
+        'Only after the AskQuestion interaction completes and answers are collected, perform one fresh read-only exploration, then call CreatePlan.',
+        'Do NOT skip the AskQuestion step and jump straight to CreatePlan when the intent is unclear.',
+        '</system_reminder>',
+      ].join('\n'),
+    });
+  } else if (isFreshPlanningTurn) {
+    contexts.push({
+      source: 'plan_ask_first_guidance',
+      role: 'user',
+      content: [
+        '<system_reminder>',
+        'Plan flow requirement (Ask-before-Build):',
+        'The user intent looks concrete. You may proceed directly to a brief read-only reconnaissance and then CreatePlan.',
+        'However, if during reconnaissance you discover ambiguity, multiple valid implementations, or missing scope details, you MUST call AskQuestion before CreatePlan.',
+        'Do not call CreatePlan with unresolved ambiguity.',
+        '</system_reminder>',
+      ].join('\n'),
+    });
+  }
+
+  return contexts.filter((entry) => String(entry.content || '').trim());
 }
 
 function hasSuccessfulToolResult(session = {}, toolName = '') {
@@ -468,6 +535,9 @@ function buildLocalRelayMessages(input = {}) {
     promptContextMessages: buildPlanInitialPromptContexts(input),
     extraSystemLines: [
       'In plan mode, prioritize producing and confirming a plan before execution when the task is complex.',
+      'Ask-before-Build: on the first planning turn, evaluate whether the user intent is clear enough to build a plan.',
+      'If the user request is vague (too short, no specific files/symbols, ambiguous verbs like "fix/look at/improve"), or there are multiple valid implementations, you MUST call AskQuestion first to clarify scope, target files, and expected outcome.',
+      'Only call CreatePlan directly on the first turn when the user intent is concrete and unambiguous (e.g. explicit file paths, clear functional requirements).',
       'After AskQuestion collects Answers, perform one fresh read-only exploration of the project structure before CreatePlan.',
       'Treat that exploration as a required step, not a comment. If you have not inspected the workspace yet, do not call CreatePlan.',
       'When the exploration step is complete, synthesize the plan immediately and present it through CreatePlan.',
@@ -494,6 +564,19 @@ function interceptToolExecution(session, toolCall, context = {}, helpers = {}) {
       startedAt,
       { blockedByPlanWorkflowPhase: phase || 'answers_collected' },
     );
+  }
+  // Ask-before-Build: 在 PLANNING 阶段首轮，若用户意图模糊且尚未 AskQuestion，拦截 CreatePlan
+  if (lower === 'createplan' && (phase === 'planning' || phase === 'idle' || phase === '')) {
+    const userText = String(session?.lastUserMessageCapture?.userText || '').trim();
+    const hasAskQuestionHistory = hasSuccessfulToolResult(session, 'askquestion');
+    if (!hasAskQuestionHistory && isVagueUserIntent(userText)) {
+      return buildBlockedExecution(
+        toolCall,
+        'Plan mode Ask-before-Build: the user request appears vague. Call AskQuestion first to clarify scope, target files/modules, and expected outcome. After answers are collected, do one fresh read-only exploration, then call CreatePlan.',
+        startedAt,
+        { blockedByPlanWorkflowPhase: phase || 'planning', blockedByAskBeforeBuild: true },
+      );
+    }
   }
   if (PLAN_MUTATION_TOOL_NAMES.has(lower)) {
     return buildBlockedExecution(
@@ -634,11 +717,10 @@ module.exports = {
   buildToolDefinitionsForResponses,
   buildLocalRelayMessages,
   buildPlanInitialPromptContexts,
+  isVagueUserIntent,
   shouldUseNativeExecForTool,
   getUpstreamRequestOptions() {
-    return {
-      preferredEndpointMode: 'chat',
-    };
+    return {};
   },
   interceptToolExecution,
   getPostToolTurnAction,

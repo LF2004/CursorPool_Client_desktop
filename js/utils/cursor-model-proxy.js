@@ -746,6 +746,14 @@ function writeApplicationUserBoth(db, tableName, { enabled, baseUrl }) {
   upsertItem(db, tableName, LEGACY_APP_USER_KEY, JSON.stringify(legacyNext));
 }
 
+function deleteItem(db, tableName, key) {
+  try {
+    db.prepare(`DELETE FROM "${tableName}" WHERE key = ?`).run(key);
+  } catch {
+    /* ignore */
+  }
+}
+
 function uniqueModelNames(modelNames = [], primaryModel = '') {
   const seen = new Set();
   const items = [];
@@ -852,10 +860,11 @@ function mergeUniqueStrings(...groups) {
   return merged;
 }
 
-function buildRelayModelEntry(name, primaryModel) {
+function buildRelayModelEntry(name, primaryModel, rawReasoningEffort = 'medium') {
   const modelName = String(name || '').trim();
   const shortName = modelName;
-  const reasoningLabel = getRelayReasoningBadgeLabel('extra-high');
+  const normalizedEffort = normalizeRelayReasoningEffort(rawReasoningEffort);
+  const reasoningLabel = getRelayReasoningBadgeLabel(normalizedEffort);
   const tooltipParts = [
     `**${modelName}**`,
     `Model: ${modelName}`,
@@ -891,7 +900,7 @@ function buildRelayModelEntry(name, primaryModel) {
     supportsSandboxing: true,
     supportsCmdK: true,
     parameterDefinitions: buildRelayModelParameterDefinitions(),
-    variants: buildRelayModelVariants(modelName, shortName, 'extra-high'),
+    variants: buildRelayModelVariants(modelName, shortName, normalizedEffort),
     cloudAgentEffortModes: ['low', 'medium', 'high', 'extra-high'],
     tooltipData: {
       markdownContent: tooltipParts.join('<br /><br />'),
@@ -907,6 +916,21 @@ function buildFeatureModelConfig(defaultModel, models, previousConfig = null) {
     defaultModel,
     fallbackModels: mergeUniqueStrings(models, previous.fallbackModels),
     bestOfNDefaultModels: mergeUniqueStrings(models, previous.bestOfNDefaultModels),
+  };
+}
+
+function isPreservedBuiltInModel(name = '') {
+  const modelName = String(name || '').trim().toLowerCase();
+  return modelName === 'default' || modelName === 'auto';
+}
+
+function buildRelayModelSelectionState(modelName, rawReasoningEffort = 'extra-high') {
+  return {
+    modelId: modelName,
+    displayModelId: modelName,
+    displayName: modelName,
+    displayNameShort: String(modelName || '').trim().slice(0, 20),
+    parameters: buildRelaySelectedModel(modelName, rawReasoningEffort).parameters,
   };
 }
 
@@ -937,9 +961,16 @@ function updateModelConfigEntry(entry, defaultModel, rawReasoningEffort = 'extra
   return next;
 }
 
-function applyRelayModelCatalog(appUser, { primaryModel, availableModels }) {
+function applyRelayModelCatalog(appUser, {
+  primaryModel,
+  availableModels,
+  contextWindow,
+  reasoningEffort = 'medium',
+}) {
   const models = uniqueModelNames(availableModels, primaryModel);
   if (!models.length) return appUser;
+  const maxContextTokens = Math.max(1, Math.min(200000, Number(contextWindow) || 200000));
+  const normalizedEffort = normalizeRelayReasoningEffort(reasoningEffort);
 
   const next = appUser && typeof appUser === 'object' ? { ...appUser } : {};
   const localModelSet = new Set(models);
@@ -949,11 +980,12 @@ function applyRelayModelCatalog(appUser, { primaryModel, availableModels }) {
   for (const item of existingCatalog) {
     const modelName = String(item?.name || '').trim();
     if (!modelName || seenCatalogNames.has(modelName)) continue;
+    if (!localModelSet.has(modelName) && !isPreservedBuiltInModel(modelName)) continue;
     seenCatalogNames.add(modelName);
     if (localModelSet.has(modelName)) {
       mergedCatalog.push({
         ...(item && typeof item === 'object' ? item : {}),
-        ...buildRelayModelEntry(modelName, primaryModel),
+        ...buildRelayModelEntry(modelName, primaryModel, normalizedEffort),
       });
     } else {
       mergedCatalog.push(item);
@@ -962,11 +994,15 @@ function applyRelayModelCatalog(appUser, { primaryModel, availableModels }) {
   for (const modelName of models) {
     if (seenCatalogNames.has(modelName)) continue;
     seenCatalogNames.add(modelName);
-    mergedCatalog.push(buildRelayModelEntry(modelName, primaryModel));
+    mergedCatalog.push(buildRelayModelEntry(modelName, primaryModel, normalizedEffort));
   }
   next.availableDefaultModels2 = mergedCatalog;
   next.localProviderModelIds = [...models];
   next.useModelParameters = true;
+  next.selectedModel = primaryModel;
+  next.recentModels = mergeUniqueStrings([primaryModel], next.recentModels, models);
+  next.lastSelectedModel = primaryModel;
+  next.currentModelId = primaryModel;
 
   const prevFeatureConfigs = next.featureModelConfigs && typeof next.featureModelConfigs === 'object'
     ? next.featureModelConfigs
@@ -997,18 +1033,24 @@ function applyRelayModelCatalog(appUser, { primaryModel, availableModels }) {
     modelsWithNoDefaultSwitch: mergeUniqueStrings(models, prevAiSettings.modelsWithNoDefaultSwitch),
     modelOverrideEnabled,
     modelOverrideDisabled,
+    selectedModel: primaryModel,
+    recentModels: mergeUniqueStrings([primaryModel], prevAiSettings.recentModels, models),
+    maxTokens: maxContextTokens,
+    contextTokenLimit: maxContextTokens,
     modelConfig: {
       ...prevModelConfig,
-      composer: updateModelConfigEntry(prevModelConfig.composer, primaryModel),
-      'cmd-k': updateModelConfigEntry(prevModelConfig['cmd-k'], primaryModel),
-      'background-composer': updateModelConfigEntry(prevModelConfig['background-composer'], primaryModel),
-      'composer-ensemble': updateModelConfigEntry(prevModelConfig['composer-ensemble'], primaryModel),
-      'plan-execution': updateModelConfigEntry(prevModelConfig['plan-execution'], primaryModel),
-      spec: updateModelConfigEntry(prevModelConfig.spec, primaryModel),
-      'deep-search': updateModelConfigEntry(prevModelConfig['deep-search'], primaryModel),
-      'quick-agent': updateModelConfigEntry(prevModelConfig['quick-agent'], primaryModel),
+      composer: updateModelConfigEntry(prevModelConfig.composer, primaryModel, normalizedEffort),
+      'cmd-k': updateModelConfigEntry(prevModelConfig['cmd-k'], primaryModel, normalizedEffort),
+      'background-composer': updateModelConfigEntry(prevModelConfig['background-composer'], primaryModel, normalizedEffort),
+      'composer-ensemble': updateModelConfigEntry(prevModelConfig['composer-ensemble'], primaryModel, normalizedEffort),
+      'plan-execution': updateModelConfigEntry(prevModelConfig['plan-execution'], primaryModel, normalizedEffort),
+      spec: updateModelConfigEntry(prevModelConfig.spec, primaryModel, normalizedEffort),
+      'deep-search': updateModelConfigEntry(prevModelConfig['deep-search'], primaryModel, normalizedEffort),
+      'quick-agent': updateModelConfigEntry(prevModelConfig['quick-agent'], primaryModel, normalizedEffort),
     },
   };
+
+  next.aiSettings.selectedModels = [buildRelayModelSelectionState(primaryModel, normalizedEffort)];
 
   return next;
 }
@@ -1016,6 +1058,8 @@ function applyRelayModelCatalog(appUser, { primaryModel, availableModels }) {
 async function syncCursorRelayModelCatalog(payload = {}) {
   const primaryModel = String(payload.modelName || '').trim();
   const availableModels = uniqueModelNames(payload.availableModels, primaryModel);
+  const contextWindow = Math.max(1, Math.min(200000, Number(payload.contextWindow) || 200000));
+  const reasoningEffort = normalizeRelayReasoningEffort(payload.reasoningEffort || 'medium');
   if (!primaryModel || !availableModels.length) {
     return { ok: false, skipped: true, reason: 'missing_models' };
   }
@@ -1037,10 +1081,16 @@ async function syncCursorRelayModelCatalog(payload = {}) {
     const nextReactive = applyRelayModelCatalog(reactive, {
       primaryModel,
       availableModels,
+      contextWindow,
+      reasoningEffort,
     });
 
     const tx = db.transaction(() => {
       upsertItem(db, tableName, REACTIVE_APP_USER_KEY, JSON.stringify(nextReactive));
+      upsertItem(db, tableName, 'cursorai/selectedModel', primaryModel);
+      upsertItem(db, tableName, 'cursorai/recentModels', JSON.stringify(mergeUniqueStrings([primaryModel], availableModels)));
+      deleteItem(db, tableName, 'cursorai/serverConfig');
+      deleteItem(db, tableName, 'cursorai/featureConfigCache');
 
       const legacyRaw = readItem(db, tableName, LEGACY_APP_USER_KEY);
       if (legacyRaw) {
@@ -1048,6 +1098,8 @@ async function syncCursorRelayModelCatalog(payload = {}) {
         const nextLegacy = applyRelayModelCatalog(legacy, {
           primaryModel,
           availableModels,
+          contextWindow,
+          reasoningEffort,
         });
         upsertItem(db, tableName, LEGACY_APP_USER_KEY, JSON.stringify(nextLegacy));
       }
@@ -1065,6 +1117,9 @@ async function syncCursorRelayModelCatalog(payload = {}) {
       dbPath,
       primaryModel,
       availableModels,
+      contextWindow,
+      reasoningEffort,
+      reloaded: isCursorRunningHeuristic() ? reloadRunningCursorWindow() : false,
     };
   } finally {
     db.close();

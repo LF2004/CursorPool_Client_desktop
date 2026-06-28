@@ -10,10 +10,34 @@ let dbCache = new Map();
 let historySyncCache = new Map();
 const HISTORY_SYNC_MIN_INTERVAL_MS = 30000;
 let Database = null;
+let databaseDisabledReason = '';
+
+function disableDatabase(reason) {
+  if (!databaseDisabledReason) {
+    databaseDisabledReason = String(reason || 'usage_database_unavailable');
+    try {
+      console.warn(`[cursor-relay-usage-store] disabled: ${databaseDisabledReason}`);
+    } catch {
+      /* ignore console failures */
+    }
+  }
+}
+
+function isDatabaseDisabled() {
+  return Boolean(databaseDisabledReason);
+}
 
 function loadDatabaseCtor() {
+  if (databaseDisabledReason) {
+    throw new Error(databaseDisabledReason);
+  }
   if (Database) return Database;
-  Database = require('better-sqlite3');
+  try {
+    Database = require('better-sqlite3');
+  } catch (error) {
+    disableDatabase(error?.message || error);
+    throw error;
+  }
   return Database;
 }
 
@@ -41,11 +65,26 @@ function ensureRelayUsageSchema(db) {
 }
 
 function openUsageDb(customRoot) {
+  if (databaseDisabledReason) {
+    throw new Error(databaseDisabledReason);
+  }
   const dbPath = getUsageDbPath(customRoot);
   const cached = dbCache.get(dbPath);
   if (cached) return cached;
-  const DatabaseCtor = loadDatabaseCtor();
-  const db = new DatabaseCtor(dbPath);
+  let DatabaseCtor = null;
+  try {
+    DatabaseCtor = loadDatabaseCtor();
+  } catch (error) {
+    disableDatabase(error?.message || error);
+    throw error;
+  }
+  let db = null;
+  try {
+    db = new DatabaseCtor(dbPath);
+  } catch (error) {
+    disableDatabase(error?.message || error);
+    throw error;
+  }
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.exec(`
@@ -126,6 +165,23 @@ function normalizeUsage(rawUsage = {}) {
     : {};
   const inputDetails = usage.input_tokens_details || usage.prompt_tokens_details || {};
   const outputDetails = usage.output_tokens_details || usage.completion_tokens_details || {};
+  const cacheReadCandidates = [
+    inputDetails.cached_tokens,
+    inputDetails.cached_input_tokens,
+    inputDetails.cache_read_input_tokens,
+    inputDetails.prompt_cache_hit_tokens,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.prompt_tokens_details?.cached_input_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.cached_input_tokens,
+    usage.cachedContentTokenCount,
+    usage.cache_read_input_tokens,
+    usage.cache_read_tokens,
+    usage.input_cached_tokens,
+    usageMeta.cachedContentTokenCount,
+    usageMeta.cacheReadInputTokens,
+    usageMeta.cacheReadTokens,
+  ];
   const deepSeekCacheHitTokens = toInt(usage.prompt_cache_hit_tokens);
   const deepSeekCacheMissTokens = toInt(usage.prompt_cache_miss_tokens);
   const inputTokens = toInt(usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount)
@@ -133,15 +189,9 @@ function normalizeUsage(rawUsage = {}) {
     || deepSeekCacheHitTokens + deepSeekCacheMissTokens;
   const outputTokens = toInt(usage.output_tokens ?? usage.completion_tokens ?? usage.candidatesTokenCount)
     || toInt(usageMeta.candidatesTokenCount);
-  const cachedInputTokens = toInt(
-    inputDetails.cached_tokens
-      ?? inputDetails.cached_input_tokens
-      ?? usage.prompt_tokens_details?.cached_tokens
-      ?? usage.prompt_cache_hit_tokens
-      ?? usage.cached_input_tokens
-      ?? usage.cachedContentTokenCount
-      ?? usageMeta.cachedContentTokenCount,
-  );
+  const cachedInputTokens = cacheReadCandidates.reduce((value, candidate) => (
+    value > 0 ? value : toInt(candidate)
+  ), 0);
   const totalTokens = toInt(usage.total_tokens) || inputTokens + outputTokens;
   return {
     inputTokens,
@@ -207,7 +257,18 @@ function recordRelayUsage(customRoot, payload = {}) {
   if (!hasRecordedTokenUsage(cost) && billedPoints == null && !forceRecord) {
     return { ok: true, skipped: true, reason: 'zero_token_usage', dbPath: getUsageDbPath(customRoot) };
   }
-  const db = openUsageDb(customRoot);
+  let db = null;
+  try {
+    db = openUsageDb(customRoot);
+  } catch (error) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'usage_db_unavailable',
+      dbPath: getUsageDbPath(customRoot),
+      error: error?.message || String(error),
+    };
+  }
   const createdAt = payload.createdAt || new Date().toISOString();
   const status = String(payload.status || 'unknown');
   const row = {
@@ -277,6 +338,7 @@ function recordRelayUsage(customRoot, payload = {}) {
 
 function appendRelayUsageMeta(customRoot, usageId, extraMeta = {}) {
   if (!usageId || !extraMeta || typeof extraMeta !== 'object') return { ok: false };
+  if (isDatabaseDisabled()) return { ok: false, skipped: true, reason: databaseDisabledReason };
   const db = openUsageDb(customRoot);
   const row = db.prepare('SELECT meta_json FROM relay_usage WHERE id = ?').get(usageId);
   if (!row) return { ok: false };
@@ -288,6 +350,9 @@ function appendRelayUsageMeta(customRoot, usageId, extraMeta = {}) {
 }
 
 function deleteZeroTokenRelayUsage(customRoot) {
+  if (isDatabaseDisabled()) {
+    return { ok: false, skipped: true, reason: databaseDisabledReason, deleted: 0, dbPath: getUsageDbPath(customRoot) };
+  }
   const db = openUsageDb(customRoot);
   const info = db.prepare(`
     DELETE FROM relay_usage
@@ -309,6 +374,9 @@ function syncUsageFromHistory(customRoot) {
   const dataDir = getRelayDataDir(customRoot);
   const historyRoot = path.join(dataDir, 'history');
   if (!fs.existsSync(historyRoot)) return { ok: true, inserted: 0, skipped: true };
+  if (isDatabaseDisabled()) {
+    return { ok: false, inserted: 0, skipped: true, reason: databaseDisabledReason };
+  }
   const db = openUsageDb(customRoot);
   let lastRunnerConfig = null;
   try {
@@ -441,6 +509,31 @@ function buildWhere(filters = {}) {
 }
 
 function listRelayUsage(customRoot, options = {}) {
+  if (isDatabaseDisabled()) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: databaseDisabledReason,
+      page: Math.max(1, toInt(options.page) || 1),
+      pageSize: Math.min(100, Math.max(1, toInt(options.pageSize) || 20)),
+      total: 0,
+      list: [],
+      summary: {
+        count: 0,
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        total_cost_usd: 0,
+        points: 0,
+        billed_points: 0,
+        effective_points: 0,
+        success_count: 0,
+        pending_count: 0,
+        error_count: 0,
+      },
+    };
+  }
   const dbPath = getUsageDbPath(customRoot);
   const forceHistorySync = options.syncHistory === true;
   const lastHistorySyncAt = historySyncCache.get(dbPath) || 0;
@@ -489,6 +582,7 @@ function listRelayUsage(customRoot, options = {}) {
 function updateRelayUsageBilledPoints(customRoot, usageId, billedPoints, serverEstimatedPoints = null) {
   const amount = Number(billedPoints);
   if (!Number.isFinite(amount) || amount <= 0) return { ok: false, skipped: true };
+  if (isDatabaseDisabled()) return { ok: false, skipped: true, reason: databaseDisabledReason };
   const db = openUsageDb(customRoot);
   const serverPoints = Number(serverEstimatedPoints);
   const info = Number.isFinite(serverPoints) && serverPoints > 0
@@ -501,6 +595,7 @@ function updateRelayUsageStatusForRequest(customRoot, requestId, fromStatus, toS
   const rid = String(requestId || '').trim();
   const nextStatus = String(toStatus || '').trim();
   if (!rid || !nextStatus) return { ok: false, skipped: true };
+  if (isDatabaseDisabled()) return { ok: false, skipped: true, reason: databaseDisabledReason };
   const db = openUsageDb(customRoot);
   const params = {
     request_id: rid,
@@ -520,6 +615,9 @@ function updateRelayUsageStatusForRequest(customRoot, requestId, fromStatus, toS
 }
 
 function clearRelayUsage(customRoot) {
+  if (isDatabaseDisabled()) {
+    return { ok: false, skipped: true, reason: databaseDisabledReason, deleted: 0, dbPath: getUsageDbPath(customRoot) };
+  }
   const db = openUsageDb(customRoot);
   const info = db.prepare('DELETE FROM relay_usage').run();
   try {
@@ -541,4 +639,5 @@ module.exports = {
   listRelayUsage,
   clearRelayUsage,
   closeUsageDbs,
+  isDatabaseDisabled,
 };

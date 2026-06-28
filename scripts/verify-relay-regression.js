@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
+const { execSync, execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 let pass = 0;
@@ -198,25 +199,24 @@ check('AvailableModelsResponse has repeated AvailableModel models = 2', protoWit
 // [FIX #2] 运行时验证：protobufjs 加载后 models 字段解析为 AvailableModel（非 ModelDetails）
 let runtimeModelsType = false;
 try {
-  const { loadCursorProtoRoot } = require('../js/utils/cursor-relay-protobuf');
-  const { getRootSync } = require('../js/utils/cursor-relay-protobuf');
-  // 同步加载（可能尚未异步加载完成，跳过不报错）
-  if (typeof getRootSync === 'function') {
-    try {
-      const root = getRootSync();
-      const amr = root.lookupType('aiserver.v1.AvailableModelsResponse');
-      if (amr) {
-        for (const [, f] of Object.entries(amr.fields || {})) {
-          if (f.name === 'models' && f.resolvedType && f.resolvedType.name === 'AvailableModel') {
-            runtimeModelsType = true;
-            break;
-          }
-        }
-      }
-    } catch { /* root not loaded yet */ }
-  }
+  const { execFileSync } = require('child_process');
+  const runtimeCheckScript = [
+    '(async () => {',
+    `  const mod = require(${JSON.stringify(path.join(ROOT, 'js/utils/cursor-relay-protobuf.js'))});`,
+    '  await mod.loadCursorProtoRoot();',
+    '  const root = mod.getRootSync();',
+    "  const amr = root.lookupType('aiserver.v1.AvailableModelsResponse');",
+    "  const ok = Object.values(amr?.fields || {}).some((f) => f.name === 'models' && f.resolvedType?.name === 'AvailableModel');",
+    "  process.stdout.write(ok ? 'true' : 'false');",
+    '})().catch(() => process.stdout.write(\'false\'));',
+  ].join('\n');
+  runtimeModelsType = execFileSync(process.execPath, ['-e', runtimeCheckScript], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim() === 'true';
 } catch { /* skip */ }
-check('runtime: models field resolves to AvailableModel type', runtimeModelsType, 'proto root may not be pre-loaded yet');
+check('runtime: models field resolves to AvailableModel type', runtimeModelsType);
 
 // model-injection injects into both model_names(#1) and models(#2)
 const injSrc = fs.readFileSync(path.join(ROOT, 'js/utils/cursor-relay-model-injection.js'), 'utf8');
@@ -230,15 +230,143 @@ const v2 = require('../js/utils/cursor-relay-protocol-v2');
 check('normalizeConversationActionForLegacy exported', typeof v2.normalizeConversationActionForLegacy === 'function');
 
 // ------------------------------------------------------------------
-// 7. Syntax check all recently modified JS files.
+// 7. Destructive Write/Edit protection must be unique and active.
 // ------------------------------------------------------------------
-console.log('\n[7] Syntax check modified JS files');
-const { execSync } = require('child_process');
+console.log('\n[7] Destructive write protection');
+const runnerPath = path.join(ROOT, 'js/utils/cursor-relay-runner.js');
+const runnerSrc = fs.readFileSync(runnerPath, 'utf8');
+const warnFnMatches = runnerSrc.match(/function warnIfWriteLooksDestructive\(/g) || [];
+check('runner has single warnIfWriteLooksDestructive definition', warnFnMatches.length === 1, `found ${warnFnMatches.length}`);
+
+let destructiveGuardExported = false;
+let destructiveWriteBlocked = false;
+let safeRewriteAllowed = false;
+try {
+  const { detectDestructiveWrite } = require('../js/utils/cursor-relay-runner');
+  destructiveGuardExported = typeof detectDestructiveWrite === 'function';
+  const before = Array.from({ length: 80 }, (_, i) => `const keep_line_${i} = ${i};`).join('\n');
+  const dangerousSnippet = [
+    'function onlyNewSnippet() {',
+    '  return 1;',
+    '}',
+  ].join('\n');
+  const safeRewrite = `${before}\nconst appended_line = true;`;
+  destructiveWriteBlocked = Boolean(detectDestructiveWrite('src/example.js', before, dangerousSnippet)?.message);
+  safeRewriteAllowed = detectDestructiveWrite('src/example.js', before, safeRewrite) === null;
+} catch {
+  /* checked below */
+}
+check('detectDestructiveWrite exported', destructiveGuardExported);
+check('detectDestructiveWrite blocks suspicious snippet overwrite', destructiveWriteBlocked);
+check('detectDestructiveWrite allows near-full rewrite', safeRewriteAllowed);
+
+// ------------------------------------------------------------------
+// 8. Official native mode number mapping must cover Multitask/Debug.
+// ------------------------------------------------------------------
+console.log('\n[8] Official native agent mode mapping');
+let modeMappingOk = false;
+let bidiCarriesMultitaskMode = false;
+try {
+  const {
+    mapAgentModeNameToNumber,
+    buildAgentBidiAppendPayload,
+  } = require('../js/utils/cursor-relay-agent-test');
+  modeMappingOk = mapAgentModeNameToNumber('AGENT_MODE_DEBUG') === 4
+    && mapAgentModeNameToNumber('DEBUG') === 4
+    && mapAgentModeNameToNumber('AGENT_MODE_MULTITASK') === 7
+    && mapAgentModeNameToNumber('MULTITASK') === 7
+    && mapAgentModeNameToNumber('TASK') === 7;
+
+  const payload = buildAgentBidiAppendPayload('req-mode-check', 'hello', {
+    mode: 'AGENT_MODE_MULTITASK',
+  });
+  bidiCarriesMultitaskMode = Buffer.from(payload).includes(Buffer.from([0x20, 0x07]))
+    && Buffer.from(payload).includes(Buffer.from([0x50, 0x07]));
+} catch {
+  /* checked below */
+}
+check('mapAgentModeNameToNumber covers DEBUG and MULTITASK', modeMappingOk);
+check('BidiAppend payload carries AGENT_MODE_MULTITASK as mode=7', bidiCarriesMultitaskMode);
+
+// ------------------------------------------------------------------
+// 8b. Native TaskV2 / debug bugfix tool parity checks.
+// ------------------------------------------------------------------
+console.log('\n[8b] Native TaskV2 and debug bugfix parity');
+let taskV2MappingOk = false;
+let reportBugfixMappingOk = false;
+let taskRegistryWorks = false;
+let taskStructuredSnapshotOk = false;
+try {
+  const protocolSrc = fs.readFileSync(path.join(ROOT, 'js/utils/cursor-relay-protocol.js'), 'utf8');
+  taskV2MappingOk = /normalized === 'task'\) return \{ field: 19, name: 'Task' \}/.test(protocolSrc)
+    || /normalized === 'task'.+field: 69, name: 'Task'/s.test(protocolSrc);
+  reportBugfixMappingOk = /ReportBugfixResults/.test(protocolSrc)
+    && /field: 78, name: 'ReportBugfixResults'/.test(protocolSrc);
+
+  const runtimeTaskCheckScript = [
+    '(async () => {',
+    `  const { buildStructuredToolCallSnapshot } = require(${JSON.stringify(path.join(ROOT, 'js/utils/cursor-relay-protocol.js'))});`,
+    `  const { executeTaskTool } = require(${JSON.stringify(path.join(ROOT, 'js/utils/cursor-relay-runner.js'))});`,
+    `  const session = { requestId: 'regression-task', workspaceRoot: ${JSON.stringify(ROOT)}, taskRegistry: null, config: {} };`,
+    '  const execution = await executeTaskTool({',
+    "    description: 'Inspect protocol',",
+    "    prompt: 'Find TaskV2 and summarize native subagent flow',",
+    "    subagent_type: { debug: 'debug' },",
+    "    name: 'Protocol Inspector',",
+    "    model: 'fast',",
+    '  }, session);',
+    "  const registryOk = Boolean(execution?.ok && execution.agentId && execution.subagentType === 'debug' && session.taskRegistry?.subagents instanceof Map && session.taskRegistry.subagents.has(execution.agentId));",
+    "  const snapshot = buildStructuredToolCallSnapshot('Task', { description: 'Inspect protocol', prompt: 'Find TaskV2 and summarize native subagent flow', subagent_type: { debug: 'debug' }, name: 'Protocol Inspector', model: 'fast' }, execution, 'tool_task');",
+    "  const snapshotOk = Boolean(snapshot?.taskToolCall?.args?.subagentType?.debug !== undefined && snapshot?.taskToolCall?.args?.model === 'fast');",
+    "  process.stdout.write(JSON.stringify({ registryOk, snapshotOk }));",
+    '})().catch(() => process.stdout.write(JSON.stringify({ registryOk: false, snapshotOk: false })));',
+  ].join('\n');
+  const runtimeTaskCheck = JSON.parse(execFileSync(process.execPath, ['-e', runtimeTaskCheckScript], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim() || '{}');
+  taskRegistryWorks = Boolean(runtimeTaskCheck.registryOk);
+  taskStructuredSnapshotOk = Boolean(runtimeTaskCheck.snapshotOk);
+} catch {
+  /* checked below */
+}
+check('protocol maps Task to native TaskToolCall field 19', taskV2MappingOk);
+check('protocol maps debug bugfix tool to native field 78', reportBugfixMappingOk);
+check('runner Task execution records subagent registry entry', taskRegistryWorks);
+check('structured Task snapshot carries subagent/model/name', taskStructuredSnapshotOk);
+
+let nativeTaskRpcRoutesOk = false;
+let cacheSelfTestLogicOk = false;
+try {
+  const runnerSrcForNative = fs.readFileSync(path.join(ROOT, 'js/utils/cursor-relay-runner.js'), 'utf8');
+  nativeTaskRpcRoutesOk = /TaskInit/.test(runnerSrcForNative)
+    && /TaskStreamLog/.test(runnerSrcForNative)
+    && /TaskProvideResult/.test(runnerSrcForNative)
+    && /TaskGetInterfaceAgentStatus/.test(runnerSrcForNative)
+    && /handleNativeTaskRpc/.test(runnerSrcForNative);
+
+  cacheSelfTestLogicOk = !/relay-response-cache/.test(runnerSrcForNative)
+    && !/cache-self-test/.test(runnerSrcForNative)
+    && !/cacheStats:\s*responseCache/.test(runnerSrcForNative);
+} catch {
+  /* checked below */
+}
+check('runner exposes native Task RPC lifecycle routes', nativeTaskRpcRoutesOk);
+check('runner no longer depends on local relay response cache', cacheSelfTestLogicOk);
+
+// ------------------------------------------------------------------
+// 9. Syntax check all recently modified JS files.
+// ------------------------------------------------------------------
+console.log('\n[9] Syntax check modified JS files');
 const modifiedFiles = [
   'js/utils/cursor-relay-state-guard.js',
   'js/utils/cursor-relay-model-injection.js',
   'js/utils/cursor-relay-protocol-v2.js',
+  'js/utils/cursor-relay-protocol.js',
   'js/utils/cursor-relay-runner.js',
+  'js/utils/cursor-relay-agent-test.js',
+  'js/utils/cursor-relay-proxy.js',
   'js/utils/cursor-relay-auth-intercept.js',
   'js/utils/cursor-relay-account-store.js',
   'update_cursor_auth.js',
@@ -251,6 +379,7 @@ const modifiedFiles = [
   'js/mode/common/tools.js',
   'js/mode/common/message-builder.js',
   'scripts/gen-cursor-modes.js',
+  'scripts/test-cursor-relay-agent.cjs',
 ];
 for (const rel of modifiedFiles) {
   try {

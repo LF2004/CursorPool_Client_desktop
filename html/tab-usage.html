@@ -21,8 +21,8 @@
   <div class="usage-summary-grid" aria-label="调用汇总">
     <div class="usage-summary-card usage-cache-card">
       <div class="usage-cache-header">
-        <span class="usage-summary-label">Prompt 缓存率</span>
-        <button type="button" class="usage-info-btn usage-cache-info-btn" aria-label="Prompt 缓存率说明" data-popover="cache-help">
+        <span class="usage-summary-label">缓存命中率</span>
+        <button type="button" class="usage-info-btn usage-cache-info-btn" aria-label="缓存命中率说明" data-popover="cache-help">
           <i class="fa fa-info-circle" aria-hidden="true"></i>
         </button>
       </div>
@@ -33,13 +33,14 @@
             <path id="usageCacheGaugeFill" class="usage-cache-gauge-fill" d="M 10 58 A 50 50 0 0 1 110 58" pathLength="157.08" stroke-dasharray="157.08" stroke-dashoffset="157.08" />
           </svg>
           <strong id="usageCacheHitRate" class="usage-cache-rate">-</strong>
+          <span id="usageCacheUpstreamRate" class="usage-cache-rate-sub">Prompt Cache</span>
         </div>
         <div class="usage-cache-stats">
-          <div class="usage-cache-stat">
+          <div class="usage-cache-stat usage-cache-stat-sub">
             <span class="usage-cache-stat-label">Token 消耗</span>
             <span id="usageCacheTokenTotal" class="usage-cache-stat-value mono">0</span>
           </div>
-          <div class="usage-cache-stat">
+          <div class="usage-cache-stat usage-cache-stat-sub">
             <span class="usage-cache-stat-label">Prompt 消耗</span>
             <span id="usageCachePromptTotal" class="usage-cache-stat-value mono">0</span>
           </div>

@@ -95,6 +95,9 @@ const SIDE_EFFECT_TOOLS = new Set([
 const memoryCache = new Map();
 let warmedUp = false;
 let warmupPromise = null;
+// 累计统计计数器（不受 LRU 驱逐影响，用于计算缓存命中率）
+let totalLookups = 0;
+let totalHitsCounter = 0;
 
 function getHistoryRoot() {
   return String(process.env.CURSOR_RELAY_HISTORY_ROOT || DEFAULT_HISTORY_ROOT);
@@ -346,18 +349,28 @@ function config_upstream_reasoning(options) {
 // 查询顺序：exact → fuzzy → ultra
 function get(keys) {
   if (!keys) return null;
+  totalLookups += 1;
   const { exact, fuzzy, ultra } = keys;
   if (exact) {
     const entry = _get(exact);
-    if (entry) return { entry, key: exact, layer: 'exact' };
+    if (entry) {
+      totalHitsCounter += 1;
+      return { entry, key: exact, layer: 'exact' };
+    }
   }
   if (fuzzy) {
     const entry = _get(fuzzy);
-    if (entry) return { entry, key: fuzzy, layer: 'fuzzy' };
+    if (entry) {
+      totalHitsCounter += 1;
+      return { entry, key: fuzzy, layer: 'fuzzy' };
+    }
   }
   if (ultra) {
     const entry = _get(ultra);
-    if (entry) return { entry, key: ultra, layer: 'ultra' };
+    if (entry) {
+      totalHitsCounter += 1;
+      return { entry, key: ultra, layer: 'ultra' };
+    }
   }
   return null;
 }
@@ -452,24 +465,37 @@ function createReplayStream(text, reasoning = '') {
       let closed = false;
       const burstSize = 8;
       let index = 0;
+      const safeClose = () => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          /* stream already closed */
+        }
+      };
       const pump = () => {
         if (closed) return;
         if (index >= frames.length) {
-          closed = true;
-          controller.close();
+          safeClose();
           return;
         }
         const end = Math.min(index + burstSize, frames.length);
         for (; index < end; index += 1) {
           if (closed) return;
-          controller.enqueue(Buffer.from(`data: ${JSON.stringify(frames[index])}\n\n`, 'utf8'));
+          try {
+            controller.enqueue(Buffer.from(`data: ${JSON.stringify(frames[index])}\n\n`, 'utf8'));
+          } catch {
+            safeClose();
+            return;
+          }
         }
         if (!closed) setTimeout(pump, 0);
       };
       pump();
     },
     cancel() {
-      // no-op
+      // cancel is intentionally tolerated; start() already guards enqueue/close races.
     },
   });
 }
@@ -620,13 +646,11 @@ function _extractCacheableTurns(items) {
 }
 
 function getStats() {
-  let totalHits = 0;
   let exactCount = 0;
   let fuzzyCount = 0;
   let ultraCount = 0;
   let hotCount = 0;
   for (const entry of memoryCache.values()) {
-    totalHits += (entry.hits || 0);
     if ((entry.hits || 0) >= HOT_HIT_THRESHOLD) hotCount += 1;
     if (entry.layer === 'exact') exactCount += 1;
     else if (entry.layer === 'fuzzy') fuzzyCount += 1;
@@ -638,7 +662,9 @@ function getStats() {
     fuzzyEntries: fuzzyCount,
     ultraEntries: ultraCount,
     hotEntries: hotCount,
-    totalHits,
+    totalHits: totalHitsCounter,
+    totalLookups,
+    hitRate: totalLookups > 0 ? (totalHitsCounter / totalLookups) * 100 : null,
     warmedUp,
   };
 }
@@ -647,6 +673,8 @@ function clear() {
   memoryCache.clear();
   warmedUp = false;
   warmupPromise = null;
+  totalLookups = 0;
+  totalHitsCounter = 0;
 }
 
 // 测试辅助导出

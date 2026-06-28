@@ -132,7 +132,7 @@ function normalizeUpstream(upstream = {}) {
   const endpointMode = String(upstream.endpointMode || 'responses').trim().toLowerCase();
   const reasoningEffort = String(upstream.reasoningEffort || 'medium').trim().toLowerCase();
   const thinkingMode = String(upstream.thinkingMode || '').trim().toLowerCase();
-  const contextWindow = Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 250000;
+  const contextWindow = Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 200000;
   if (!baseUrl) throw new Error('Upstream baseUrl is required for the local relay runner');
   if (!apiKey) throw new Error('Upstream apiKey is required for the local relay runner');
   const availableModels = Array.isArray(upstream.availableModels)
@@ -189,7 +189,7 @@ function buildOfficialPassthroughUpstream() {
     endpointMode: 'responses',
     reasoningEffort: 'medium',
     thinkingMode: '',
-    contextWindow: 250000,
+    contextWindow: 200000,
   };
 }
 
@@ -1055,6 +1055,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     healthOk: health.ok,
     proxyServer: running ? `http://127.0.0.1:${health.payload?.port || port}` : '',
     outboundProxy: runnerConfig?.outboundProxy || health.payload?.outboundProxy || null,
+    cacheStats: health.payload?.cacheStats || null,
     configPath: paths.configPath,
     logPath: paths.logPath,
     interceptPath: CHAT_PATH,
@@ -1070,7 +1071,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
             endpointMode: runnerConfig.upstream.endpointMode || 'responses',
             reasoningEffort: runnerConfig.upstream.reasoningEffort || 'medium',
             thinkingMode: runnerConfig.upstream.thinkingMode || '',
-            contextWindow: runnerConfig.upstream.contextWindow || 250000,
+            contextWindow: runnerConfig.upstream.contextWindow || 200000,
             apiKeyMasked: maskSecret(runnerConfig.upstream.apiKey),
           }
         : health.payload
@@ -1084,7 +1085,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
             endpointMode: health.payload.upstreamEndpointMode || 'responses',
             reasoningEffort: health.payload.upstreamReasoningEffort || 'medium',
             thinkingMode: health.payload.upstreamThinkingMode || '',
-            contextWindow: health.payload.upstreamContextWindow || 250000,
+            contextWindow: health.payload.upstreamContextWindow || 200000,
             stats: health.payload.stats || null,
           }
         : null,

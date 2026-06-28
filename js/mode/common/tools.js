@@ -18,6 +18,9 @@ const SUPPORTED_MODE_TOOL_NAMES = new Set([
   'AskQuestion',
   'CreatePlan',
   'Task',
+  'ReportBugfixResults',
+  'DebugLogs',
+  'ReproductionSteps',
   'SwitchMode',
 ]);
 
@@ -54,11 +57,28 @@ function enhanceRelayToolDefinition(tool) {
     },
   };
   if (name === 'Write') {
-    clone.function.description = `${clone.function.description}\n\nUse mainly for new files or true full-file rewrites. For modifying existing files, prefer PatchEdit or StrReplace with exact old_string/new_string.`;
+    clone.function.description = `${clone.function.description}
+
+IMPORTANT — 全量覆盖语义，务必谨慎使用：
+- Write 会用 contents 完整替换目标文件的全部内容。绝对不要只传入"新增的代码片段"，那会删除文件中所有未提及的已有代码。
+- 编辑现有文件时，contents 必须包含该文件的完整内容（原有保留部分 + 修改部分），缺一不可。如果拿不准完整内容，先调用 Read 读取，再基于读取结果构造完整 contents。
+- 修改现有文件优先使用 PatchEdit 或 StrReplace（只需 old_string/new_string），仅在创建新文件或确需全量重写时才用 Write。
+- 禁止用 Write 删除未提及的已有代码。`;
+  } else if (name === 'Edit') {
+    clone.function.description = `${clone.function.description}
+
+IMPORTANT — 全量覆盖语义，务必谨慎使用：
+- Edit 会用 contents 完整替换目标文件的全部内容。绝对不要只传入"新增的代码片段"，那会删除文件中所有未提及的已有代码。
+- contents 必须包含该文件的完整内容（原有保留部分 + 修改部分）。如果拿不准完整内容，先调用 Read 读取，再基于读取结果构造完整 contents。
+- 修改现有文件优先使用 PatchEdit 或 StrReplace（只需 old_string/new_string）。`;
   } else if (name === 'StrReplace') {
-    clone.function.description = `${clone.function.description}\n\nPrefer this over full-file Write when an exact old_string can be identified. Set new_string to an empty string to delete the exact old_string.`;
+    clone.function.description = `${clone.function.description}
+
+修改现有文件时优先使用本工具而非 Write/Edit：只需提供精确的 old_string 和 new_string，不会触碰文件其余内容，避免误删未提及的代码。Set new_string to an empty string to delete the exact old_string.`;
   } else if (name === 'PatchEdit') {
-    clone.function.description = `${clone.function.description}\n\nSet new_string to an empty string to delete the exact old_string.`;
+    clone.function.description = `${clone.function.description}
+
+修改现有文件时优先使用本工具而非 Write/Edit：只需提供精确的 old_string 和 new_string，不会触碰文件其余内容，避免误删未提及的代码。Set new_string to an empty string to delete the exact old_string.`;
   }
   return clone;
 }
@@ -131,7 +151,7 @@ function buildFallbackRelayToolDefinitions() {
       type: 'function',
       function: {
         name: 'Write',
-        description: 'Write the full contents of a local file. Use this mainly for new files or full-file rewrites. For modifying an existing file, prefer PatchEdit or StrReplace with exact old_string/new_string.',
+        description: 'Write the full contents of a local file. This is a FULL OVERWRITE — contents must contain the complete file content (all existing code to keep plus any changes), never just the newly added snippet, otherwise all unmentioned existing code will be deleted. For modifying an existing file, prefer PatchEdit or StrReplace with exact old_string/new_string. Read the file first if you need to preserve existing content.',
         parameters: {
           type: 'object',
           properties: {
@@ -146,7 +166,7 @@ function buildFallbackRelayToolDefinitions() {
       type: 'function',
       function: {
         name: 'PatchEdit',
-        description: 'Edit an existing local file by replacing exact old_string with new_string. Set new_string to an empty string to delete the exact old_string. Prefer this for page beautification and normal edits because it is faster and produces smaller native review diffs than full-file Write.',
+        description: 'Edit an existing local file by replacing exact old_string with new_string. Only the matched old_string is affected; all other content is preserved. Set new_string to an empty string to delete the exact old_string. Prefer this for normal edits because it is faster, produces smaller native review diffs than full-file Write, and never accidentally deletes unmentioned code.',
         parameters: {
           type: 'object',
           properties: {
@@ -163,7 +183,7 @@ function buildFallbackRelayToolDefinitions() {
       type: 'function',
       function: {
         name: 'Edit',
-        description: 'Replace a local file with the full updated contents. Prefer PatchEdit when you can identify an exact old_string.',
+        description: 'Replace a local file with the full updated contents. This is a FULL OVERWRITE — contents must contain the complete file content (all existing code to keep plus any changes), never just the newly added snippet, otherwise all unmentioned existing code will be deleted. Prefer PatchEdit or StrReplace when you can identify an exact old_string.',
         parameters: {
           type: 'object',
           properties: {
@@ -178,7 +198,7 @@ function buildFallbackRelayToolDefinitions() {
       type: 'function',
       function: {
         name: 'StrReplace',
-        description: 'Replace exact text in an existing local file. Set new_string to an empty string to delete the exact old_string. Prefer this over full-file Write when an exact old_string can be identified.',
+        description: 'Replace exact text in an existing local file. Only the matched old_string is affected; all other content is preserved. Set new_string to an empty string to delete the exact old_string. Prefer this over full-file Write/Edit when an exact old_string can be identified — it never accidentally deletes unmentioned code.',
         parameters: {
           type: 'object',
           properties: {

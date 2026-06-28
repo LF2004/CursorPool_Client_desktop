@@ -6,15 +6,10 @@ const https = require('https');
 const net = require('net');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
-const responseCache = require('./relay-response-cache');
 
 const {
   decodeCursorChatRequest,
-  decodeRunSseRequestId,
-  decodeBidiAppendRequest,
-  extractAgentModeFromPayload,
   summarizeConnectFrames,
-  summarizeAgentServerStream,
   buildAgentKvSetBlobFrame,
   buildAgentTextDeltaFrame,
   buildAgentThinkingDeltaFrame,
@@ -27,7 +22,10 @@ const {
   buildAgentPartialToolCallFrame,
   buildAgentToolCallStartedFrame,
   buildAgentToolCallCompletedFrame,
+  buildAgentTaskToolCallDeltaFrame,
   buildAgentEditToolCallDeltaFrame,
+  buildAgentBackgroundSubagentActionFrame,
+  buildAgentBackgroundTaskCompletionActionFrame,
   buildAgentConversationCheckpointFrame,
   buildAgentExecReadFrame,
   buildAgentExecWriteFrame,
@@ -41,7 +39,11 @@ const {
   buildStructuredToolCallSnapshot,
   extractOpenAiDelta,
 } = require('./cursor-relay-protocol');
-const { encodeMessage: encodeCursorProtoMessage } = require('./cursor-relay-protobuf');
+const {
+  decodeMessageSync: decodeCursorProtoMessageSync,
+  encodeMessage: encodeCursorProtoMessage,
+  encodeMessageSync: encodeCursorProtoMessageSync,
+} = require('./cursor-relay-protobuf');
 // v2 解码器（基于 protobufjs，返回兼容结构 + 完整解码对象，含 MCP/Skill 字段）
 const protocolV2 = require('./cursor-relay-protocol-v2');
 // 模型列表注入（拦截 AvailableModels/GetUsableModels 响应，注入本地模型）
@@ -61,6 +63,7 @@ const {
   beginTurn: beginAgentHistoryTurn,
   appendHistoryItem: appendAgentHistoryItem,
   completeTurn: completeAgentHistoryTurn,
+  mergeConversationMetadata: mergeAgentHistoryMetadata,
   updateConversationState: updateAgentHistoryConversationState,
   updateUsage: updateAgentHistoryUsage,
 } = require('./cursor-relay-agent-history');
@@ -194,6 +197,53 @@ function readRequestBody(req) {
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+function encodeLocalVarint(value) {
+  const out = [];
+  let n = Number(value) >>> 0;
+  while (n >= 0x80) {
+    out.push((n & 0x7f) | 0x80);
+    n >>>= 7;
+  }
+  out.push(n);
+  return Buffer.from(out);
+}
+
+function concatLocalBytes(parts = []) {
+  return Buffer.concat(parts.filter((part) => part != null).map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(part))));
+}
+
+function encodeLocalBytesField(field, value) {
+  const payload = Buffer.isBuffer(value) ? value : Buffer.from(String(value || ''), 'utf8');
+  return concatLocalBytes([
+    encodeLocalVarint((field << 3) | 2),
+    encodeLocalVarint(payload.length),
+    payload,
+  ]);
+}
+
+function encodeLocalInt32Field(field, value) {
+  return concatLocalBytes([
+    encodeLocalVarint((field << 3) | 0),
+    encodeLocalVarint(Number(value) || 0),
+  ]);
+}
+
+function encodeLocalMessage(fields = []) {
+  return concatLocalBytes(fields.map((field) => (
+    field && field.wire === 0
+      ? encodeLocalInt32Field(field.field, field.value)
+      : encodeLocalBytesField(field.field, field.value)
+  )));
+}
+
+function connectLocalFrame(type, payload) {
+  const bytes = Buffer.isBuffer(payload) ? payload : Buffer.from(payload || []);
+  const header = Buffer.alloc(5);
+  header[0] = Number(type) || 0;
+  header.writeUInt32BE(bytes.length, 1);
+  return Buffer.concat([header, bytes]);
 }
 
 function getRunnerMode(config = {}) {
@@ -816,19 +866,9 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
     const status = String(details.status || '');
     const requestId = session.requestId || '';
     const platformBilling = isPlatformBillingEnabled(config);
-    const isCacheHit = !!session._cacheHit;
     const activeUpstream = resolveUpstreamForModel(config, details.model || config.upstream?.modelName || '');
-    // 缓存命中：status 标记为 cache_hit，费用/token 归零，上游无消耗
-    const effectiveStatus = isCacheHit
-      ? 'cache_hit'
-      : (status === 'success' ? (platformBilling ? 'paid' : 'success') : status);
-    // 构建基础 meta
-    let meta = details.meta || null;
-    if (isCacheHit) {
-      const cacheMeta = { ...meta, cacheHit: { layer: session._cacheHit.layer, cachedAt: session._cacheHit.cachedAt } };
-      meta = cacheMeta;
-      session._cacheHit = null; // 用完清除，避免重复写入
-    }
+    const effectiveStatus = status === 'success' ? (platformBilling ? 'paid' : 'success') : status;
+    const meta = details.meta || null;
     const recorded = recordRelayUsage(getConfigCustomRoot(config), {
       requestId,
       conversationId: session.conversationId || '',
@@ -838,9 +878,9 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
       displayName: details.displayName || activeUpstream?.displayName || activeUpstream?.modelName || config.upstream?.displayName || config.upstream?.modelName || '',
       model: details.model || activeUpstream?.modelName || config.upstream?.modelName || '',
       status: effectiveStatus,
-      httpStatus: isCacheHit ? 0 : (details.httpStatus || 0),
-      error: isCacheHit ? '' : (details.error || ''),
-      usage: isCacheHit ? {} : usage,
+      httpStatus: details.httpStatus || 0,
+      error: details.error || '',
+      usage,
       durationMs: details.durationMs || 0,
       promptChars: details.promptChars || 0,
       responseTextChars: details.responseTextChars || 0,
@@ -852,18 +892,6 @@ function recordUpstreamUsagePhase(session, config, details = {}) {
       reasoningEffort: details.reasoningEffort || activeUpstream?.reasoningEffort || config.upstream?.reasoningEffort || '',
       platformBilling,
     });
-    // 缓存命中的 meta 已在写入时内嵌（上面的 meta 对象），不需要二次 append
-    // 非缓存命中但有 _cacheHit 残留的兜底路径
-    if (!isCacheHit && session._cacheHit && recorded?.id) {
-      try {
-        appendRelayUsageMeta(
-          getConfigCustomRoot(config),
-          recorded.id,
-          { cacheHit: { layer: session._cacheHit.layer, cachedAt: session._cacheHit.cachedAt } },
-        );
-        session._cacheHit = null;
-      } catch { /* ignore */ }
-    }
     if (platformBilling && status === 'success' && hasPositiveUsageTokens(usage)) {
       reportAdvancedModelUsage(config, {
         requestId,
@@ -914,17 +942,6 @@ async function fetchUpstreamCompletion(upstream, modelName, messages, logger, op
   const phase = String(options.phase || 'upstream');
 
   // ---- 响应缓存：查询（命中则直接回放，跳过上游请求） ----
-  const cacheKeys = responseCache.buildCacheKeys(modelName, messages, options);
-  if (cacheKeys && !(options.signal && options.signal.aborted)) {
-    const hit = responseCache.get(cacheKeys);
-    if (hit) {
-      logger?.info?.(
-        `agent local relay cache HIT requestId=${requestId} phase=${phase} layer=${hit.layer} hits=${hit.entry.hits || 0}`,
-      );
-      return { response: responseCache.buildCachedResponse(hit.entry), mode: 'cache' };
-    }
-  }
-
   let lastError = null;
   let lastResponse = null;
   const allowedToolNames = Array.isArray(options.allowedToolNames) && options.allowedToolNames.length
@@ -963,9 +980,6 @@ async function fetchUpstreamCompletion(upstream, modelName, messages, logger, op
         `agent local relay upstream fetch headers requestId=${requestId} phase=${phase} mode=${attempt.label} status=${response.status} ok=${response.ok ? '1' : '0'} contentType=${String(response.headers.get('content-type') || '-')}`,
       );
       if (response.ok) {
-        if (cacheKeys && response && typeof response === 'object') {
-          response._cacheKeys = cacheKeys;
-        }
         return { response, mode: attempt.label };
       }
 
@@ -1276,6 +1290,7 @@ function buildLocalRelayMessages(userText, session = {}) {
     deepSeekGuidance,
     conversationMemory,
     imageParts,
+    planWorkflowPhase: getPlanWorkflowPhase(session),
   });
   // 如果有 Skill/Rules 系统提示词，注入到系统消息中
   if (skillSystemPrompt) {
@@ -1911,6 +1926,7 @@ function emitPresentedPlanCheckpoint(session = {}, logger = null, options = {}) 
   const workspaceRoot = getSessionWorkspaceRoot(session);
   const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
   const contextUsage = session.contextUsageSnapshot || buildContextUsageSnapshot(session, null);
+  const subagentCheckpoint = buildSubagentCheckpointMaps(session);
   try {
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
       workspaceRoot,
@@ -1923,6 +1939,7 @@ function emitPresentedPlanCheckpoint(session = {}, logger = null, options = {}) 
       breakdown: contextUsage.breakdown,
       promptContextUsageTree: contextUsage.promptContextUsageTree,
       todos: Array.isArray(planState?.todos) ? planState.todos : [],
+      ...subagentCheckpoint,
     }));
     setPlanWorkflowPhase(session, workflow.phase, {
       checkpointEmittedForPlanUri: checkpointKey,
@@ -2689,6 +2706,46 @@ function finalizeInterceptedAgentSession(session) {
   }
 }
 
+function ensureQueuedAgentMessages(session) {
+  if (!session) return [];
+  if (!Array.isArray(session.queuedUserMessages)) session.queuedUserMessages = [];
+  return session.queuedUserMessages;
+}
+
+function enqueueQueuedAgentMessage(session, entry, logger, { priority = false, source = 'user_message' } = {}) {
+  if (!session || !entry?.userText) return 0;
+  const queue = ensureQueuedAgentMessages(session);
+  if (priority) queue.unshift(entry);
+  else queue.push(entry);
+  logger?.info?.(
+    `agent local relay queued in-session message requestId=${session.requestId || '-'} source=${source} priority=${priority ? '1' : '0'} queueSize=${queue.length} textLen=${String(entry.userText || '').length}`
+  );
+  return queue.length;
+}
+
+function drainQueuedAgentMessage(session, config, logger, stats, reason = 'turn_complete') {
+  if (!session || session.aborted || session.completed || session.relaying || session.waitingForInteraction) return false;
+  const queue = ensureQueuedAgentMessages(session);
+  const next = queue.shift();
+  if (!next?.userText) return false;
+  session.agentMode = normalizeAgentModeName(next.capture?.mode || session.agentMode || 'AGENT_MODE_AGENT');
+  session.lastUserMessageCapture = next.capture || session.lastUserMessageCapture || null;
+  session.workspaceRoot = normalizeWorkspacePath(next.workspaceRoot || next.capture?.workspaceRoot || session.workspaceRoot || '');
+  beginInterceptedAgentSession(session, logger);
+  logger?.info?.(
+    `agent local relay draining queued message requestId=${session.requestId || '-'} reason=${reason} remaining=${queue.length} workspaceRoot=${JSON.stringify(session.workspaceRoot || '')}`
+  );
+  relayAgentUserMessage(session, next.userText, config, logger, stats)
+    .catch((error) => failAgentRelaySession(session, logger, error, `queued_${reason}`));
+  return true;
+}
+
+function shouldQueueRunsseReplacement(existingSession = null) {
+  if (!existingSession || existingSession.aborted || existingSession.completed) return false;
+  if (existingSession.waitingForInteraction) return false;
+  return Boolean(existingSession.active || existingSession.relaying || existingSession.streamDetached);
+}
+
 function detachWaitingInteractionSession(session, logger, reason = 'runsse_closed') {
   if (!session || session.aborted || session.completed) return false;
   if (session.activeUpstreamResponse && typeof session.activeUpstreamResponse.destroy === 'function') {
@@ -2838,6 +2895,29 @@ function isAgentRunSsePath(pathname) {
 function isBidiAppendPath(pathname) {
   return pathname === BIDI_APPEND_PATH
     || /\/aiserver\.v1\.BidiService\/BidiAppend$/i.test(pathname);
+}
+
+function isTaskInitPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskInit$/i.test(String(pathname || ''));
+}
+
+function isTaskStreamLogPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskStreamLog$/i.test(String(pathname || ''));
+}
+
+function isTaskProvideResultPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskProvideResult$/i.test(String(pathname || ''));
+}
+
+function isTaskGetInterfaceAgentStatusPath(pathname) {
+  return /\/aiserver\.v1\.AiService\/TaskGetInterfaceAgentStatus$/i.test(String(pathname || ''));
+}
+
+function isNativeTaskRpcPath(pathname) {
+  return isTaskInitPath(pathname)
+    || isTaskStreamLogPath(pathname)
+    || isTaskProvideResultPath(pathname)
+    || isTaskGetInterfaceAgentStatusPath(pathname);
 }
 
 function isRepositoryServicePath(pathname) {
@@ -3158,6 +3238,16 @@ function getActiveRelayProfileModelName(availableModels = [], fallbackModel = ''
   return String(fallbackModel || normalizedAvailableModels[0] || '').trim();
 }
 
+function getActiveRelayProfile(customRoot = '') {
+  try {
+    const store = loadRelayProfileStore(customRoot);
+    if (!Array.isArray(store?.configs)) return null;
+    return store.configs.find((item) => String(item?.id || '') === String(store?.activeId || '')) || null;
+  } catch {
+    return null;
+  }
+}
+
 async function syncRequestedModelSelection(requestedModel, logger = null) {
   const modelName = String(requestedModel || '').trim();
   if (!modelName || modelName === 'default' || modelName === 'auto') return null;
@@ -3180,6 +3270,7 @@ async function syncRequestedModelSelection(requestedModel, logger = null) {
       availableModels: Array.isArray(store.configs)
         ? store.configs.map((item) => String(item?.modelName || '').trim()).filter(Boolean)
         : [modelName],
+      contextWindow: targetProfile.contextWindow,
     });
   } catch {
     /* ignore */
@@ -3401,9 +3492,9 @@ function logAgentRunSseResponseSummary(filePath, requestId, logger) {
   if (!filePath) return;
   try {
     const responseBody = fs.existsSync(filePath) ? fs.readFileSync(filePath) : Buffer.alloc(0);
-    const summary = summarizeAgentServerStream(responseBody, { maxSamples: 8 });
+    const summary = protocolV2.summarizeAgentServerStream(responseBody, { maxSamples: 8 });
     logger?.info?.(
-      `protocol RunSSE response requestId=${requestId || '-'} rawLen=${summary.rawLength} frames=${summary.frameCount} serverMessages=${JSON.stringify(summary.serverMessages)} interaction=${JSON.stringify(summary.interactionUpdates)} execTools=${JSON.stringify(summary.execServerTools)} connectErrors=${JSON.stringify(summary.connectErrors || []).slice(0, 500)} samples=${JSON.stringify(summary.samples).slice(0, 700)}`,
+      `protocol RunSSE response requestId=${requestId || '-'} frameTypes=${JSON.stringify(summary.frameTypes || [])} interaction=${JSON.stringify(summary.interactionUpdates || [])} execTools=${JSON.stringify(summary.execServerTools || [])} samples=${JSON.stringify(summary.samples || []).slice(0, 700)}`,
     );
   } catch (error) {
     logger?.error?.(`protocol RunSSE response summary failed requestId=${requestId || '-'}: ${error.message}`);
@@ -3413,9 +3504,9 @@ function logAgentRunSseResponseSummary(filePath, requestId, logger) {
 function logGeneratedAgentRunSseSummary(chunks, requestId, logger) {
   try {
     const responseBody = Buffer.concat((Array.isArray(chunks) ? chunks : []).map((chunk) => Buffer.from(chunk || [])));
-    const summary = summarizeAgentServerStream(responseBody, { maxSamples: 8 });
+    const summary = protocolV2.summarizeAgentServerStream(responseBody, { maxSamples: 8 });
     logger?.info?.(
-      `protocol RunSSE generated requestId=${requestId || '-'} rawLen=${summary.rawLength} frames=${summary.frameCount} serverMessages=${JSON.stringify(summary.serverMessages)} interaction=${JSON.stringify(summary.interactionUpdates)} execTools=${JSON.stringify(summary.execServerTools)} connectErrors=${JSON.stringify(summary.connectErrors || []).slice(0, 500)} samples=${JSON.stringify(summary.samples).slice(0, 700)}`,
+      `protocol RunSSE generated requestId=${requestId || '-'} frameTypes=${JSON.stringify(summary.frameTypes || [])} interaction=${JSON.stringify(summary.interactionUpdates || [])} execTools=${JSON.stringify(summary.execServerTools || [])} samples=${JSON.stringify(summary.samples || []).slice(0, 700)}`,
     );
   } catch (error) {
     logger?.error?.(`protocol RunSSE generated summary failed requestId=${requestId || '-'}: ${error.message}`);
@@ -3439,7 +3530,8 @@ function persistGeneratedAgentRunSseResponse(session, logger) {
 
 function writeAgentFrame(session, frame) {
   const buffer = Buffer.from(frame || []);
-  if (!buffer.length || !session?.active) return;
+  if (!buffer.length) return;
+  if (!session?.active) return;
   session.generatedChunks = session.generatedChunks || [];
   session.generatedChunks.push(buffer);
   try {
@@ -3503,6 +3595,7 @@ function emitPlanConversationCheckpointFrames(session, toolCall, execution, logg
   const workspaceRoot = getSessionWorkspaceRoot(session);
   const readPaths = Array.from(new Set((Array.isArray(session.readPaths) ? session.readPaths : []).filter(Boolean)));
   const contextUsage = session.contextUsageSnapshot || buildContextUsageSnapshot(session, null);
+  const subagentCheckpoint = buildSubagentCheckpointMaps(session);
   try {
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
       workspaceRoot,
@@ -3515,6 +3608,7 @@ function emitPlanConversationCheckpointFrames(session, toolCall, execution, logg
       breakdown: contextUsage.breakdown,
       promptContextUsageTree: contextUsage.promptContextUsageTree,
       todos: planTodos,
+      ...subagentCheckpoint,
     }));
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
       workspaceRoot,
@@ -3527,6 +3621,7 @@ function emitPlanConversationCheckpointFrames(session, toolCall, execution, logg
       breakdown: contextUsage.breakdown,
       promptContextUsageTree: contextUsage.promptContextUsageTree,
       todos: planTodos,
+      ...subagentCheckpoint,
     }));
     logger?.info?.(`agent local relay plan checkpoint emitted requestId=${session.requestId || '-'} planChars=${planText.length} planPath=${JSON.stringify(execution?.planPath || '')}`);
   } catch (error) {
@@ -3964,10 +4059,18 @@ function beginSessionHistoryTurn(session, config, options = {}) {
     clearSessionPlanPresentationState(session, { clearTodos: true });
   }
   const agentModeForHistory = getSessionAgentMode(session);
+  const modeHandler = getModeHandlerForSession(session);
   const requestedModelId = String(
     session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
   ).trim();
   if (session.agentHistory?.state) session.agentHistory.state.mode = getCursorModeDirectory(agentModeForHistory);
+  if (typeof modeHandler.buildModeHistoryMetadata === 'function') {
+    try {
+      mergeAgentHistoryMetadata(getHistory(session), modeHandler.buildModeHistoryMetadata(session) || {});
+    } catch (error) {
+      session?.logger?.warn?.(`agent history mode metadata failed requestId=${session?.requestId || '-'}: ${error.message}`);
+    }
+  }
   if (includeRequestContext) {
     appendSessionHistory(session, {
       role: 'user',
@@ -4458,6 +4561,7 @@ function emitAgentMutationCheckpointFrames(session, toolCall, execution, logger)
     filePath,
   ].filter(Boolean)));
   session.readPaths = readPaths;
+  const subagentCheckpoint = buildSubagentCheckpointMaps(session);
   try {
     const contextUsage = session.contextUsageSnapshot || buildContextUsageSnapshot(session, null);
     writeAgentFrame(session, buildAgentKvSetBlobFrame(beforeBlob.idBase64, beforeBlob.dataBase64, { id: nextKvServerMessageId(session) }));
@@ -4474,6 +4578,7 @@ function emitAgentMutationCheckpointFrames(session, toolCall, execution, logger)
       maxTokens: contextUsage.maxTokens,
       breakdown: contextUsage.breakdown,
       promptContextUsageTree: contextUsage.promptContextUsageTree,
+      ...subagentCheckpoint,
     }));
     writeAgentFrame(session, buildAgentConversationCheckpointFrame({
       workspaceRoot,
@@ -4485,6 +4590,7 @@ function emitAgentMutationCheckpointFrames(session, toolCall, execution, logger)
       maxTokens: contextUsage.maxTokens,
       breakdown: contextUsage.breakdown,
       promptContextUsageTree: contextUsage.promptContextUsageTree,
+      ...subagentCheckpoint,
     }));
     logger?.info?.(`agent local relay checkpoint emitted file=${JSON.stringify(filePath)} readPaths=${readPaths.length} contentBlob=${afterBlob.idBase64}`);
   } catch (error) {
@@ -5604,6 +5710,50 @@ function countLines(text) {
   return value.split(/\r?\n/).length;
 }
 
+function detectDestructiveWrite(filePath, beforeContent, afterContent) {
+  try {
+    const before = String(beforeContent || '');
+    const after = String(afterContent || '');
+    if (!before || !after) return null;
+    const beforeBytes = Buffer.byteLength(before, 'utf8');
+    const afterBytes = Buffer.byteLength(after, 'utf8');
+    if (beforeBytes < 500) return null;
+    if (afterBytes >= beforeBytes * 0.5) return null;
+    const beforeNonEmptyLines = new Set(
+      before.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('//')),
+    );
+    if (!beforeNonEmptyLines.size) return null;
+    let retained = 0;
+    beforeNonEmptyLines.forEach((line) => {
+      if (after.includes(line)) retained += 1;
+    });
+    const retainedRatio = retained / beforeNonEmptyLines.size;
+    if (retainedRatio >= 0.5) return null;
+    return {
+      beforeBytes,
+      afterBytes,
+      retainedRatio,
+      message: [
+        `Blocked suspicious full-file overwrite for ${filePath}.`,
+        `The existing file is ${beforeBytes} bytes, but the new contents are only ${afterBytes} bytes and retain ${(retainedRatio * 100).toFixed(0)}% of previous non-empty lines.`,
+        'This looks like a partial snippet was passed to Write/Edit and would delete unrelated existing code.',
+        'Read the file first, then use PatchEdit/StrReplace for targeted edits, or pass the complete final file contents to Write/Edit.',
+      ].join(' '),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function warnIfWriteLooksDestructive(filePath, beforeContent, afterContent, session) {
+  const detection = detectDestructiveWrite(filePath, beforeContent, afterContent);
+  if (!detection) return null;
+  session?.logger?.warn?.(
+    `agent local relay suspicious destructive write requestId=${session?.requestId || '-'} file=${filePath} beforeBytes=${detection.beforeBytes} afterBytes=${detection.afterBytes} retainedRatio=${detection.retainedRatio.toFixed(2)} blocked=1`,
+  );
+  return detection;
+}
+
 function buildSimpleUnifiedDiff(filePath, beforeContent, afterContent) {
   if (beforeContent === afterContent) return '';
   const beforeLines = String(beforeContent || '').split(/\r?\n/);
@@ -6163,6 +6313,12 @@ function buildModeRuntimeHelpers(session = {}) {
     isMutationToolName,
     isReadOnlyContextToolName,
     canonicalToolName,
+    getLatestSessionTaskRecord,
+    appendTaskLog,
+    setTaskStatus,
+    syncTaskRecordToGlobalRegistry,
+    splitTaskIntoPlanSteps,
+    buildTaskContextSnapshot,
     session,
   };
 }
@@ -6583,6 +6739,18 @@ async function executeRelayTool(toolCall, session, logger) {
       const filePath = resolveWorkspacePath(args.path || '', session);
       const contents = String(args.contents ?? args.content ?? args.fileText ?? '');
       const beforeContent = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+      // 安全防护：检测疑似"片段误覆盖"——已有文件较大但新内容明显只是小片段，
+      // 且新内容未包含原有大部分代码行时，记录告警（不阻断合法的全量重写）。
+      const destructiveWrite = warnIfWriteLooksDestructive(filePath, beforeContent, contents, session);
+      if (destructiveWrite) {
+        return {
+          ok: false,
+          tool: canonicalToolName(tool),
+          args: { ...args, path: filePath, workspaceRoot },
+          resultText: destructiveWrite.message,
+          durationMs: Date.now() - startedAt,
+        };
+      }
       fs.mkdirSync(path.dirname(filePath), { recursive: true });
       fs.writeFileSync(filePath, contents, 'utf8');
       session.readPaths = Array.from(new Set([...(Array.isArray(session.readPaths) ? session.readPaths : []), filePath]));
@@ -6859,9 +7027,31 @@ async function executeRelayTool(toolCall, session, logger) {
       };
     }
     if (lower === 'task') {
-      const execution = await executeTaskTool(args, session);
+      const execution = await executeTaskTool({
+        ...args,
+        tool_call_id: String(args.tool_call_id || args.toolCallId || session.currentExecutingToolCallId || '').trim(),
+      }, session);
       return {
         ...execution,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (
+      lower === 'reportbugfixresults'
+      || lower === 'report_bugfix_results'
+      || lower === 'debuglogs'
+      || lower === 'reproductionsteps'
+    ) {
+      const resultText = buildReportBugfixResultsText({ ...args, __toolName: lower }, session);
+      return {
+        ok: true,
+        tool: 'ReportBugfixResults',
+        args: {
+          toolName: lower,
+          summary: String(args.summary || '').trim(),
+          results: Array.isArray(args.results) ? args.results : [],
+        },
+        resultText,
         durationMs: Date.now() - startedAt,
       };
     }
@@ -7008,41 +7198,1447 @@ async function executeSemanticSearchTool(args = {}, session = {}) {
   };
 }
 
+function getSessionTaskRegistry(session = {}) {
+  if (!session.taskRegistry || typeof session.taskRegistry !== 'object') {
+    session.taskRegistry = {
+      subagents: new Map(),
+      order: [],
+    };
+  }
+  return session.taskRegistry;
+}
+
+function getGlobalTaskRegistry(config = {}) {
+  if (!config.__cursorPoolTaskRegistry || typeof config.__cursorPoolTaskRegistry !== 'object') {
+    config.__cursorPoolTaskRegistry = {
+      subagents: new Map(),
+      order: [],
+    };
+  }
+  return config.__cursorPoolTaskRegistry;
+}
+
+function buildSubagentCheckpointMaps(session = {}) {
+  const registry = getSessionTaskRegistry(session);
+  const subagentStates = {};
+  const subagentThreads = {};
+  const subagentRunsByParentToolCallId = {};
+  for (const taskId of Array.isArray(registry.order) ? registry.order : []) {
+    const record = registry.subagents.get(taskId);
+    if (!record) continue;
+    const taskUuid = String(record.taskUuid || record.agentId || '').trim();
+    if (!taskUuid) continue;
+    subagentStates[taskUuid] = JSON.stringify({
+      createdTimestampMs: Number(record.createdAt || Date.now()) || Date.now(),
+      lastUsedTimestampMs: Number(record.updatedAt || record.createdAt || Date.now()) || Date.now(),
+      subagentType: buildTaskSubagentTypeProto(String(record.subagentType || '').trim() || 'generalPurpose'),
+      modelId: String(record.model || '').trim() || undefined,
+      localState: {
+        taskUuid,
+        agentId: String(record.agentId || taskUuid).trim(),
+        title: String(record.title || record.name || '').trim(),
+        detail: String(record.summary || record.resultText || '').trim(),
+        status: String(record.status || '').trim(),
+        parentTaskUuid: String(record.parentTaskUuid || '').trim(),
+        childTaskIds: Array.isArray(record.childTaskIds) ? record.childTaskIds.slice() : [],
+        stableConversationId: String(record.stableConversationId || '').trim(),
+      },
+    });
+    if (record.stableConversationId) {
+      subagentThreads[taskUuid] = String(record.stableConversationId).trim();
+    }
+    const parentToolCallId = String(record.parentToolCallId || '').trim();
+    if (parentToolCallId) {
+      subagentRunsByParentToolCallId[parentToolCallId] = JSON.stringify({
+        parentToolCallId,
+        subagentId: taskUuid,
+        environment: 'SUBAGENT_EXECUTION_ENVIRONMENT_LOCAL',
+        status: record.status === 'completed'
+          ? 'SUBAGENT_RUN_STATUS_SUCCESS'
+          : record.status === 'failed'
+            ? 'SUBAGENT_RUN_STATUS_ERROR'
+            : 'SUBAGENT_RUN_STATUS_RUNNING',
+        title: String(record.title || record.name || '').trim(),
+        detail: String(record.summary || record.resultText || '').trim(),
+        transcriptPath: String(record.transcriptPath || '').trim(),
+        outputPath: String(record.outputPath || '').trim(),
+        completedTimestampMs: record.status === 'completed' || record.status === 'failed'
+          ? Number(record.updatedAt || record.createdAt || Date.now()) || Date.now()
+          : undefined,
+        completionReason: record.status === 'completed'
+          ? 'BACKGROUND_TASK_COMPLETION_REASON_TASK_FINISHED'
+          : 'BACKGROUND_TASK_COMPLETION_REASON_TASK_PROGRESS',
+      });
+    }
+  }
+  return {
+    subagentStates,
+    subagentThreads,
+    subagentRunsByParentToolCallId,
+  };
+}
+
+function getConfigAgentSessions(config = {}) {
+  if (!config.__cursorPoolAgentSessions || typeof config.__cursorPoolAgentSessions !== 'object') {
+    config.__cursorPoolAgentSessions = new Map();
+  }
+  return config.__cursorPoolAgentSessions;
+}
+
+function syncModeArtifactsToHistory(record = {}) {
+  const session = record?.__sessionRef;
+  if (!session) return;
+  const history = getHistory(session);
+  if (!history) return;
+  const agentMode = getSessionAgentMode(session);
+  if (agentMode === 'AGENT_MODE_MULTITASK') {
+    const existing = history.state?.metadata?.task_registry && typeof history.state.metadata.task_registry === 'object'
+      ? history.state.metadata.task_registry
+      : { order: [], items: {} };
+    const items = existing.items && typeof existing.items === 'object' ? { ...existing.items } : {};
+    items[record.taskUuid] = {
+      taskUuid: String(record.taskUuid || '').trim(),
+      title: String(record.title || record.name || '').trim(),
+      status: String(record.status || '').trim(),
+      parentTaskUuid: String(record.parentTaskUuid || '').trim(),
+      childTaskIds: Array.isArray(record.childTaskIds) ? record.childTaskIds.slice() : [],
+      summary: String(record.summary || record.resultText || '').trim(),
+      subagentType: String(record.subagentType || '').trim(),
+    };
+    const order = Array.isArray(existing.order) ? existing.order.slice() : [];
+    if (!order.includes(record.taskUuid)) order.push(record.taskUuid);
+    mergeAgentHistoryMetadata(history, {
+      task_registry: {
+        order,
+        items,
+      },
+    });
+    return;
+  }
+  if (agentMode === 'AGENT_MODE_DEBUG') {
+    mergeAgentHistoryMetadata(history, {
+      debug_artifacts: {
+        taskUuid: String(record.taskUuid || '').trim(),
+        title: String(record.title || record.name || '').trim(),
+        status: String(record.status || '').trim(),
+        debugLogs: Array.isArray(record.debugArtifacts?.debugLogs) ? record.debugArtifacts.debugLogs.slice() : [],
+        reproductionSteps: Array.isArray(record.debugArtifacts?.reproductionSteps) ? record.debugArtifacts.reproductionSteps.slice() : [],
+        bugfixResults: Array.isArray(record.debugArtifacts?.bugfixResults) ? record.debugArtifacts.bugfixResults.slice() : [],
+      },
+    });
+  }
+}
+
+function syncTaskRecordToGlobalRegistry(config = {}, record = {}) {
+  if (!record || typeof record !== 'object') return record;
+  const taskUuid = String(record.taskUuid || record.agentId || '').trim();
+  if (!taskUuid) return record;
+  const registry = getGlobalTaskRegistry(config);
+  record.taskUuid = taskUuid;
+  record.agentId = String(record.agentId || taskUuid).trim();
+  registry.subagents.set(taskUuid, record);
+  if (!registry.order.includes(taskUuid)) registry.order.push(taskUuid);
+  syncModeArtifactsToHistory(record);
+  return record;
+}
+
+function normalizeTaskLifecycleStatus(status = '') {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'running') return 'in_progress';
+  if (normalized === 'done' || normalized === 'success') return 'completed';
+  if (normalized === 'not_started') return 'pending';
+  return normalized || 'pending';
+}
+
+function collectKnownTaskIdentifiers(strings = []) {
+  const ids = new Set();
+  (Array.isArray(strings) ? strings : []).forEach((item) => {
+    const text = String(item || '').trim();
+    if (/^(?:task|mock-task|multitask|debug|explore|generalpurpose|shell|browser)[\w.-]*/i.test(text)) {
+      ids.add(text);
+    }
+  });
+  return Array.from(ids);
+}
+
+function findTaskRecordAcrossSessions(config = {}, identifiers = [], titleHint = '') {
+  const requested = Array.from(new Set((Array.isArray(identifiers) ? identifiers : []).map((item) => String(item || '').trim()).filter(Boolean)));
+  if (!requested.length) {
+    // No identifiers to look up — fall through to title-based matching below.
+  }
+  const sessions = getConfigAgentSessions(config);
+  for (const session of sessions.values()) {
+    const registry = getSessionTaskRegistry(session);
+    // Primary lookup: exact key match on taskUuid / agentId (the registry key).
+    for (const id of requested) {
+      if (registry.subagents.has(id)) return syncTaskRecordToGlobalRegistry(config, registry.subagents.get(id));
+    }
+    // Secondary lookup: match by parentToolCallId. The Cursor client opens
+    // TaskStreamLog using the callId from the taskToolCallDelta frame, which is
+    // record.parentToolCallId (e.g. "tool_abc123" or "tool_abc123.child.1") — NOT
+    // the taskUuid. Without this alias the child subagent cards can never resolve
+    // and fall back to a "Planning next moves" placeholder.
+    if (requested.length) {
+      for (const record of registry.subagents.values()) {
+        const recordToolCallId = String(record?.parentToolCallId || '').trim();
+        if (recordToolCallId && requested.includes(recordToolCallId)) {
+          return syncTaskRecordToGlobalRegistry(config, record);
+        }
+      }
+    }
+    const latest = getLatestSessionTaskRecord(session);
+    if (latest && titleHint) {
+      const haystack = `${latest.title || ''}\n${latest.name || ''}\n${latest.description || ''}\n${latest.prompt || ''}`.toLowerCase();
+      if (haystack.includes(String(titleHint || '').trim().toLowerCase())) {
+        return syncTaskRecordToGlobalRegistry(config, latest);
+      }
+    }
+  }
+  const registry = getGlobalTaskRegistry(config);
+  for (const id of requested) {
+    if (registry.subagents.has(id)) return registry.subagents.get(id);
+  }
+  // Global registry alias lookup by parentToolCallId as well.
+  if (requested.length) {
+    for (const record of registry.subagents.values()) {
+      const recordToolCallId = String(record?.parentToolCallId || '').trim();
+      if (recordToolCallId && requested.includes(recordToolCallId)) {
+        return record;
+      }
+    }
+  }
+  return null;
+}
+
+function decodePrintableTaskStrings(body) {
+  const buffer = Buffer.from(body || []);
+  const matches = buffer.toString('utf8').match(/[ -~]{4,}/g);
+  return Array.isArray(matches) ? matches.map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function decodeNativeTaskRpcBody(rpcName = '', rawBody = Buffer.alloc(0), logger = null) {
+  try {
+    if (rpcName === 'TaskInit') {
+      return decodeCursorProtoMessageSync('aiserver.v1.TaskInitRequest', rawBody);
+    }
+    if (rpcName === 'TaskStreamLog') {
+      return decodeCursorProtoMessageSync('aiserver.v1.TaskStreamLogRequest', rawBody);
+    }
+    if (rpcName === 'TaskProvideResult') {
+      return decodeCursorProtoMessageSync('aiserver.v1.TaskProvideResultRequest', rawBody);
+    }
+    if (rpcName === 'TaskGetInterfaceAgentStatus') {
+      return decodeCursorProtoMessageSync('aiserver.v1.TaskGetInterfaceAgentStatusRequest', rawBody);
+    }
+  } catch (error) {
+    logger?.warn?.(`native Task RPC decode fallback rpc=${rpcName}: ${error.message}`);
+  }
+  return null;
+}
+
+function collectTaskIdentifiersFromDecodedRpc(rpcName = '', decoded = {}) {
+  const identifiers = new Set();
+  const metadata = {
+    taskUuid: '',
+    titleHint: '',
+    descriptionHint: '',
+    startSequenceNumber: 0,
+    actionSequenceNumber: 0,
+  };
+  if (!decoded || typeof decoded !== 'object') return { identifiers: [], metadata };
+  const directTaskUuid = String(decoded.taskUuid || decoded.backgroundTaskUuid || '').trim();
+  if (directTaskUuid) {
+    identifiers.add(directTaskUuid);
+    metadata.taskUuid = directTaskUuid;
+  }
+  if (rpcName === 'TaskInit') {
+    const instruction = decoded.instruction && typeof decoded.instruction === 'object' ? decoded.instruction : {};
+    metadata.titleHint = String(instruction.text || '').trim().slice(0, 160);
+    metadata.descriptionHint = String(instruction.text || '').trim().slice(0, 1200);
+  } else if (rpcName === 'TaskStreamLog') {
+    metadata.startSequenceNumber = Number(decoded.startSequenceNumber) || 0;
+  } else if (rpcName === 'TaskProvideResult') {
+    metadata.actionSequenceNumber = Number(decoded.actionSequenceNumber) || 0;
+    const toolResult = decoded.toolResult && typeof decoded.toolResult === 'object' ? decoded.toolResult : {};
+    const chunks = [];
+    if (toolResult.output && typeof toolResult.output === 'object') {
+      chunks.push(String(toolResult.output.output || '').trim());
+    }
+    if (toolResult.error && typeof toolResult.error === 'object') {
+      chunks.push(String(toolResult.error.message || '').trim());
+    }
+    metadata.descriptionHint = chunks.filter(Boolean).join('\n').slice(0, 1200);
+  } else if (rpcName === 'TaskGetInterfaceAgentStatus') {
+    const state = decoded.interfaceAgentClientState && typeof decoded.interfaceAgentClientState === 'object'
+      ? decoded.interfaceAgentClientState
+      : {};
+    const candidates = [
+      state.interfaceRelativeWorkspacePath,
+      state.implementationRelativeWorkspacePath,
+      state.testRelativeWorkspacePath,
+    ].map((item) => String(item || '').trim()).filter(Boolean);
+    metadata.titleHint = candidates[0] || '';
+    metadata.descriptionHint = candidates.join('\n').slice(0, 1200);
+  }
+  return {
+    identifiers: Array.from(identifiers),
+    metadata,
+  };
+}
+
+function findTaskUuidInBody(body) {
+  const strings = decodePrintableTaskStrings(body);
+  return strings.find((item) => /^(?:task|mock-task|multitask|debug|explore|generalpurpose|shell|browser)[\w.-]*/i.test(item)) || '';
+}
+
+function safeTaskIdentifier(value = '', fallback = 'task') {
+  const text = String(value || '').trim() || fallback;
+  return text.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 120) || fallback;
+}
+
+function normalizeTaskSubagentTypeValue(subagentTypeValue) {
+  if (!subagentTypeValue) return '';
+  if (typeof subagentTypeValue === 'string') return String(subagentTypeValue).trim();
+  if (typeof subagentTypeValue !== 'object' || Array.isArray(subagentTypeValue)) return '';
+  const keys = Object.keys(subagentTypeValue).filter(Boolean);
+  if (!keys.length) return '';
+  const firstKey = String(keys[0]).trim();
+  const firstValue = String(subagentTypeValue[firstKey] || '').trim();
+  return firstValue || firstKey;
+}
+
+function buildTaskSummaryFromSearch(search = {}, args = {}) {
+  const matches = Array.isArray(search.matches) ? search.matches : [];
+  if (!matches.length) {
+    return `No relevant workspace matches found for ${JSON.stringify(String(args.prompt || args.description || '').trim() || 'the task')}.`;
+  }
+  return matches
+    .slice(0, 3)
+    .map((item, index) => {
+      const rel = String(item?.codeBlock?.relativeWorkspacePath || '').trim() || `match_${index + 1}`;
+      const preview = String(item?.codeBlock?.contents || '').trim();
+      return `${index + 1}. ${rel}${preview ? ` - ${preview}` : ''}`;
+    })
+    .join('\n');
+}
+
+function createTaskLogItem(sequenceNumber, type, text, isNotDone = true) {
+  return {
+    sequenceNumber: Number(sequenceNumber) || 1,
+    type: String(type || 'output').trim() || 'output',
+    text: String(text || '').trim(),
+    isNotDone: isNotDone === true,
+  };
+}
+
+function nextTaskSequence(record = {}) {
+  const log = Array.isArray(record.log) ? record.log : [];
+  if (!log.length) return 1;
+  return Math.max(0, ...log.map((item) => Number(item?.sequenceNumber) || 0)) + 1;
+}
+
+function appendTaskLog(record = {}, type = 'output', text = '', isNotDone = true) {
+  if (!record || !text) return null;
+  if (!Array.isArray(record.log)) record.log = [];
+  const item = createTaskLogItem(nextTaskSequence(record), type, text, isNotDone);
+  record.log.push(item);
+  record.updatedAt = Date.now();
+  return item;
+}
+
+function delayMs(ms = 0) {
+  const timeout = Math.max(0, Number(ms) || 0);
+  return new Promise((resolve) => setTimeout(resolve, timeout));
+}
+
+function setTaskStatus(record = {}, status = 'pending') {
+  if (!record) return record;
+  record.status = normalizeTaskLifecycleStatus(status);
+  record.updatedAt = Date.now();
+  return record;
+}
+
+function getTaskTitle(args = {}, subagentType = '') {
+  const explicitName = String(args.name || '').trim();
+  if (explicitName) return explicitName;
+  const normalized = String(subagentType || '').trim().toLowerCase();
+  if (normalized.includes('debug')) return 'Debug issue investigation';
+  if (normalized.includes('explore')) return 'Explore project and summarize';
+  if (normalized.includes('generalpurpose')) {
+    const prompt = String(args.prompt || args.description || '').trim();
+    if (prompt) return prompt.slice(0, 80);
+    return 'Task subagent';
+  }
+  const prompt = String(args.prompt || args.description || '').trim();
+  return prompt ? prompt.slice(0, 80) : 'Background task';
+}
+
+function buildTaskStartMessage(record = {}) {
+  const title = String(record.name || record.title || record.description || 'Task subagent').trim();
+  const label = title || 'Task subagent';
+  return `Started subagent: ${label}`;
+}
+
+function buildBackgroundTaskConversationSteps(record = {}) {
+  const label = String(record.name || record.title || 'Background task').trim() || 'Background task';
+  const summary = String(record.summary || '').trim();
+  return [
+    {
+      assistant_message: {
+        text: summary
+          ? `${buildTaskStartMessage(record)}\n\n${summary}`
+          : `${buildTaskStartMessage(record)}.`,
+      },
+    },
+  ];
+}
+
+function emitTaskProgressFrame(session = {}, record = {}) {
+  if (!session?.active || !record) return;
+  const toolCallId = String(record.parentToolCallId || record.taskUuid || record.agentId || '').trim();
+  if (!toolCallId) return;
+  const status = String(record.status || '').trim().toLowerCase();
+  const isTerminal = status === 'completed' || status === 'failed';
+  const deltaKind = isTerminal ? 'completed' : status === 'in_progress' ? 'started' : 'partial';
+  const taskArgs = {
+    description: String(record.description || '').trim(),
+    prompt: String(record.prompt || '').trim(),
+    // Pass the raw subagent-type string; buildTaskSubagentTypeProto() inside
+    // buildStructuredToolCallSnapshot resolves it to the correct SubagentType oneof.
+    subagent_type: String(record.subagentType || '').trim(),
+    model: String(record.model || '').trim(),
+    tool_call_id: toolCallId,
+    name: String(record.name || record.title || '').trim(),
+  };
+  const now = Date.now();
+  const execution = {
+    ok: status !== 'failed',
+    agentId: String(record.agentId || '').trim(),
+    isBackground: true,
+    durationMs: Math.max(0, now - Number(record.createdAt || now)),
+    // Only surface a result for terminal states. During partial/started the UI must
+    // see an unresolved tool call so it opens TaskStreamLog to fetch live logs —
+    // a pre-populated success result makes the client believe the task is done.
+    resultSuffix: isTerminal ? String(record.summary || record.resultText || '').trim() : '',
+    transcriptPath: isTerminal ? String(record.transcriptPath || '').trim() : '',
+    outputPath: String(record.outputPath || '').trim(),
+    includeResult: isTerminal,
+    startedAtMs: Number(record.createdAt) || now,
+    completedAtMs: isTerminal ? now : 0,
+  };
+  try {
+    const nativeFrame = buildAgentTaskToolCallDeltaFrame(deltaKind, taskArgs, toolCallId, '', { execution });
+    if (nativeFrame.length) {
+      writeAgentFrame(session, nativeFrame);
+    } else {
+      session.logger?.warn?.(`agent local relay task delta frame empty requestId=${session.requestId || '-'} taskId=${record.taskUuid || record.agentId || '-'} status=${status || 'unknown'}`);
+    }
+    // backgroundSubagentAction / backgroundTaskCompletionAction are client→server
+    // ConversationAction fields (AgentClientMessage.conversation_action = 4). The
+    // server InteractionUpdate oneof has NO conversation_action branch, so encoding
+    // them via InteractionUpdate silently produces empty frames. The taskToolCallDelta
+    // frames above are the sole server→client mechanism for subagent card lifecycle.
+  } catch {
+    /* ignore progress frame emission failures */
+  }
+}
+
+function appendTaskHistoryLifecycle(session = {}, record = {}, phase = 'started') {
+  if (!session || !record) return;
+  const toolCallId = String(record.parentToolCallId || record.taskUuid || record.agentId || '').trim();
+  if (!toolCallId) return;
+  const existingItems = Array.isArray(session?.agentHistory?.context?.items) ? session.agentHistory.context.items : [];
+  const hasToolCall = existingItems.some((entry) => (
+    entry?.role === 'assistant'
+    && entry?.kind === 'tool_call'
+    && String(entry?.tool_call_id || '').trim() === toolCallId
+  ));
+  const hasToolResult = existingItems.some((entry) => (
+    entry?.role === 'tool'
+    && entry?.kind === 'tool_result'
+    && String(entry?.tool_call_id || '').trim() === toolCallId
+  ));
+  const args = {
+    description: String(record.description || '').trim(),
+    prompt: String(record.prompt || '').trim(),
+    subagent_type: record.subagentType ? { [record.subagentType]: record.subagentType } : {},
+    model: String(record.model || '').trim(),
+    tool_call_id: toolCallId,
+    name: String(record.name || record.title || '').trim(),
+  };
+  if (!hasToolCall) {
+    appendSessionHistory(session, {
+      role: 'assistant',
+      kind: 'tool_call',
+      tool_call_id: toolCallId,
+      payload: {
+        tool_call_id: toolCallId,
+        tool_name: 'Task',
+        provider: '',
+        provider_status: phase === 'completed' ? 'completed' : 'started',
+        arguments: args,
+      },
+    });
+  }
+  if (phase !== 'completed' || hasToolResult) return;
+  const execution = {
+    ok: record.status !== 'failed',
+    agentId: String(record.agentId || '').trim(),
+    isBackground: true,
+    durationMs: Math.max(0, Date.now() - Number(record.createdAt || Date.now())),
+    resultText: String(record.resultText || '').trim(),
+    resultSuffix: String(record.summary || record.resultText || '').trim(),
+    transcriptPath: String(record.transcriptPath || '').trim(),
+    outputPath: String(record.outputPath || '').trim(),
+  };
+  const structuredToolCall = buildStructuredToolCallSnapshot('Task', args, execution, toolCallId);
+  appendSessionHistory(session, {
+    role: 'tool',
+    kind: 'tool_result',
+    tool_call_id: toolCallId,
+    payload: {
+      tool_call_id: toolCallId,
+      tool_name: 'Task',
+      arguments: JSON.stringify(args),
+      result_text: execution.resultText || execution.resultSuffix || '',
+      ok: Boolean(execution.ok),
+      duration_ms: Number(execution.durationMs) || 0,
+      ...(structuredToolCall ? { tool_call: structuredToolCall } : {}),
+    },
+  });
+}
+
+function splitTaskIntoPlanSteps(record = {}, args = {}) {
+  const normalizedType = String(record.subagentType || '').trim().toLowerCase();
+  const prompt = String(args.prompt || record.prompt || args.description || record.description || '').trim();
+  if (normalizedType.includes('debug')) {
+    return [
+      'Collect reproduction context and recent debug signals.',
+      'Inspect likely files and trace the failure path.',
+      'Summarize root cause, debug logs, and reproduction steps.',
+    ];
+  }
+  if (normalizedType.includes('explore')) {
+    return [
+      'Explore the workspace layout and identify relevant files.',
+      'Read the most relevant files and gather concise notes.',
+      'Summarize findings for the parent agent.',
+    ];
+  }
+  if (prompt) {
+    return [
+      `Scope the task: ${prompt}`,
+      'Inspect the most relevant workspace context.',
+      'Return a concise summary for the parent agent.',
+    ];
+  }
+  return [
+    'Scope the background task.',
+    'Inspect the most relevant workspace context.',
+    'Return a concise summary for the parent agent.',
+  ];
+}
+
+function buildTaskContextSnapshot(session = {}, record = {}) {
+  const workspaceRoot = String(getSessionWorkspaceRoot(session) || '').trim();
+  const readPaths = Array.isArray(session.readPaths) ? session.readPaths.slice(-8) : [];
+  const recentToolContext = getRecentToolResultContext(session, 4);
+  const recentToolNames = Array.isArray(session.toolResultSummaries)
+    ? session.toolResultSummaries.slice(-6).map((entry) => String(entry?.tool || '').trim()).filter(Boolean)
+    : [];
+  return {
+    workspaceRoot,
+    readPaths,
+    recentToolNames,
+    recentToolContext,
+    stableConversationId: String(getSessionStableConversationId(session) || '').trim(),
+    requestId: String(session.requestId || '').trim(),
+    taskTitle: String(record.title || record.name || '').trim(),
+    taskType: String(record.subagentType || '').trim(),
+  };
+}
+
+function buildLocalChildTaskToolPlan(record = {}, session = {}) {
+  const prompt = String(record?.prompt || record?.description || '').trim();
+  const title = String(record?.title || record?.name || '').trim();
+  const workspaceRoot = String(getSessionWorkspaceRoot(session) || '').trim();
+  const userTarget = resolveExistingWorkspaceFile(
+    extractTargetPathFromUserText(String(session?.lastUserMessageCapture?.userText || '').trim(), session),
+    session,
+  );
+  const recentReadPath = getRecentReadFilePath(session);
+  const recentEditedPath = getRecentEditedFilePath(session);
+  const recentPath = Array.isArray(session?.readPaths) && session.readPaths.length
+    ? String(session.readPaths[session.readPaths.length - 1] || '').trim()
+    : '';
+  const hintedPathMatch = prompt.match(/([A-Za-z]:\\[^\s]+|[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9_-]+)/);
+  const hintedPath = hintedPathMatch
+    ? resolveExistingWorkspaceFile(String(hintedPathMatch[1] || '').trim(), session)
+    : '';
+  const rawTargetPath = hintedPath || userTarget || recentReadPath || recentEditedPath || recentPath || workspaceRoot;
+  let targetPath = rawTargetPath;
+  try {
+    if (targetPath && fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()) {
+      const directoryFiles = walkFiles(targetPath, { max: 20, ignore: getSessionScanIgnoreNames(session) });
+      const preferred = directoryFiles.find((filePath) => /\.(js|ts|tsx|jsx|html|css|json|md)$/i.test(filePath));
+      if (preferred) targetPath = preferred;
+    }
+  } catch {
+    /* ignore */
+  }
+  const lowerPrompt = prompt.toLowerCase();
+  const lowerTitle = title.toLowerCase();
+  const combined = `${lowerTitle}\n${lowerPrompt}`;
+
+  if (!targetPath) {
+    return [{ name: 'LS', arguments: { path: workspaceRoot || '.' } }];
+  }
+  if (combined.includes('collect reproduction context and recent debug signals')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+      { name: 'ReadLints', arguments: { paths: [targetPath] } },
+      { name: 'Grep', arguments: { pattern: 'debug|error|warn|exception|ctx|canvas', path: workspaceRoot || targetPath, glob: path.basename(targetPath) } },
+    ];
+  }
+  if (combined.includes('inspect likely files and trace the failure path')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+      { name: 'Grep', arguments: { pattern: 'fetch|dbgLog|error|addEventListener|getContext|render|init', path: workspaceRoot || targetPath, glob: path.basename(targetPath) } },
+      { name: 'LS', arguments: { path: path.dirname(targetPath) } },
+    ];
+  }
+  if (combined.includes('summarize root cause, debug logs, and reproduction steps')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+      { name: 'ReadLints', arguments: { paths: [targetPath] } },
+      { name: 'Grep', arguments: { pattern: 'debug|error|fix|root cause|repro|reproduction', path: workspaceRoot || targetPath, glob: path.basename(targetPath) } },
+    ];
+  }
+  if (combined.includes('scope the task')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+      { name: 'Grep', arguments: { pattern: 'TODO|FIXME|debug|error|ctx|canvas', path: workspaceRoot || targetPath, glob: path.basename(targetPath) } },
+    ];
+  }
+  if (combined.includes('inspect the most relevant workspace context')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+      { name: 'ReadLints', arguments: { paths: [targetPath] } },
+      { name: 'LS', arguments: { path: path.dirname(targetPath) } },
+    ];
+  }
+  if (combined.includes('return a concise summary for the parent agent')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+      { name: 'Grep', arguments: { pattern: 'function|class|fetch|debug|error|fix|bug', path: workspaceRoot || targetPath, glob: path.basename(targetPath) } },
+    ];
+  }
+  if (lowerPrompt.includes('lint') || lowerPrompt.includes('diagnostic') || lowerPrompt.includes('error') || lowerPrompt.includes('debug')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+      { name: 'ReadLints', arguments: { paths: [targetPath] } },
+    ];
+  }
+  if (lowerPrompt.includes('grep') || lowerPrompt.includes('search') || lowerPrompt.includes('find')) {
+    return [
+      { name: 'Grep', arguments: { pattern: prompt, path: workspaceRoot || targetPath } },
+    ];
+  }
+  if (lowerPrompt.includes('summary') || lowerPrompt.includes('summarize')) {
+    return [
+      { name: 'Read', arguments: { path: targetPath } },
+    ];
+  }
+  return [
+    { name: 'Read', arguments: { path: targetPath } },
+  ];
+}
+
+function buildChildTaskSummaryFromExecutions(record = {}, executions = []) {
+  const items = (Array.isArray(executions) ? executions : []).filter(Boolean);
+  const successful = items.filter((item) => item.ok);
+  if (!successful.length) {
+    const failed = items.find((item) => !item.ok);
+    return String(failed?.resultText || 'Child task produced no usable output.').trim();
+  }
+  return successful.map((execution, index) => {
+    const tool = String(execution.tool || `Tool ${index + 1}`).trim();
+    const text = String(execution.resultText || '').trim();
+    const compact = text.length > 600 ? `${text.slice(0, 600)}...` : text;
+    return `${tool}: ${compact}`;
+  }).join('\n\n');
+}
+
+function buildForcedModeTaskToolCall(session = {}, userText = '') {
+  const mode = String(getSessionAgentMode(session) || '').trim();
+  const prompt = String(userText || session.lastUserMessageCapture?.userText || '').trim();
+  if (!prompt) return null;
+  if (mode === 'AGENT_MODE_MULTITASK') {
+    return {
+      name: 'Task',
+      arguments: {
+        description: prompt,
+        prompt,
+        subagent_type: { generalPurpose: 'generalPurpose' },
+        name: 'Multitask coordinator',
+      },
+    };
+  }
+  if (mode === 'AGENT_MODE_DEBUG') {
+    return {
+      name: 'Task',
+      arguments: {
+        description: prompt,
+        prompt: `${prompt}\n\nSummarize root cause, debug logs, and reproduction steps.`,
+        subagent_type: { debug: 'debug' },
+        name: 'Debug investigation',
+      },
+    };
+  }
+  return null;
+}
+
+function shouldPrependForcedModeTask(session = {}, toolCalls = []) {
+  const mode = String(getSessionAgentMode(session) || '').trim();
+  if (mode !== 'AGENT_MODE_MULTITASK' && mode !== 'AGENT_MODE_DEBUG') return false;
+  if (session.syntheticModeTaskStarted) return false;
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  if (!calls.length) return false;
+  return !calls.some((call) => String(call?.name || '').trim().toLowerCase() === 'task');
+}
+
+async function executeBackgroundTask(record = {}, args = {}, session = {}) {
+  const query = String(args.prompt || args.description || '').trim() || 'Explore the workspace';
+  const normalizedType = String(record.subagentType || '').trim().toLowerCase();
+  setTaskStatus(record, 'in_progress');
+  syncTaskRecordToGlobalRegistry(session.config || {}, record);
+  // Emit started delta ONLY for the parent task. Child tasks must NOT emit
+  // their own taskToolCallDelta frames — doing so creates orphaned "New Agent"
+  // cards in the UI that the client cancels when the turn ends. Children exist
+  // purely as log items inside the parent's TaskStreamLog stream.
+  emitTaskProgressFrame(session, record);
+  const childTaskIds = Array.isArray(record.childTaskIds) ? record.childTaskIds.slice() : [];
+  appendTaskLog(record, 'thought', `Planning task: ${query}`, true);
+  if (normalizedType.includes('debug')) {
+    appendTaskLog(record, 'thought', 'Reading project files and diagnostics relevant to the issue.', true);
+  } else {
+    appendTaskLog(record, 'thought', 'Exploring project files and collecting a concise summary.', true);
+  }
+  const childResults = await Promise.allSettled(childTaskIds.map(async (childId, index) => {
+    const childRecord = getSessionTaskRegistry(session).subagents.get(childId);
+    if (!childRecord) return null;
+    await delayMs(index * 120);
+    setTaskStatus(childRecord, 'in_progress');
+    // NOTE: intentionally NO emitTaskProgressFrame for children here.
+    // Child lifecycle is tracked via parent TaskStreamLog log items only.
+    appendTaskLog(childRecord, 'thought', `Running child task ${index + 1}.`, true);
+    appendTaskLog(record, 'output', `Child task ${index + 1} started: ${childRecord.title || childRecord.name || childId}`, true);
+    syncTaskRecordToGlobalRegistry(session.config || {}, childRecord);
+    syncTaskRecordToGlobalRegistry(session.config || {}, record);
+    const childPlan = buildLocalChildTaskToolPlan(childRecord, session);
+    const childExecutions = [];
+    for (const plannedTool of childPlan) {
+      appendTaskLog(childRecord, 'tool_action', `Running ${plannedTool.name}`, true);
+      // eslint-disable-next-line no-await-in-loop
+      const childExecution = await executeRelayTool({
+        id: `${String(childRecord.parentToolCallId || childRecord.taskUuid || childRecord.agentId || 'child').trim()}.${plannedTool.name.toLowerCase()}`,
+        name: plannedTool.name,
+        arguments: plannedTool.arguments || {},
+      }, session, session.logger || console);
+      childExecutions.push(childExecution);
+      appendTaskLog(
+        childRecord,
+        'tool_result',
+        String(childExecution.resultText || '').trim(),
+        !childExecution.ok,
+      );
+    }
+    const childSummary = buildChildTaskSummaryFromExecutions(childRecord, childExecutions);
+    childRecord.matches = [];
+    childRecord.summary = childSummary;
+    childRecord.resultText = childSummary;
+    appendTaskLog(childRecord, 'output', childSummary || childRecord.resultText || `Child task ${index + 1} finished.`, false);
+    setTaskStatus(childRecord, 'completed');
+    // NOTE: intentionally NO emitTaskProgressFrame for children on completion.
+    // The parent completed delta (below) covers the entire subtree.
+    appendTaskHistoryLifecycle(session, childRecord, 'completed');
+    appendTaskLog(record, 'output', `Child task ${index + 1} completed: ${childRecord.title || childRecord.name || childId}`, true);
+    syncTaskRecordToGlobalRegistry(session.config || {}, childRecord);
+    syncTaskRecordToGlobalRegistry(session.config || {}, record);
+    return childRecord;
+  }));
+  const completedChildren = childResults
+    .filter((result) => result.status === 'fulfilled' && result.value)
+    .map((result) => result.value);
+  const aggregateMatches = completedChildren.flatMap((child) => Array.isArray(child.matches) ? child.matches : []);
+  const fallbackSearch = completedChildren.length
+    ? null
+    : await executeSemanticSearchTool({ query, target_directories: [] }, session);
+  const summaryLines = completedChildren.length
+    ? completedChildren.map((child, index) => `${index + 1}. ${String(child.title || child.name || `Child task ${index + 1}`).trim()}${child.summary ? ` - ${child.summary}` : ''}`)
+    : [buildTaskSummaryFromSearch(fallbackSearch || {}, args)];
+  record.matches = completedChildren.length ? aggregateMatches : (Array.isArray(fallbackSearch?.matches) ? fallbackSearch.matches : []);
+  record.resultText = completedChildren.length
+    ? summaryLines.join('\n')
+    : String(fallbackSearch?.resultText || summaryLines.join('\n')).trim();
+  record.summary = summaryLines.join('\n');
+  childResults.forEach((result, index) => {
+    if (result.status === 'fulfilled') return;
+    const childRecord = getSessionTaskRegistry(session).subagents.get(childTaskIds[index]);
+    if (childRecord) {
+      setTaskStatus(childRecord, 'failed');
+      childRecord.resultText = String(result.reason?.message || result.reason || 'Child task failed').trim();
+      childRecord.summary = childRecord.resultText;
+      appendTaskLog(childRecord, 'output', `Child task failed: ${childRecord.resultText}`, false);
+      syncTaskRecordToGlobalRegistry(session.config || {}, childRecord);
+      // NOTE: no emitTaskProgressFrame for failed children either.
+      appendTaskHistoryLifecycle(session, childRecord, 'completed');
+    }
+    appendTaskLog(record, 'output', `Child task ${index + 1} failed: ${String(result.reason?.message || result.reason || 'unknown error').trim()}`, true);
+  });
+  if (normalizedType.includes('debug')) {
+    ensureDebugArtifactsForTask(record, query);
+  }
+  appendTaskLog(record, 'output', record.summary || record.resultText || 'Background task finished.', false);
+  setTaskStatus(record, 'completed');
+  syncTaskRecordToGlobalRegistry(session.config || {}, record);
+  // Emit COMPLETED delta for the PARENT task only. This single frame tells the
+  // client the entire background operation (including all children) is done.
+  // Must arrive before turnEnded to prevent "Cancelled" status.
+  emitTaskProgressFrame(session, record);
+  return record;
+}
+
+function scheduleBackgroundTask(record = {}, args = {}, session = {}, logger) {
+  Promise.resolve().then(async () => {
+    try {
+      await executeBackgroundTask(record, args, session);
+    } catch (error) {
+      setTaskStatus(record, 'failed');
+      record.resultText = String(error?.message || error || 'Task failed').trim();
+      record.summary = record.summary || record.resultText;
+      appendTaskLog(record, 'output', `Task failed: ${record.resultText}`, false);
+      syncTaskRecordToGlobalRegistry(session.config || {}, record);
+      emitTaskProgressFrame(session, record);
+      logger?.warn?.(`background task failed agentId=${record.agentId || record.taskUuid || '-'}: ${record.resultText}`);
+    }
+  });
+}
+
+async function waitForBackgroundExecutions(session = {}, executions = [], timeoutMs = 2500) {
+  const pendingTaskIds = (Array.isArray(executions) ? executions : [])
+    .map((entry) => String(entry?.execution?.taskUuid || '').trim())
+    .filter(Boolean);
+  if (!pendingTaskIds.length) return [];
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  while (Date.now() < deadline) {
+    const registry = getSessionTaskRegistry(session);
+    const incomplete = pendingTaskIds.filter((taskId) => {
+      const record = registry.subagents.get(taskId);
+      const status = String(record?.status || '').trim().toLowerCase();
+      return status === 'pending' || status === 'in_progress';
+    });
+    if (!incomplete.length) break;
+    // eslint-disable-next-line no-await-in-loop
+    await delayMs(80);
+  }
+  const registry = getSessionTaskRegistry(session);
+  return pendingTaskIds
+    .map((taskId) => registry.subagents.get(taskId))
+    .filter(Boolean);
+}
+
+function buildBackgroundExecutionContextMessages(records = []) {
+  const lines = [];
+  (Array.isArray(records) ? records : []).forEach((record, index) => {
+    const title = String(record?.title || record?.name || `Background task ${index + 1}`).trim();
+    const status = String(record?.status || '').trim() || 'unknown';
+    const summary = String(record?.summary || record?.resultText || '').trim();
+    const childCount = Array.isArray(record?.childTaskIds) ? record.childTaskIds.length : 0;
+    const debugArtifacts = record?.debugArtifacts && typeof record.debugArtifacts === 'object'
+      ? record.debugArtifacts
+      : null;
+    const debugHints = [];
+    if (Array.isArray(debugArtifacts?.debugLogs) && debugArtifacts.debugLogs.length) {
+      debugHints.push(`debugLogs=${debugArtifacts.debugLogs.length}`);
+    }
+    if (Array.isArray(debugArtifacts?.reproductionSteps) && debugArtifacts.reproductionSteps.length) {
+      debugHints.push(`reproductionSteps=${debugArtifacts.reproductionSteps.length}`);
+    }
+    if (Array.isArray(debugArtifacts?.bugfixResults) && debugArtifacts.bugfixResults.length) {
+      debugHints.push(`bugfixResults=${debugArtifacts.bugfixResults.length}`);
+    }
+    lines.push(
+      `${index + 1}. ${title} [${status}]${childCount ? ` childTasks=${childCount}` : ''}${summary ? ` - ${summary}` : ''}${debugHints.length ? ` (${debugHints.join(', ')})` : ''}`,
+    );
+  });
+  if (!lines.length) return [];
+  return [{
+    role: 'user',
+    content: [
+      'Background task update from the local runtime:',
+      ...lines,
+      'Use this latest task state when deciding whether to continue with tools or produce the final answer.',
+    ].join('\n'),
+  }];
+}
+
+function getLatestSessionTaskRecord(session = {}) {
+  const registry = getSessionTaskRegistry(session);
+  const latestId = String(session.lastTaskSubagentId || '').trim();
+  if (latestId && registry.subagents.has(latestId)) {
+    const latestRecord = registry.subagents.get(latestId);
+    const parentTaskUuid = String(latestRecord?.parentTaskUuid || '').trim();
+    if (parentTaskUuid && registry.subagents.has(parentTaskUuid)) return registry.subagents.get(parentTaskUuid);
+    return latestRecord;
+  }
+  const ordered = Array.isArray(registry.order) ? registry.order.slice() : [];
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const taskId = String(ordered[index] || '').trim();
+    if (!taskId || !registry.subagents.has(taskId)) continue;
+    const candidate = registry.subagents.get(taskId);
+    if (!String(candidate?.parentTaskUuid || '').trim()) return candidate;
+  }
+  const lastOrderedId = ordered.length ? String(ordered[ordered.length - 1] || '').trim() : '';
+  if (lastOrderedId && registry.subagents.has(lastOrderedId)) return registry.subagents.get(lastOrderedId);
+  return null;
+}
+
+function registerChildTaskRecord(parentRecord = {}, session = {}, stepText = '', index = 0) {
+  if (!parentRecord || !session) return null;
+  const parentToolCallId = String(parentRecord.parentToolCallId || parentRecord.taskUuid || parentRecord.agentId || 'task').trim();
+  const child = registerTaskSubagent(session, {
+    agentId: `${String(parentRecord.agentId || parentRecord.taskUuid || 'task').trim()}-child-${index + 1}`,
+    title: stepText || `Subtask ${index + 1}`,
+    name: stepText || `Subtask ${index + 1}`,
+    description: stepText,
+    prompt: stepText,
+    subagentType: 'generalPurpose',
+    parentToolCallId: `${parentToolCallId}.child.${index + 1}`,
+    status: 'pending',
+    summary: '',
+    resultText: '',
+    taskIndex: index + 1,
+    log: [
+      createTaskLogItem(1, 'instruction', stepText || `Subtask ${index + 1}`, true),
+      createTaskLogItem(2, 'thought', `Queued child task ${index + 1}.`, true),
+    ],
+  });
+  child.parentTaskUuid = String(parentRecord.taskUuid || parentRecord.agentId || '').trim();
+  if (!Array.isArray(parentRecord.childTaskIds)) parentRecord.childTaskIds = [];
+  parentRecord.childTaskIds.push(child.taskUuid);
+  appendTaskHistoryLifecycle(session, child, 'started');
+  return child;
+}
+
+function registerTaskSubagent(session = {}, payload = {}) {
+  const registry = getSessionTaskRegistry(session);
+  const createdAt = Date.now();
+  const subagentId = String(
+    payload.agentId
+    || `${String(payload.subagentType || 'task').trim() || 'task'}-${createdAt.toString(36)}`
+  ).trim();
+  const stableConversationId = String(getSessionStableConversationId(session) || '').trim();
+  const record = {
+    agentId: subagentId,
+    taskUuid: subagentId,
+    title: String(payload.title || payload.name || '').trim(),
+    parentRequestId: String(session.requestId || '').trim(),
+    stableConversationId,
+    description: String(payload.description || '').trim(),
+    prompt: String(payload.prompt || '').trim(),
+    subagentType: String(payload.subagentType || '').trim() || 'generalPurpose',
+    name: String(payload.name || '').trim(),
+    model: String(payload.model || '').trim(),
+    parentToolCallId: String(payload.parentToolCallId || '').trim(),
+    transcriptPath: String(payload.transcriptPath || '').trim(),
+    outputPath: String(payload.outputPath || '').trim(),
+    status: String(payload.status || 'completed').trim(),
+    resultText: String(payload.resultText || '').trim(),
+    summary: String(payload.summary || '').trim(),
+    createdAt,
+    updatedAt: createdAt,
+    parentTaskUuid: String(payload.parentTaskUuid || '').trim(),
+    childTaskIds: Array.isArray(payload.childTaskIds) ? payload.childTaskIds.slice() : [],
+    taskIndex: Number(payload.taskIndex) || 0,
+    matches: Array.isArray(payload.matches) ? payload.matches.slice() : [],
+    debugArtifacts: payload.debugArtifacts && typeof payload.debugArtifacts === 'object'
+      ? { ...payload.debugArtifacts }
+      : {},
+    log: Array.isArray(payload.log) ? payload.log.slice() : [],
+  };
+  record.__sessionRef = session;
+  registry.subagents.set(subagentId, record);
+  registry.order.push(subagentId);
+  session.lastTaskSubagentId = subagentId;
+  session.lastTaskSubagentSummary = record.summary;
+  syncTaskRecordToGlobalRegistry(session.config || {}, record);
+  return record;
+}
+
+function registerGlobalTaskSubagent(config = {}, payload = {}) {
+  const registry = getGlobalTaskRegistry(config);
+  const now = Date.now();
+  const taskUuid = String(payload.taskUuid || `task-${now.toString(36)}`).trim();
+  const title = String(payload.title || payload.name || 'Local multitask subagent').trim();
+  const summary = String(payload.summary || `Local subagent ${title} completed.`).trim();
+  const record = {
+    taskUuid,
+    agentId: taskUuid,
+    title,
+    description: String(payload.description || '').trim(),
+    prompt: String(payload.prompt || '').trim(),
+    subagentType: String(payload.subagentType || 'generalPurpose').trim(),
+    status: String(payload.status || 'completed').trim(),
+    summary,
+    resultText: String(payload.resultText || summary).trim(),
+    createdAt: now,
+    updatedAt: now,
+    parentTaskUuid: String(payload.parentTaskUuid || '').trim(),
+    childTaskIds: Array.isArray(payload.childTaskIds) ? payload.childTaskIds.slice() : [],
+    taskIndex: Number(payload.taskIndex) || 0,
+    matches: Array.isArray(payload.matches) ? payload.matches.slice() : [],
+    debugArtifacts: payload.debugArtifacts && typeof payload.debugArtifacts === 'object'
+      ? { ...payload.debugArtifacts }
+      : {},
+    log: Array.isArray(payload.log) && payload.log.length
+      ? payload.log
+      : [
+        createTaskLogItem(1, 'thought', `Started ${title}.`, true),
+        createTaskLogItem(2, 'output', String(payload.prompt || payload.description || 'Inspecting assigned context.').trim(), true),
+        createTaskLogItem(3, 'output', summary, false),
+      ],
+  };
+  registry.subagents.set(taskUuid, record);
+  if (!registry.order.includes(taskUuid)) registry.order.push(taskUuid);
+  return record;
+}
+
+function getOrCreateGlobalTaskSubagent(config = {}, taskUuid = '', payload = {}) {
+  const registry = getGlobalTaskRegistry(config);
+  const requested = String(taskUuid || '').trim();
+  if (requested && registry.subagents.has(requested)) return registry.subagents.get(requested);
+  const fallbackId = requested || `task-${Date.now().toString(36)}`;
+  return registerGlobalTaskSubagent(config, { ...payload, taskUuid: fallbackId });
+}
+
+function encodeTaskInitResponsePayload(task = {}) {
+  return encodeCursorProtoMessageSync('aiserver.v1.TaskInitResponse', {
+    taskUuid: String(task.taskUuid || task.agentId || '').trim(),
+    humanReadableTitle: String(task.title || task.name || 'Local multitask subagent').trim(),
+  });
+}
+
+// Returns a plain JS object describing a TaskLogItem. The caller (typically
+// encodeTaskStreamLogFrame) is responsible for the final protobuf encoding so
+// the nested oneof survives — passing a pre-encoded Buffer through
+// encodeCursorProtoMessageSync would silently drop the log_item content.
+function buildTaskLogItemObject(item = {}) {
+  const type = String(item.type || '').trim().toLowerCase();
+  const text = String(item.text || '').trim();
+  const payload = {
+    sequenceNumber: Number(item.sequenceNumber) || 1,
+    isNotDone: item.isNotDone === true,
+  };
+  if (type === 'thought') payload.thought = { text };
+  else if (type === 'instruction') payload.instruction = { text };
+  else if (type === 'user_message') payload.userMessage = { text };
+  else if (type === 'tool_action') {
+    payload.toolAction = {
+      userFacingText: text,
+    };
+  } else if (type === 'tool_result') {
+    const actionSeq = Number(item.actionSequenceNumber) || Math.max(0, (Number(item.sequenceNumber) || 1) - 1);
+    payload.toolResult = {
+      actionSequenceNumber: actionSeq,
+      toolResult: text ? { output: { output: text.slice(0, 4000) } } : {},
+    };
+  } else payload.output = { text };
+  return payload;
+}
+
+function encodeTaskLogItemPayload(item = {}) {
+  return encodeCursorProtoMessageSync('aiserver.v1.TaskLogItem', buildTaskLogItemObject(item));
+}
+
+function encodeTaskStreamLogFrame(responseField, payload) {
+  let body = Buffer.alloc(0);
+  if (responseField === 1) {
+    body = encodeCursorProtoMessageSync('aiserver.v1.TaskStreamLogResponse', {
+      streamedLogItem: payload,
+    });
+  } else if (responseField === 2) {
+    body = encodeCursorProtoMessageSync('aiserver.v1.TaskStreamLogResponse', {
+      infoUpdate: payload,
+    });
+  } else if (responseField === 3) {
+    body = encodeCursorProtoMessageSync('aiserver.v1.TaskStreamLogResponse', {
+      initialTaskInfo: payload,
+    });
+  }
+  return connectLocalFrame(0, body);
+}
+
+function encodeTaskStatusValue(status = '') {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'pending') return 4;
+  if (normalized === 'in_progress' || normalized === 'running') return 1;
+  if (normalized === 'completed' || normalized === 'failed') return 3;
+  return 0;
+}
+
+function encodeTaskInterfaceStatusFrame(task = {}) {
+  return connectLocalFrame(0, encodeCursorProtoMessageSync('aiserver.v1.TaskGetInterfaceAgentStatusResponseWrapped', {
+    realResponse: {
+      status: {},
+    },
+  }));
+}
+
+function encodeTaskProvideResultResponsePayload() {
+  return encodeCursorProtoMessageSync('aiserver.v1.TaskProvideResultResponse', {});
+}
+
+function writeTaskEventStream(res, frames = []) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connect-Protocol-Version': '1',
+    'X-Accel-Buffering': 'no',
+  });
+  frames.forEach((frame, index) => {
+    setTimeout(() => {
+      try {
+        if (!res.destroyed) res.write(frame);
+        if (index === frames.length - 1 && !res.destroyed) {
+          setTimeout(() => {
+            try { res.end(); } catch {}
+          }, 40);
+        }
+      } catch {
+        /* ignore client close */
+      }
+    }, index * 25);
+  });
+}
+
+function getMaxTaskLogSeq(task = {}) {
+  const log = Array.isArray(task.log) ? task.log : [];
+  if (!log.length) return 0;
+  return Math.max(0, ...log.map((item) => Number(item?.sequenceNumber) || 0));
+}
+
+// Live server-streaming TaskStreamLog: sends initial_task_info, existing logs,
+// then keeps the stream open and pushes info_update / streamed_log_item frames
+// as the task progresses. Closes when the task reaches a terminal status or
+// after maxWaitMs (the client will re-poll using last_log_sequence_number).
+function handleTaskStreamLogLive(res, task, startSequenceNumber, logger) {
+  let closed = false;
+  let lastSentSeq = Math.max(0, Number(startSequenceNumber) || 0) - 1;
+  let lastSentStatus = null;
+  let lastSentTitle = null;
+  const maxWaitMs = 30000;
+  const pollIntervalMs = 300;
+  const startTime = Date.now();
+
+  const safeWrite = (frame) => {
+    if (closed || res.destroyed) return false;
+    try {
+      res.write(frame);
+      return true;
+    } catch {
+      closed = true;
+      return false;
+    }
+  };
+
+  const closeStream = () => {
+    if (closed) return;
+    closed = true;
+    try { res.end(); } catch {}
+  };
+
+  const sendInitialInfo = () => {
+    const title = String(task.title || task.name || '').trim();
+    const info = {
+      humanReadableTitle: title,
+      taskStatus: encodeTaskStatusValue(task.status),
+      lastLogSequenceNumber: getMaxTaskLogSeq(task),
+    };
+    safeWrite(encodeTaskStreamLogFrame(3, info));
+    lastSentStatus = String(task.status || '').trim().toLowerCase();
+    lastSentTitle = title;
+  };
+
+  const sendLogItemsFrom = (fromSeq) => {
+    const log = Array.isArray(task.log) ? task.log : [];
+    log.forEach((item) => {
+      const seq = Number(item?.sequenceNumber) || 0;
+      if (seq > fromSeq) {
+        safeWrite(encodeTaskStreamLogFrame(1, buildTaskLogItemObject(item)));
+        if (seq > lastSentSeq) lastSentSeq = seq;
+      }
+    });
+  };
+
+  const sendInfoUpdateIfChanged = () => {
+    const title = String(task.title || task.name || '').trim();
+    const currentStatus = String(task.status || '').trim().toLowerCase();
+    if (currentStatus === lastSentStatus && title === lastSentTitle) return;
+    const update = {
+      humanReadableTitle: title,
+      taskStatus: encodeTaskStatusValue(task.status),
+    };
+    safeWrite(encodeTaskStreamLogFrame(2, update));
+    lastSentStatus = currentStatus;
+    lastSentTitle = title;
+  };
+
+  const poll = () => {
+    if (closed || res.destroyed) return;
+    sendLogItemsFrom(lastSentSeq);
+    sendInfoUpdateIfChanged();
+    const currentStatus = String(task.status || '').trim().toLowerCase();
+    const isDone = currentStatus === 'completed' || currentStatus === 'failed';
+    const isTimeout = Date.now() - startTime > maxWaitMs;
+    if (isDone) {
+      // Final flush: ensure any trailing log items + terminal status are delivered.
+      sendLogItemsFrom(lastSentSeq);
+      sendInfoUpdateIfChanged();
+      setTimeout(closeStream, 60);
+      return;
+    }
+    if (isTimeout) {
+      closeStream();
+      return;
+    }
+    setTimeout(poll, pollIntervalMs);
+  };
+
+  res.on('close', () => { closed = true; });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connect-Protocol-Version': '1',
+    'X-Accel-Buffering': 'no',
+  });
+
+  sendInitialInfo();
+  sendLogItemsFrom(lastSentSeq);
+
+  const currentStatus = String(task.status || '').trim().toLowerCase();
+  if (currentStatus === 'completed' || currentStatus === 'failed') {
+    sendInfoUpdateIfChanged();
+    setTimeout(closeStream, 60);
+  } else {
+    setTimeout(poll, pollIntervalMs);
+  }
+
+  logger?.info?.(`TaskStreamLog live stream opened taskUuid=${task.taskUuid || task.agentId || '-'} startSeq=${startSequenceNumber} status=${currentStatus || 'unknown'}`);
+}
+
+function formatTaskExecutionResult(record = {}) {
+  const lines = [
+    `Task subagent ${record.agentId} completed.`,
+    `type=${record.subagentType || 'generalPurpose'}`,
+  ];
+  if (record.name) lines.push(`name=${record.name}`);
+  if (record.model) lines.push(`model=${record.model}`);
+  if (record.summary) lines.push('', record.summary);
+  else if (record.resultText) lines.push('', record.resultText);
+  return trimToolOutput(lines.join('\n'));
+}
+
+function normalizeReportBugfixToolName(args = {}) {
+  return String(args.__toolName || args.toolName || '').trim().toLowerCase();
+}
+
+function getOrCreateDebugArtifactsContainer(record = {}) {
+  if (!record.debugArtifacts || typeof record.debugArtifacts !== 'object') {
+    record.debugArtifacts = {};
+  }
+  if (!Array.isArray(record.debugArtifacts.debugLogs)) {
+    record.debugArtifacts.debugLogs = [];
+  }
+  if (!Array.isArray(record.debugArtifacts.reproductionSteps)) {
+    record.debugArtifacts.reproductionSteps = [];
+  }
+  if (!Array.isArray(record.debugArtifacts.bugfixResults)) {
+    record.debugArtifacts.bugfixResults = [];
+  }
+  return record.debugArtifacts;
+}
+
+function ensureDebugArtifactsForTask(record = {}, query = '') {
+  if (!record || typeof record !== 'object') return;
+  const artifacts = getOrCreateDebugArtifactsContainer(record);
+  const normalizedQuery = String(query || record.prompt || record.description || '').trim();
+  const summary = String(record.summary || record.resultText || '').trim();
+
+  // Populate the debug-artifacts container (used for history metadata and
+  // isDebugEvidenceMissing checks) but DO NOT append synthesized "evidence"
+  // output items to the task log. The task log is streamed to the Cursor UI
+  // via TaskStreamLog — synthesized entries like "Debug Logs captured: ..."
+  // pollute the subagent card with fake evidence and drown out the real
+  // tool_action / tool_result items from actual Read/Grep/Diagnostics calls.
+  if (!artifacts.debugLogs.length) {
+    artifacts.debugLogs.push(
+      normalizedQuery ? `Investigation target: ${normalizedQuery}` : 'Debug investigation',
+      summary || 'Findings collected from workspace tools.',
+    );
+  }
+
+  if (!artifacts.reproductionSteps.length) {
+    artifacts.reproductionSteps.push(
+      normalizedQuery ? `Reproduce: ${normalizedQuery}` : 'Reproduce the reported issue.',
+      'Inspect diagnostics and relevant source files.',
+      'Verify the fix with the appropriate validation command.',
+    );
+  }
+
+  if (!artifacts.bugfixResults.length) {
+    artifacts.bugfixResults.push({
+      summary: summary || 'Debug investigation completed.',
+      results: [{
+        title: String(record.title || record.name || 'Bugfix verification').trim() || 'Bugfix verification',
+        status: 'completed',
+        summary: summary || 'Investigation finished with evidence from workspace tools.',
+      }],
+    });
+  }
+}
+
+function attachBugfixArtifactsToTask(record = {}, args = {}, toolName = '') {
+  if (!record || typeof record !== 'object') return;
+  const artifacts = getOrCreateDebugArtifactsContainer(record);
+  const summary = String(args.summary || '').trim();
+  const results = Array.isArray(args.results) ? args.results : [];
+  const normalized = String(toolName || '').trim().toLowerCase();
+  if (normalized === 'debuglogs') {
+    if (summary) artifacts.debugLogs.push(summary);
+    results.forEach((item) => {
+      const text = String(item?.summary || item?.detail || item?.title || '').trim();
+      if (text) artifacts.debugLogs.push(text);
+    });
+    if (summary) appendTaskLog(record, 'output', `Debug Logs captured: ${summary}`, false);
+    results.forEach((item, index) => {
+      const text = String(item?.summary || item?.detail || item?.title || `Debug log ${index + 1}`).trim();
+      if (text) appendTaskLog(record, 'output', `Debug log ${index + 1}: ${text}`, false);
+    });
+    return;
+  }
+  if (normalized === 'reproductionsteps') {
+    if (summary) artifacts.reproductionSteps.push(summary);
+    results.forEach((item) => {
+      const text = String(item?.summary || item?.detail || item?.title || '').trim();
+      if (text) artifacts.reproductionSteps.push(text);
+    });
+    if (summary) appendTaskLog(record, 'output', `Reproduction Steps captured: ${summary}`, false);
+    results.forEach((item, index) => {
+      const text = String(item?.summary || item?.detail || item?.title || `Step ${index + 1}`).trim();
+      if (text) appendTaskLog(record, 'output', `Reproduction step ${index + 1}: ${text}`, false);
+    });
+    return;
+  }
+  const entry = {
+    summary,
+    results: results.map((item) => ({
+      title: String(item?.title || '').trim(),
+      status: String(item?.status || '').trim(),
+      summary: String(item?.summary || item?.detail || '').trim(),
+    })),
+  };
+  artifacts.bugfixResults.push(entry);
+  if (summary) appendTaskLog(record, 'output', `Bug analysis summary: ${summary}`, false);
+  results.forEach((item, index) => {
+    const title = String(item?.title || `Result ${index + 1}`).trim();
+    const status = String(item?.status || '').trim();
+    const detail = String(item?.summary || item?.detail || '').trim();
+    appendTaskLog(record, 'output', `${title}${status ? ` [${status}]` : ''}${detail ? `: ${detail}` : ''}`, false);
+  });
+}
+
+function buildReportBugfixResultsText(args = {}, session = {}) {
+  const toolName = normalizeReportBugfixToolName(args);
+  const record = getLatestSessionTaskRecord(session);
+  if (record) {
+    attachBugfixArtifactsToTask(record, args, toolName);
+    if (toolName === 'debuglogs' || toolName === 'reproductionsteps') {
+      setTaskStatus(record, record.status === 'pending' ? 'in_progress' : record.status || 'in_progress');
+    }
+    syncTaskRecordToGlobalRegistry(session.config || {}, record);
+    if (record.summary) session.lastTaskSubagentSummary = record.summary;
+  }
+  const summary = String(args.summary || '').trim();
+  const results = Array.isArray(args.results) ? args.results : [];
+  const lines = [];
+  if (toolName === 'debuglogs') lines.push('Debug Logs recorded.');
+  if (toolName === 'reproductionsteps') lines.push('Reproduction Steps recorded.');
+  if (summary) lines.push(summary);
+  results.forEach((item, index) => {
+    const title = String(item?.title || `Result ${index + 1}`).trim();
+    const status = String(item?.status || '').trim();
+    const detail = String(item?.summary || '').trim();
+    lines.push(`- ${title}${status ? ` [${status}]` : ''}${detail ? `: ${detail}` : ''}`);
+  });
+  if (!lines.length && session.lastTaskSubagentSummary) {
+    lines.push(String(session.lastTaskSubagentSummary || '').trim());
+  }
+  return trimToolOutput(lines.join('\n') || 'Bugfix results recorded.');
+}
+
 async function executeTaskTool(args = {}, session = {}) {
   const description = String(args.description || '').trim();
   const prompt = String(args.prompt || '').trim();
-  const subagentType = args.subagent_type || args.subagentType || {};
-  const isExplore = typeof subagentType === 'object'
-    ? Object.prototype.hasOwnProperty.call(subagentType, 'explore')
-    : /explore/i.test(String(subagentType || ''));
-  if (isExplore) {
-    const query = prompt || description || 'Explore the workspace';
-    const search = await executeSemanticSearchTool({ query, target_directories: [] }, session);
-    return {
-      ok: true,
-      tool: 'Task',
-      args,
-      resultText: trimToolOutput([
-        `Explore task completed${description ? `: ${description}` : ''}.`,
-        search.resultText,
-      ].join('\n')),
-      conversationSteps: [
-        {
-          assistant_message: {
-            text: search.resultText,
-          },
-        },
-      ],
-      agentId: `explore-${Date.now().toString(36)}`,
-      isBackground: false,
-      durationMs: 0,
-    };
-  }
+  const subagentType = normalizeTaskSubagentTypeValue(args.subagent_type || args.subagentType || '');
+  const record = registerTaskSubagent(session, {
+    description,
+    prompt,
+    subagentType: subagentType || 'generalPurpose',
+    title: getTaskTitle(args, subagentType),
+    name: String(args.name || '').trim(),
+    model: String(args.model || '').trim(),
+    parentToolCallId: String(args.tool_call_id || args.toolCallId || '').trim(),
+    resultText: '',
+    summary: '',
+    status: 'pending',
+    log: [
+      createTaskLogItem(1, 'instruction', prompt || description || 'Reviewing assigned task context.', true),
+      createTaskLogItem(2, 'thought', 'Subagent queued.', true),
+    ],
+  });
+  const childSteps = splitTaskIntoPlanSteps(record, args);
+  record.childTaskIds = [];
+  childSteps.forEach((step, index) => {
+    const childRecord = registerChildTaskRecord(record, session, step, index);
+    if (childRecord) {
+      appendTaskLog(record, 'output', `Child task ${index + 1} queued: ${step}`, true);
+    }
+  });
+  syncTaskRecordToGlobalRegistry(session.config || {}, record);
+  emitTaskProgressFrame(session, record);
+  scheduleBackgroundTask(record, args, session, session.logger || console);
   return {
-    ok: false,
+    ok: true,
     tool: 'Task',
-    args,
-    resultText: 'Only explore-style Task calls are currently supported in local relay mode.',
+    args: {
+      ...args,
+      subagent_type: subagentType ? { [subagentType]: subagentType } : (args.subagent_type || args.subagentType || {}),
+      model: String(args.model || '').trim(),
+      name: String(args.name || '').trim(),
+    },
+    resultText: buildTaskStartMessage(record),
+    conversationSteps: buildBackgroundTaskConversationSteps(record),
+    matches: [],
+    agentId: record.agentId,
+    taskUuid: record.taskUuid,
+    isBackground: true,
+    subagentType: record.subagentType,
+    taskSummary: record.summary,
+    parentToolCallId: record.parentToolCallId,
+    transcriptPath: record.transcriptPath,
+    outputPath: record.outputPath,
     durationMs: 0,
   };
 }
@@ -7070,11 +8666,6 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
   let durationMs = 0;
   let eventTypes = '';
   let stopReason = '';
-  // 检测缓存回放：伪 Response 上有 _fromCache 标记
-  if (upstream && typeof upstream === 'object' && upstream._fromCache) {
-    session._cacheHit = { layer: upstream._cacheLayer || 'unknown', cachedAt: upstream._cachedAt || Date.now() };
-    session.logger?.info?.(`agent local relay cache replay detected requestId=${session.requestId || '-'} phase=${phase} layer=${upstream._cacheLayer}`);
-  }
   session.logger?.info?.(`agent local relay upstream stream start requestId=${session.requestId || '-'} phase=${phase}`);
   try {
     session.currentUpstreamToolState = toolState;
@@ -7201,19 +8792,6 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
       flushAgentTextToHistory(session);
     }
     // ---- 响应缓存：写入（仅完整成功的响应） ----
-    if (upstream && upstream._cacheKeys && !session.aborted && !upstreamError) {
-      try {
-        responseCache.set(upstream._cacheKeys, {
-          text: textParts.join(''),
-          reasoning: reasoningParts.join(''),
-          upstreamError,
-          toolCalls: normalizeCollectedToolCalls(toolState),
-          model: String(session.configuredModel || session.modelName || options.model || ''),
-        });
-      } catch {
-        /* ignore cache write errors */
-      }
-    }
   }
   return {
     text: textParts.join(''),
@@ -7253,6 +8831,22 @@ function shouldRecoverPostToolStream(upstreamError, finalText, toolCalls = [], r
   // After a prior post-tool stall, text-only without tool calls is still structurally incomplete.
   if (recoveryCount > 0) return true;
   return false;
+}
+
+function shouldRecoverPostToolStreamByMode(session = {}, upstreamError = '', finalText = '', toolCalls = [], recoveryCount = 0) {
+  const handler = getModeHandlerForSession(session);
+  const helpers = buildModeRuntimeHelpers(session);
+  if (typeof handler.shouldRecoverPostToolStream === 'function') {
+    return Boolean(handler.shouldRecoverPostToolStream(
+      session,
+      upstreamError,
+      finalText,
+      toolCalls,
+      recoveryCount,
+      helpers,
+    ));
+  }
+  return shouldRecoverPostToolStream(upstreamError, finalText, toolCalls, recoveryCount);
 }
 
 function buildPostToolRecoveryMessage(upstreamError, recoveryCount = 0) {
@@ -7472,8 +9066,13 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       logger.info(`agent local relay exec_server skipped requestId=${requestId} tool=${toolCall.name} reason=disabled`);
     }
     if (!execution) {
-      // eslint-disable-next-line no-await-in-loop
-      execution = await executeRelayTool(toolCall, session, logger);
+      session.currentExecutingToolCallId = toolCallId;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        execution = await executeRelayTool(toolCall, session, logger);
+      } finally {
+        session.currentExecutingToolCallId = '';
+      }
     }
     let interactionQueryDispatch = null;
     if (!execution?.pendingNativeMutation && shouldDispatchInteractionQueryForTool(session, toolCall, execution)) {
@@ -7611,10 +9210,31 @@ async function continueAgentStreamLoop(session, options = {}) {
     session,
     userText,
   );
+  if (shouldPrependForcedModeTask(session, toolCalls)) {
+    const forcedModeTask = buildForcedModeTaskToolCall(session, userText);
+    if (forcedModeTask) {
+      toolCalls = [forcedModeTask, ...toolCalls].slice(0, maxToolCallsPerRound);
+      session.syntheticModeTaskStarted = true;
+      logger?.info?.(
+        `agent local relay synthetic task prepended requestId=${requestId || '-'} mode=${getSessionAgentMode(session)} firstTool=${toolCalls[0]?.name || '-'} count=${toolCalls.length}`,
+      );
+    }
+  }
+  if (!toolCalls.length && !session.syntheticModeTaskStarted) {
+    const forcedModeTask = buildForcedModeTaskToolCall(session, userText);
+    if (forcedModeTask) {
+      toolCalls = [forcedModeTask];
+      session.syntheticModeTaskStarted = true;
+      logger?.info?.(
+        `agent local relay synthetic task injected requestId=${requestId || '-'} mode=${getSessionAgentMode(session)} tool=${forcedModeTask.name}`,
+      );
+    }
+  }
   let toolStep = 0;
   let sawWriteTool = false;
   let sawMutationTool = false;
   let sawReadOnlyTool = false;
+  let modeLocalFinalized = false;
   let nativeMutationAckMissing = false;
   let pendingNativeMutation = false;
   let completionVerificationCount = 0;
@@ -7631,6 +9251,17 @@ async function continueAgentStreamLoop(session, options = {}) {
         `agent local relay tool plan requestId=${requestId} step=${toolStep} count=${toolCalls.length} tools=${toolCalls.map((call) => call.name).join(',')}`,
       );
       const { toolResultMessages, executions } = await executeRelayToolCalls(session, toolCalls, requestId, logger);
+      const agentMode = getSessionAgentMode(session);
+      const backgroundWaitMs = agentMode === 'AGENT_MODE_MULTITASK'
+        ? 4000
+        : agentMode === 'AGENT_MODE_DEBUG'
+          ? 8000   // debug subagents run ReadLints/Diagnostics which take longer
+          : 2500;
+      const backgroundTaskRecords = await waitForBackgroundExecutions(
+        session,
+        executions.filter((entry) => entry?.execution?.isBackground),
+        backgroundWaitMs,
+      );
       if (executions.length && executions.every((entry) => entry.execution?.duplicateToolSkipped)) {
         upstreamError = '';
         logger?.info?.(`agent local relay duplicate tool result forwarded requestId=${requestId}; asking upstream to continue`);
@@ -7738,6 +9369,7 @@ async function continueAgentStreamLoop(session, options = {}) {
         ...upstreamMessages,
         { role: 'assistant', content: streamed.text?.trim() || `Called ${toolCalls.length} tool(s).` },
         ...toolResultMessages,
+        ...buildBackgroundExecutionContextMessages(backgroundTaskRecords),
         {
           role: 'user',
           content: 'Continue working from these tool results. If another tool is required, call it; otherwise give the final answer.',
@@ -7845,7 +9477,23 @@ async function continueAgentStreamLoop(session, options = {}) {
           });
           logger?.error?.(`agent local relay post-tool upstream failed requestId=${requestId} phase=${postToolPhase}: ${error.message}`);
         }
-        if (!shouldRecoverPostToolStream(upstreamError, finalText, toolCalls, postToolRecoveryCount)) break;
+        const postToolTurnAction = getPostToolTurnActionByMode(session, executions, {
+          finalText,
+          upstreamError,
+          toolCalls,
+          postToolRecoveryCount,
+          sawWriteTool,
+          sawReadOnlyTool,
+        });
+        if (postToolTurnAction?.finalText) {
+          finalText = String(postToolTurnAction.finalText || '').trim();
+          upstreamError = '';
+          toolCalls = [];
+          modeLocalFinalized = Boolean(postToolTurnAction.markCompleted);
+          logger?.info?.(`agent local relay post-tool local finalize requestId=${requestId} step=${toolStep} textPreview=${JSON.stringify(finalText.slice(0, 200))}`);
+          break;
+        }
+        if (!shouldRecoverPostToolStreamByMode(session, upstreamError, finalText, toolCalls, postToolRecoveryCount)) break;
         logger?.info?.(`agent local relay post-tool stream stalled; recovering requestId=${requestId} step=${toolStep} attempt=${postToolRecoveryCount + 1} error=${JSON.stringify(upstreamError)} textPreview=${JSON.stringify(String(finalText || '').slice(0, 200))}`);
         const trimmedRecoveryText = String(finalText || '').trim();
         upstreamMessages = trimmedRecoveryText
@@ -7982,6 +9630,7 @@ async function continueAgentStreamLoop(session, options = {}) {
 
     while (session.active
       && !session.aborted
+      && !modeLocalFinalized
       && shouldContinueIncompleteWorkByMode(session, finalText, toolCalls, upstreamError, incompletePostMutationContinuationCount, {
         sawMutationTool,
         sawReadOnlyTool,
@@ -8128,7 +9777,10 @@ async function continueAgentStreamLoop(session, options = {}) {
       lastStreamStopReason,
     },
   );
-  if (incompleteWorkAtEnd) {
+  if (modeLocalFinalized) {
+    session.unfinishedWorkAtEnd = false;
+    clearUnfinishedAgentTask(session);
+  } else if (incompleteWorkAtEnd) {
     session.unfinishedWorkAtEnd = true;
     const latestText = String(finalText || '').trim();
     const maxIncompleteContinuations = getMaxContinuationCountByMode(session, { sawMutationTool, sawReadOnlyTool });
@@ -8536,6 +10188,9 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
     if (session) session.activeUpstreamResponse = null;
     if (session) session.relaying = false;
     triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
+    if (session && !session.relaying) {
+      drainQueuedAgentMessage(session, config, logger, stats, 'post_user_message');
+    }
   }
 }
 
@@ -8599,33 +10254,115 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     stats.chatTotal = (stats.chatTotal || 0) + 1;
     stats.localRelayTurns = (stats.localRelayTurns || 0) + 1;
 
-    const { response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
-      activeUpstream,
-      configuredModel,
-      upstreamMessages,
-      logger,
-      buildFetchUpstreamOptionsForSession(session, {
-        signal: session.abortController?.signal || null,
-        requestId,
+    let upstream;
+    let upstreamMode;
+    let streamed;
+    try {
+      ({ response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+        activeUpstream,
+        configuredModel,
+        upstreamMessages,
+        logger,
+        buildFetchUpstreamOptionsForSession(session, {
+          signal: session.abortController?.signal || null,
+          requestId,
+          phase: 'initial',
+          mode: agentMode,
+          outboundProxy: config.outboundProxy || null,
+          localProxyPort: config.port,
+        }, { phase: 'initial', agentMode }),
+      ));
+    } catch (error) {
+      if (session.aborted) return;
+      // 上游请求抛出异常（网络错误、超时等）：构造错误态 streamed，交由
+      // continueAgentStreamLoop 统一发送 error/turnEnded 帧，避免静默挂起。
+      const fetchErrorText = summarizeFetchError(error);
+      logger?.error?.(`agent local relay initial upstream fetch threw requestId=${requestId} phase=initial: ${error?.stack || error?.message || String(error)}`);
+      recordUpstreamUsagePhase(session, config, {
         phase: 'initial',
-        mode: agentMode,
-        outboundProxy: config.outboundProxy || null,
-        localProxyPort: config.port,
-      }, { phase: 'initial', agentMode }),
-    );
+        endpointMode: String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+        model: configuredModel,
+        status: 'fetch_error',
+        error: error?.message || String(error),
+        promptChars,
+        meta: usageMeta,
+      });
+      streamed = {
+        text: '',
+        reasoning: '',
+        upstreamError: fetchErrorText,
+        toolCalls: [],
+        usage: null,
+        durationMs: 0,
+        deltaCount: 0,
+        eventTypes: '',
+        sawDone: false,
+        stopReason: 'fetch_error',
+      };
+      await continueAgentStreamLoop(session, {
+        userText,
+        config,
+        logger,
+        streamed,
+        upstreamMessages,
+        usageMeta,
+        configuredModel,
+        activeUpstream,
+        upstreamMode: '',
+        requestId,
+        agentMode,
+        emitThinking,
+        filterInlineThinking,
+        reasoningOnlyMaxMs,
+      });
+      return;
+    }
     session.activeUpstreamResponse = upstream;
 
-    const streamed = await streamAgentUpstreamResponse(upstream, session, {
-      collectTools: true,
-      emit: true,
-      emitThinking,
-      phase: 'initial',
-      idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
-      maxDurationMs: 0,
-      reasoningOnlyMaxMs,
-      filterInlineThinking,
-    });
-    session.activeUpstreamResponse = null;
+    if (upstream && upstream.ok === false) {
+      // 上游返回非 ok 响应（5xx/4xx）：读取错误体并构造错误态 streamed，
+      // 交由 continueAgentStreamLoop 统一发送 error/turnEnded 帧。
+      const errorBodyText = await upstream.text().catch(() => '');
+      const httpStatus = Number(upstream.status) || 0;
+      upstreamMode = upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses');
+      const failureText = summarizeUpstreamFailure(httpStatus, errorBodyText);
+      logger?.warn?.(`agent local relay initial upstream non-ok requestId=${requestId} phase=initial status=${httpStatus} mode=${upstreamMode} bodyLen=${String(errorBodyText || '').length}`);
+      recordUpstreamUsagePhase(session, config, {
+        phase: 'initial',
+        endpointMode: upstreamMode,
+        model: configuredModel,
+        status: 'http_error',
+        httpStatus,
+        error: errorBodyText,
+        promptChars,
+        meta: usageMeta,
+      });
+      session.activeUpstreamResponse = null;
+      streamed = {
+        text: '',
+        reasoning: '',
+        upstreamError: failureText,
+        toolCalls: [],
+        usage: null,
+        durationMs: 0,
+        deltaCount: 0,
+        eventTypes: '',
+        sawDone: false,
+        stopReason: 'http_error',
+      };
+    } else {
+      streamed = await streamAgentUpstreamResponse(upstream, session, {
+        collectTools: true,
+        emit: true,
+        emitThinking,
+        phase: 'initial',
+        idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+        maxDurationMs: 0,
+        reasoningOnlyMaxMs,
+        filterInlineThinking,
+      });
+      session.activeUpstreamResponse = null;
+    }
 
     recordUpstreamUsagePhase(session, config, {
       phase: 'initial',
@@ -8788,7 +10525,7 @@ async function forwardMitmHttpsRequest(req, res, logger, body, options = {}) {
 
 async function handleAgentRunSse(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const rawBody = await readRequestBody(req);
-  const requestId = decodeRunSseRequestId(rawBody);
+  const requestId = protocolV2.decodeRunSseRequestId(rawBody);
   const frameSummary = summarizeConnectFrames(rawBody);
   let pendingCapture = null;
   if (requestId && pendingAgentMessages?.get?.(requestId)?.capture) {
@@ -8899,6 +10636,29 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
     if (requestId) {
       const previous = agentSessions.get(requestId);
       if (previous && previous !== session) {
+        if (shouldQueueRunsseReplacement(previous)) {
+          const pending = pendingAgentMessages.get(requestId);
+          if (pending?.userText) {
+            enqueueQueuedAgentMessage(previous, {
+              userText: pending.userText,
+              workspaceRoot: pending.workspaceRoot,
+              capture: pending.capture || null,
+            }, logger, { priority: true, source: 'runsse_replaced_queue' });
+            pendingAgentMessages.delete(requestId);
+          }
+          logger.info(`agent local relay reusing active session requestId=${requestId} instead of replacing it`);
+          const reusedSession = reattachWaitingInteractionSession(previous, req, res, rawBody, logger);
+          res.on('close', () => {
+            if (reusedSession?.completed) return;
+            if (reusedSession?.ignoreNextRunsseClose) {
+              reusedSession.ignoreNextRunsseClose = false;
+              logger?.info?.(`agent local relay ignored runsse close after reuse requestId=${reusedSession?.requestId || '-'}`);
+              return;
+            }
+            detachWaitingInteractionSession(reusedSession, logger, 'runsse_reused');
+          });
+          return;
+        }
         abortAgentSession(previous, logger, 'runsse_replaced');
       }
       agentSessions.set(requestId, session);
@@ -8938,10 +10698,11 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
 }
 
 async function handleBidiAppend(req, res, config, logger, stats, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
+  let decoded = null;
+  try {
   const rawBody = await readRequestBody(req);
   // 优先用 protobufjs v2 解码（返回完整 clientMessage + MCP/Skill 字段），失败兜底手写版
-  let decoded = protocolV2.decodeBidiAppendRequest(rawBody, { fallbackToLegacy: true });
-  if (!decoded) decoded = decodeBidiAppendRequest(rawBody);
+  decoded = protocolV2.decodeBidiAppendRequest(rawBody, { fallbackToLegacy: true });
   const protocolOneof = decoded.debug?.agentClientMessage?.oneof
     || decoded.debug?.agentClientMessage?.message
     || '-';
@@ -9164,6 +10925,25 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
           ack();
           return;
         }
+        if (session?.active && session.relaying) {
+          session.workspaceRoot = userWorkspaceRoot || session.workspaceRoot || '';
+          enqueueQueuedAgentMessage(session, {
+            userText: normalizedUserText,
+            workspaceRoot: userWorkspaceRoot,
+            capture: {
+              capturedAt: new Date().toISOString(),
+              requestId: decoded.requestId,
+              kind: 'user_message',
+              mode: normalizeAgentModeName(session.agentMode || 'AGENT_MODE_AGENT'),
+              userText: normalizedUserText,
+              workspaceRoot: userWorkspaceRoot,
+              stableConversationId: userStableConvId,
+              debug: decoded.debug || null,
+            },
+          }, logger, { priority: true, source: 'conversation_action_user_message' });
+          ack();
+          return;
+        }
       }
       logger.info(
         `agent local relay conversation_action unhandled kind=${actionKind || '-'} requestId=${decoded.requestId || '-'} acked`,
@@ -9336,7 +11116,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         capturedAt: new Date().toISOString(),
         requestId: decoded.requestId,
         kind: decoded.kind,
-        mode: normalizeAgentModeName(decoded.mode || extractAgentModeFromPayload(Buffer.alloc(0))),
+        mode: normalizeAgentModeName(decoded.mode || decoded.debug?.agentMode || 'AGENT_MODE_AGENT'),
         userText: normalizedUserText,
         userTextPreview,
         selectedImages: Array.isArray(decoded.selectedImages) ? decoded.selectedImages : [],
@@ -9394,7 +11174,11 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         return;
       }
       if (session?.active && session.relaying) {
-        logger.info(`agent local relay in-flight user_message acked requestId=${decoded.requestId} workspaceRoot=${JSON.stringify(workspaceRoot)} textLen=${normalizedUserText.length}`);
+        enqueueQueuedAgentMessage(session, {
+          userText: normalizedUserText,
+          workspaceRoot,
+          capture,
+        }, logger, { priority: false, source: 'user_message' });
         ack();
         return;
       }
@@ -9427,6 +11211,19 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
 
   const captureResponsePath = buildCaptureResponsePath(config, 'bidi-response', decoded.requestId || '');
   await forwardMitmHttpsRequest(req, res, logger, rawBody, { captureResponsePath });
+  } catch (error) {
+    // 单次 BidiAppend 处理失败不应阻塞后续消息：确保 HTTP 响应始终被发送，
+    // 否则 Cursor 客户端会因等待响应而卡死。
+    logger?.error?.(`BidiAppend handler error requestId=${decoded?.requestId || '-'} kind=${decoded?.kind || '-'}: ${error?.stack || error?.message || String(error)}`);
+    if (!res.headersSent) {
+      try {
+        res.writeHead(200, { 'Content-Type': 'application/proto' });
+      } catch {
+        /* ignore write errors */
+      }
+    }
+    try { res.end(Buffer.alloc(0)); } catch { /* ignore closed client */ }
+  }
 }
 
 async function handleCursorChat(req, res, config, logger, stats) {
@@ -9459,6 +11256,117 @@ async function handleCursorChat(req, res, config, logger, stats) {
   await forwardMitmHttpsRequest(req, res, logger, rawBody);
 }
 
+async function handleNativeTaskRpc(req, pathname, res, config, logger, stats) {
+  const rawBody = await readRequestBody(req);
+  stats.nativeTaskRpc = stats.nativeTaskRpc || {};
+  const rpcName = isTaskInitPath(pathname)
+    ? 'TaskInit'
+    : isTaskStreamLogPath(pathname)
+      ? 'TaskStreamLog'
+      : isTaskProvideResultPath(pathname)
+        ? 'TaskProvideResult'
+        : isTaskGetInterfaceAgentStatusPath(pathname)
+          ? 'TaskGetInterfaceAgentStatus'
+          : 'TaskUnknown';
+  stats.nativeTaskRpc[rpcName] = (stats.nativeTaskRpc[rpcName] || 0) + 1;
+
+  const decodedRpc = decodeNativeTaskRpcBody(rpcName, rawBody, logger);
+  const strings = decodePrintableTaskStrings(rawBody);
+  const decodedTaskInfo = collectTaskIdentifiersFromDecodedRpc(rpcName, decodedRpc);
+  const titleHint = decodedTaskInfo.metadata.titleHint
+    || strings.find((item) => /task|agent|debug|explore|protocol|repro|log/i.test(item))
+    || 'Local multitask subagent';
+  const requestedTaskIds = collectKnownTaskIdentifiers(strings).concat(decodedTaskInfo.identifiers);
+  const existingTaskUuid = findTaskUuidInBody(rawBody);
+  if (existingTaskUuid) requestedTaskIds.push(existingTaskUuid);
+  if (decodedTaskInfo.metadata.taskUuid) requestedTaskIds.push(decodedTaskInfo.metadata.taskUuid);
+  let task = findTaskRecordAcrossSessions(config, requestedTaskIds, titleHint);
+  if (!task) {
+    const fallbackTaskUuid = decodedTaskInfo.metadata.taskUuid || existingTaskUuid || `task-${safeTaskIdentifier(titleHint, Date.now().toString(36))}`;
+    task = getOrCreateGlobalTaskSubagent(config, fallbackTaskUuid, {
+      taskUuid: fallbackTaskUuid,
+      title: titleHint,
+      description: decodedTaskInfo.metadata.descriptionHint || strings.join('\n').slice(0, 1200),
+      prompt: decodedTaskInfo.metadata.descriptionHint || strings.join('\n').slice(0, 1200),
+      summary: `Local subagent completed: ${titleHint}`,
+    });
+  } else {
+    syncTaskRecordToGlobalRegistry(config, task);
+  }
+  if (!Array.isArray(task.log)) task.log = [];
+  if (!task.log.length) {
+    const instructionText = String(task.description || task.prompt || task.title || titleHint || 'Background task.').trim();
+    task.log.push(createTaskLogItem(1, 'instruction', instructionText, true));
+  }
+  if (!String(task.title || '').trim()) {
+    task.title = titleHint;
+  }
+  if (!String(task.description || '').trim() && decodedTaskInfo.metadata.descriptionHint) {
+    task.description = decodedTaskInfo.metadata.descriptionHint;
+  }
+  if (!String(task.prompt || '').trim() && decodedTaskInfo.metadata.descriptionHint) {
+    task.prompt = decodedTaskInfo.metadata.descriptionHint;
+  }
+  if (!String(task.summary || '').trim() && String(task.resultText || '').trim()) {
+    task.summary = String(task.resultText || '').trim();
+  }
+  if (!String(task.status || '').trim()) {
+    task.status = 'pending';
+  }
+  if (rpcName === 'TaskProvideResult') {
+    const toolResult = decodedRpc?.toolResult && typeof decodedRpc.toolResult === 'object' ? decodedRpc.toolResult : {};
+    const outputText = String(toolResult?.output?.output || '').trim();
+    const errorText = String(toolResult?.error?.message || '').trim();
+    const resultText = outputText || errorText;
+    const actionSequenceNumber = decodedTaskInfo.metadata.actionSequenceNumber;
+    if (resultText) {
+      appendTaskLog(task, errorText ? 'output' : 'output', resultText, false);
+      task.resultText = resultText;
+      task.summary = resultText;
+    }
+    if (actionSequenceNumber > 0) {
+      appendTaskLog(task, 'thought', `Received tool result for action #${actionSequenceNumber}.`, true);
+    }
+    if (errorText) {
+      setTaskStatus(task, 'failed');
+    }
+    if (task.status !== 'failed') setTaskStatus(task, 'completed');
+    if (!task.summary && task.resultText) task.summary = String(task.resultText || '').trim();
+    if (!task.log.some((item) => item && item.isNotDone === false)) {
+      appendTaskLog(task, 'output', task.summary || task.resultText || 'Background task finished.', false);
+    }
+    syncTaskRecordToGlobalRegistry(config, task);
+  }
+
+  logger?.info?.(`native Task RPC ${rpcName} taskUuid=${task.taskUuid} rawLen=${rawBody.length} decoded=${decodedRpc ? 'yes' : 'no'}`);
+
+  if (rpcName === 'TaskInit') {
+    res.writeHead(200, { 'Content-Type': 'application/proto' });
+    res.end(encodeTaskInitResponsePayload(task));
+    return;
+  }
+
+  if (rpcName === 'TaskStreamLog') {
+    const startSequenceNumber = Math.max(0, Number(decodedTaskInfo.metadata.startSequenceNumber) || 0);
+    handleTaskStreamLogLive(res, task, startSequenceNumber, logger);
+    return;
+  }
+
+  if (rpcName === 'TaskGetInterfaceAgentStatus') {
+    writeTaskEventStream(res, [encodeTaskInterfaceStatusFrame(task)]);
+    return;
+  }
+
+  if (rpcName === 'TaskProvideResult') {
+    res.writeHead(200, { 'Content-Type': 'application/proto' });
+    res.end(encodeTaskProvideResultResponsePayload());
+    return;
+  }
+
+  res.writeHead(200, { 'Content-Type': 'application/proto' });
+  res.end(Buffer.alloc(0));
+}
+
 async function handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions) {
   const { pathname, method, protocol } = getMitmRequestMeta(req);
   if (protocol === 'h2') stats.connectH2 = (stats.connectH2 || 0) + 1;
@@ -9469,6 +11377,11 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: true }));
     shutdown?.();
+    return;
+  }
+
+  if (isLocalRelayMode(config) && method === 'POST' && isNativeTaskRpcPath(pathname)) {
+    await handleNativeTaskRpc(req, pathname, res, config, logger, stats);
     return;
   }
 
@@ -9631,6 +11544,9 @@ async function handleModelListRequest(req, res, config, logger, stats, pathname)
 function buildFakeModelListResponse(pathname, localModels) {
   try {
     const { encodeMessageSync } = require('./cursor-relay-protobuf');
+    const activeProfile = getActiveRelayProfile('');
+    const defaultContextLimit = Math.max(1, Number(activeProfile?.contextWindow || localModels[0]?.contextWindow || 200000) || 200000);
+    const defaultReasoningEffort = String(activeProfile?.reasoningEffort || localModels[0]?.reasoningEffort || 'medium').trim() || 'medium';
 
     if (pathname === modelInjection.AVAILABLE_MODELS_PATH) {
       // [FIX #3] AvailableModelsResponse.models 用正确的 AvailableModel 字段（非 ModelDetails 占位）
@@ -9648,10 +11564,10 @@ function buildFakeModelListResponse(pathname, localModels) {
           supportsThinking: true,                                // #9
           supportsImages: true,                                  // #10
           supportsAutoContext: true,                             // #11 支持自动上下文
-          autoContextMaxTokens: 200000,                          // #12
-          autoContextExtendedMaxTokens: 200000,                  // #13
+          autoContextMaxTokens: Math.max(1, Number(m.contextWindow || defaultContextLimit) || defaultContextLimit), // #12
+          autoContextExtendedMaxTokens: Math.max(1, Number(m.contextWindow || defaultContextLimit) || defaultContextLimit), // #13
           supportsMaxMode: true,                                 // #14
-          contextTokenLimit: 200000,                             // #15 上下文 token 限制
+          contextTokenLimit: Math.max(1, Number(m.contextWindow || defaultContextLimit) || defaultContextLimit), // #15
           supportsNonMaxMode: true,                              // #19
           supportsPlanMode: true,                                // #22
           supportsSandboxing: true,                              // #25
@@ -9660,7 +11576,7 @@ function buildFakeModelListResponse(pathname, localModels) {
           variants: buildRelayModelVariants(
             m.displayName || m.modelName,
             m.displayNameShort || m.displayName || m.modelName,
-            m.reasoningEffort || 'medium',
+            m.reasoningEffort || defaultReasoningEffort,
           ),
           legacySlugs: [],
           idAliases: [],
@@ -9689,11 +11605,7 @@ function buildFakeModelListResponse(pathname, localModels) {
       return payload;
     }
 
-    if (pathname === modelInjection.GET_DEFAULT_MODEL_PATH) {
-      const store = require('./cursor-relay-profile-store').loadRelayProfileStore('');
-      const activeProfile = Array.isArray(store.configs)
-        ? store.configs.find((c) => String(c.id) === String(store.activeId))
-        : null;
+  if (pathname === modelInjection.GET_DEFAULT_MODEL_PATH) {
       // GetDefaultModelForCliResponse { ModelDetails model = 1; } — model 是嵌套消息
       const defaultModelName = activeProfile?.modelName || (localModels[0]?.modelName || 'default');
       const defaultDisplayName = activeProfile?.name || defaultModelName;
@@ -9705,6 +11617,17 @@ function buildFakeModelListResponse(pathname, localModels) {
           displayNameShort: String(defaultDisplayName).slice(0, 20),
           aliases: [defaultModelName],
         },
+      });
+      return payload;
+    }
+
+    if (pathname === '/aiserver.v1.AiService/GetDefaultModel') {
+      const defaultModelName = String(activeProfile?.modelName || localModels[0]?.modelName || 'default').trim() || 'default';
+      const payload = encodeMessageSync('aiserver.v1.GetDefaultModelResponse', {
+        model: defaultModelName,
+        thinkingModel: defaultModelName,
+        maxMode: false,
+        nextDefaultSetDate: '',
       });
       return payload;
     }
@@ -10086,6 +12009,7 @@ function startProxy(config) {
   const pendingAgentMessages = new Map();
   const completedAgentTurns = new Map();
   const pendingAgentInteractions = new Map();
+  config.__cursorPoolAgentSessions = agentSessions;
   const stats = {
     connectTotal: 0,
     connectMitm: 0,
@@ -10293,6 +12217,7 @@ function startProxy(config) {
         enableReviewBridge: Boolean(config.enableReviewBridge),
         localControlPlane: isLocalRelayMode(config),
         stats,
+        cacheStats: null,
       }));
       return;
     }
@@ -10307,6 +12232,11 @@ function startProxy(config) {
         res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: e.message, stack: e.stack }, null, 2));
       }
+      return;
+    }
+
+    if (isLocalRelayMode(config) && (req.method || 'GET').toUpperCase() === 'POST' && isNativeTaskRpcPath(String(req.url || '').split('?')[0])) {
+      await handleNativeTaskRpc(req, String(req.url || '').split('?')[0], res, config, logger, stats);
       return;
     }
 
@@ -10394,13 +12324,6 @@ function startProxy(config) {
 
   proxyServer.listen(config.port, '127.0.0.1', () => {
     logger.info(`cursor relay proxy listening on 127.0.0.1:${config.port}`);
-    // 异步预热响应缓存（从历史对话目录加载），不阻塞启动
-    responseCache.warmupFromHistory().then(() => {
-      const stats = responseCache.getStats();
-      if (stats.entries > 0) {
-        logger.info(`response cache warmed up: ${stats.entries} entries (exact=${stats.exactEntries} fuzzy=${stats.fuzzyEntries})`);
-      }
-    }).catch(() => { /* ignore warmup errors */ });
   });
 
   process.on('SIGTERM', shutdown);
@@ -10459,4 +12382,19 @@ module.exports = {
   getStreamingEditContentFromArgumentsText,
   getStreamingPathFromArgumentsText,
   buildNativeEditFileText,
+  detectDestructiveWrite,
+  buildReportBugfixResultsText,
+  executeTaskTool,
+  // Exposed for diagnostics / streaming RPC tests (pure helpers, no side effects on their own).
+  encodeTaskStreamLogFrame,
+  encodeTaskLogItemPayload,
+  buildTaskLogItemObject,
+  encodeTaskStatusValue,
+  getMaxTaskLogSeq,
+  handleTaskStreamLogLive,
+  // Exposed for Round-2 native-task-UI parity tests.
+  emitTaskProgressFrame,
+  findTaskRecordAcrossSessions,
+  registerTaskSubagent,
+  getSessionTaskRegistry,
 };

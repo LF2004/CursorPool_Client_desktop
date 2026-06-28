@@ -72,12 +72,18 @@ function buildPlanWorkflowUpdateForToolExecution({
 } = {}) {
   if (!execution?.ok) return null;
   const lower = String(toolName || execution?.tool || '').trim().toLowerCase();
+  // Ask-before-Build: 在 PLANNING 首轮，若用户意图模糊，模型应先调用 AskQuestion。
+  // AskQuestion 成功 → 进入 AWAITING_ANSWERS，等待用户回答。
+  // 该转换从任何阶段（含 PLANNING/IDLE）都能触发。
   if (lower === 'askquestion') {
     return buildPlanWorkflowStateUpdate(state, PLAN_WORKFLOW_PHASES.AWAITING_ANSWERS, {
       lastToolName: 'AskQuestion',
       needsFreshExploreAfterAnswers: false,
     }, requestId);
   }
+  // CreatePlan 成功 → 进入 AWAITING_PLAN_PRESENTATION。
+  // 在 PLANNING 首轮直接调用 CreatePlan 是允许的（用户意图明确的情况），
+  // 但 plan-mode.interceptToolExecution 会在意图模糊且无 AskQuestion 历史时拦截。
   if (lower === 'createplan') {
     return buildPlanWorkflowStateUpdate(state, PLAN_WORKFLOW_PHASES.AWAITING_PLAN_PRESENTATION, {
       lastToolName: 'CreatePlan',

@@ -26,6 +26,10 @@ function mapAgentModeNameToNumber(modeName = '') {
     case 'AGENT_MODE_PROJECT':
     case 'PROJECT':
       return 6;
+    case 'AGENT_MODE_MULTITASK':
+    case 'MULTITASK':
+    case 'TASK':
+      return 7;
     default:
       return 1;
   }
@@ -595,5 +599,6 @@ module.exports = {
   buildAgentBidiAppendPayload,
   buildAgentExecClientPayload,
   buildAgentExecClientControlPayload,
+  mapAgentModeNameToNumber,
   runRelayAgentConnectionTest,
 };

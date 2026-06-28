@@ -7,6 +7,7 @@ import {
   PROVIDER_HINTS,
   PROVIDER_BASE_URLS,
   DEFAULT_CONTEXT_WINDOW,
+  MAX_CONTEXT_WINDOW,
   DEFAULT_REASONING_EFFORT,
   REASONING_EFFORT_OPTIONS,
   VALID_REASONING_EFFORTS,
@@ -152,8 +153,10 @@ function updateProfileTestStatus(id, patch) {
   const profile = getProfileById(profilesStore, id);
   if (!profile) return;
   profile.testStatus = { ...profile.testStatus, ...patch };
+  // 仅更新内存和 localStorage（upsertProfile 内部会写 localStorage）
+  // 不在此处触发 DB 写入，避免测试（尤其"测试全部"）时大量 IPC DB 写入阻塞主进程导致 UI 卡死
+  // localStorage 的 updatedAt 比 DB 新，loadProfilesStore 会自动检测并优先使用
   upsertProfile(profilesStore, profile);
-  void saveProfilesStore(profilesStore);
 }
 
 function formatProbeSeconds(ms) {
@@ -539,7 +542,7 @@ function collectModalFormProfile() {
     ? 'chat'
     : inferEndpointModeFromBaseUrl(rawBaseUrl, selectedEndpointMode);
   const rawContextWindow = Number(($('relayModalContext')?.value || '').trim() || DEFAULT_CONTEXT_WINDOW);
-  const contextWindow = Math.max(1, Math.min(200000, Number.isFinite(rawContextWindow) ? rawContextWindow : DEFAULT_CONTEXT_WINDOW));
+  const contextWindow = Math.max(1, Math.min(MAX_CONTEXT_WINDOW, Number.isFinite(rawContextWindow) ? rawContextWindow : DEFAULT_CONTEXT_WINDOW));
   if ($('relayModalContext')) $('relayModalContext').value = String(contextWindow);
   return {
     ...base,
@@ -573,8 +576,24 @@ async function saveModalProfile({ testAfter = false } = {}) {
     setActiveProfile(profilesStore, saved.id);
   }
   await saveProfilesStore(profilesStore);
+  await reloadProfilesStore();
   renderConfigGrid();
   closeConfigModal();
+  const bridge = window.electronBridge;
+  const isActiveProfile = String(profilesStore.activeId || '') === String(saved.id || '');
+  if (isActiveProfile && bridge?.cursorRelayGetConfig && bridge?.cursorRelayQuickSwitchModel) {
+    try {
+      const current = await bridge.cursorRelayGetConfig({ lightweight: true });
+      const relayRunning = Boolean(current?.runner?.running || current?.enabled);
+      relayEnabled = relayRunning;
+      if (relayRunning) {
+        await bridge.cursorRelayQuickSwitchModel({ profileId: saved.id });
+        void refreshRelayStatus().catch(() => null);
+      }
+    } catch {
+      /* ignore hot apply failure after save; manual enable path can recover */
+    }
+  }
   if (testAfter) {
     await testProfileById(saved.id, { silent: false });
   }
@@ -869,8 +888,8 @@ function validateUpstreamPayload(payload) {
   if (!(Number(payload.contextWindow) > 0)) {
     throw new Error('上下文窗口必须大于 0');
   }
-  if (Number(payload.contextWindow) > 200000) {
-    throw new Error('上下文窗口不能超过 200000，否则无法触发 Cursor 原生上下文压缩');
+  if (Number(payload.contextWindow) > MAX_CONTEXT_WINDOW) {
+    throw new Error(`上下文窗口不能超过 ${MAX_CONTEXT_WINDOW}，否则无法触发 Cursor 原生上下文压缩`);
   }
 }
 

@@ -12488,7 +12488,22 @@ message InterfaceAgentInitResponse {
   string human_readable_title = 2;
 }
 
+enum InterfaceAgentStepStatus {
+  INTERFACE_AGENT_STEP_STATUS_UNSPECIFIED = 0;
+  INTERFACE_AGENT_STEP_STATUS_WAITING = 1;
+  INTERFACE_AGENT_STEP_STATUS_RUNNING = 2;
+  INTERFACE_AGENT_STEP_STATUS_SUCCESS = 3;
+  INTERFACE_AGENT_STEP_STATUS_FAILURE = 4;
+}
+
 message InterfaceAgentStatus {
+  InterfaceAgentStepStatus validate_configuration = 1;
+  InterfaceAgentStepStatus stub_new_function = 2;
+  InterfaceAgentStepStatus verify_spec = 3;
+  InterfaceAgentStepStatus write_tests = 4;
+  InterfaceAgentStepStatus write_implementation = 5;
+  InterfaceAgentStepStatus implement_new_function = 6;
+  InterfaceAgentStepStatus run_tests = 7;
   string validate_configuration_message = 8;
   string stub_new_function_message = 9;
   string verify_spec_message = 10;
@@ -12496,6 +12511,7 @@ message InterfaceAgentStatus {
   string write_implementation_message = 12;
   string implement_new_function_message = 13;
   string run_tests_message = 14;
+  InterfaceAgentStepStatus write_test_plan = 15;
   string write_test_plan_message = 16;
 }
 
@@ -21179,6 +21195,7 @@ message TaskInfoRequest {
 
 message TaskInfoResponse {
   string human_readable_title = 1;
+  TaskStatus task_status = 2;
   int32 last_log_sequence_number = 3;
 }
 
@@ -21312,7 +21329,13 @@ message TaskStreamLogRequest {
 message TaskStreamLogResponse {
   oneof response {
     TaskLogItem streamed_log_item = 1;
+    TaskStreamLogResponse.InfoUpdate info_update = 2;
     TaskInfoResponse initial_task_info = 3;
+  }
+
+  message InfoUpdate {
+    optional string human_readable_title = 1;
+    optional TaskStatus task_status = 2;
   }
 }
 

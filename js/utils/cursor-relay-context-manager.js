@@ -149,7 +149,7 @@ function buildRelayConversationMemory(session = {}, options = {}) {
 }
 
 function resolveRelayContextBudgetChars(config = {}) {
-  const contextTokens = Number(config?.upstream?.contextWindow) || 250000;
+  const contextTokens = Number(config?.upstream?.contextWindow) || 200000;
   const reservedOutputTokens = Math.max(1024, Number(config.relayReservedOutputTokens) || DEFAULT_RELAY_CONTEXT_RESERVED_OUTPUT_TOKENS);
   const ratio = Number(config.relayContextInputRatio);
   const inputRatio = Number.isFinite(ratio) && ratio > 0 && ratio <= 1 ? ratio : DEFAULT_RELAY_CONTEXT_INPUT_RATIO;

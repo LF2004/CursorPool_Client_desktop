@@ -122,6 +122,8 @@ function dedupeModels(models = []) {
       modelId: String(item?.modelId || modelName).trim() || modelName,
       reasoningEffort: String(item?.reasoningEffort || 'medium').trim() || 'medium',
       thinkingMode: String(item?.thinkingMode || '').trim(),
+      contextWindow: Number(item?.contextWindow) > 0 ? Number(item.contextWindow) : 200000,
+      endpointMode: String(item?.endpointMode || '').trim().toLowerCase() || 'responses',
     });
   }
   return merged;
@@ -150,6 +152,8 @@ function collectModelsFromRunnerConfig(customRoot = '') {
           modelId: modelName,
           reasoningEffort: String(source.reasoningEffort || 'medium').trim() || 'medium',
           thinkingMode: String(source.thinkingMode || '').trim(),
+          contextWindow: Number(source.contextWindow) > 0 ? Number(source.contextWindow) : 200000,
+          endpointMode: String(source.endpointMode || '').trim().toLowerCase() || 'responses',
         });
       }
     };
@@ -187,6 +191,8 @@ function collectLocalModels() {
           modelId: String(c.modelName || '').trim(), // model_id 用 modelName
           reasoningEffort: String(c.reasoningEffort || 'medium').trim() || 'medium',
           thinkingMode: String(c.thinkingMode || '').trim(),
+          contextWindow: Number(c.contextWindow) > 0 ? Number(c.contextWindow) : 200000,
+          endpointMode: String(c.endpointMode || '').trim().toLowerCase() || 'responses',
         })));
     }
   } catch {

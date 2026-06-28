@@ -36,7 +36,8 @@ export const PROVIDER_ICONS = {
   custom: './assets/icons/providers/custom.svg',
 };
 
-export const DEFAULT_CONTEXT_WINDOW = 200000;
+export const MAX_CONTEXT_WINDOW = 200000;
+export const DEFAULT_CONTEXT_WINDOW = MAX_CONTEXT_WINDOW;
 export const DEFAULT_REASONING_EFFORT = 'medium';
 export const REASONING_EFFORT_OPTIONS = [
   { value: 'low', label: '低' },
@@ -159,7 +160,7 @@ function normalizeProfile(raw) {
     thinkingMode: providerId === 'deepseek' || providerId === 'mimo'
       ? (['enabled', 'disabled'].includes(raw.thinkingMode) ? raw.thinkingMode : DEFAULT_DEEPSEEK_THINKING_MODE)
       : '',
-    contextWindow: Math.max(1, Math.min(200000, Number(raw.contextWindow) > 0 ? Number(raw.contextWindow) : DEFAULT_CONTEXT_WINDOW)),
+    contextWindow: Math.max(1, Math.min(MAX_CONTEXT_WINDOW, Number(raw.contextWindow) > 0 ? Number(raw.contextWindow) : DEFAULT_CONTEXT_WINDOW)),
     notes: String(raw.notes || '').trim(),
     testStatus: normalizeTestStatus(raw.testStatus),
     createdAt: Number(raw.createdAt) || now,
@@ -351,14 +352,34 @@ export async function loadProfilesStore() {
     const dbStore = await bridge.cursorRelayProfilesLoad();
     const hasDbConfigs = Array.isArray(dbStore?.configs) && dbStore.configs.length > 0;
     if (hasDbConfigs) {
-      const normalized = {
+      const dbNormalized = {
         version: Number(dbStore.version) || 2,
         activeId: String(dbStore.activeId || ''),
         filterProvider: normalizeProviderId(dbStore.filterProvider || 'openai'),
         configs: dbStore.configs.map(normalizeProfile).filter(Boolean),
       };
-      saveProfilesStoreToLocalStorage(normalized);
-      return normalized;
+
+      // 比较 DB 和 localStorage 的最新 updatedAt，防止 DB 保存失败后用旧数据覆盖新数据
+      const localStore = loadProfilesStoreFromLocalStorage();
+      const dbMaxUpdated = dbNormalized.configs.reduce(
+        (max, c) => Math.max(max, Number(c.updatedAt) || 0), 0,
+      );
+      const localMaxUpdated = (localStore.configs || []).reduce(
+        (max, c) => Math.max(max, Number(c.updatedAt) || 0), 0,
+      );
+
+      if (localMaxUpdated > dbMaxUpdated) {
+        // localStorage 比 DB 新 —— DB 保存可能失败了，优先使用 localStorage 并重新同步 DB
+        try {
+          await bridge.cursorRelayProfilesSave(localStore);
+        } catch {
+          /* ignore re-sync failure */
+        }
+        return localStore;
+      }
+
+      saveProfilesStoreToLocalStorage(dbNormalized);
+      return dbNormalized;
     }
 
     const localStore = loadProfilesStoreFromLocalStorage();
@@ -402,8 +423,10 @@ export async function saveProfilesStore(store) {
   try {
     await bridge.cursorRelayProfilesSave(payload);
     await bridge.refreshTrayMenu?.();
-  } catch {
-    /* ignore */
+  } catch (error) {
+    // DB 保存失败时记录警告，localStorage 已更新故不会丢失数据
+    // loadProfilesStore 会通过 updatedAt 对比检测到 DB 数据过期并自动恢复
+    console.warn('[relay-profiles] DB save failed, localStorage is up-to-date:', error?.message || error);
   }
   return payload;
 }

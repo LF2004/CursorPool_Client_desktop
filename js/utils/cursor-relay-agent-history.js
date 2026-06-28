@@ -96,6 +96,21 @@ function updateConversationState(conversation, patch = {}) {
   saveConversation(conversation);
 }
 
+function mergeConversationMetadata(conversation, patch = {}) {
+  if (!conversation || !patch || typeof patch !== 'object') return;
+  conversation.state = conversation.state && typeof conversation.state === 'object'
+    ? conversation.state
+    : {};
+  const current = conversation.state.metadata && typeof conversation.state.metadata === 'object'
+    ? conversation.state.metadata
+    : {};
+  conversation.state.metadata = {
+    ...current,
+    ...patch,
+  };
+  saveConversation(conversation);
+}
+
 function beginTurn(config = {}, requestId = '', workspaceRoot = '', capture = null) {
   const stableConversationId = String(capture?.stableConversationId || capture?.conversationId || '').trim();
   const conversation = loadConversation(config, stableConversationId || requestId, { requestId, workspaceRoot });
@@ -182,6 +197,7 @@ module.exports = {
   completeTurn,
   getConversationId,
   getHistoryRoot,
+  mergeConversationMetadata,
   updateConversationState,
   updateUsage,
 };

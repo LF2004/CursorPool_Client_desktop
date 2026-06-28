@@ -980,7 +980,8 @@ body.theme-light .log-detail { color: #374151; }
   justify-content: center;
   flex: 0 0 132px;
   width: 132px;
-  min-height: 68px;
+  min-height: 78px;
+  padding-bottom: 12px;
 }
 .usage-cache-gauge-svg {
   width: 132px;
@@ -1003,12 +1004,23 @@ body.theme-light .log-detail { color: #374151; }
 .usage-cache-rate {
   position: absolute;
   left: 50%;
-  bottom: 0;
+  bottom: 6px;
   transform: translateX(-50%);
   color: #f8fafc;
   font-size: 21px;
   line-height: 1;
   font-variant-numeric: tabular-nums;
+}
+.usage-cache-rate-sub {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  color: #94a3b8;
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+  font-weight: 400;
 }
 .usage-cache-stats {
   display: grid;

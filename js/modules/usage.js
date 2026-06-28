@@ -33,6 +33,7 @@ function formatUsageModeLabel(value) {
   const text = String(value || '').trim().toUpperCase();
   if (text === 'AGENT_MODE_PLAN' || text === 'PLAN') return 'Plan';
   if (text === 'AGENT_MODE_ASK' || text === 'ASK') return 'Ask';
+  if (text === 'AGENT_MODE_DEBUG' || text === 'DEBUG') return 'Debug';
   if (text === 'AGENT_MODE_MULTITASK' || text === 'MULTITASK' || text === 'TASK') return 'Multitask';
   return 'Agent';
 }
@@ -136,6 +137,7 @@ function computeCacheStats(summary = {}) {
   const totalTokens = Number(summary.total_tokens) || (inputTokens + outputTokens);
   const billablePrompt = Math.max(0, inputTokens - cachedTokens);
   const cacheHitRate = inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : null;
+  // 本地 Relay Response Cache 统计（从 runner health 端点获取）
   return {
     inputTokens,
     cachedTokens,
@@ -148,15 +150,20 @@ function computeCacheStats(summary = {}) {
 
 function renderCacheSummary(summary = {}) {
   const stats = computeCacheStats(summary);
-  const rateText = stats.cacheHitRate == null ? '-' : `${formatNumber(stats.cacheHitRate, 2)}%`;
+  // 仪表盘显示本地 Relay 缓存命中率（更有意义，上游 prompt cache 多为 0）
+  const gaugeRate = stats.cacheHitRate;
+  const rateText = gaugeRate == null ? '-' : `${formatNumber(gaugeRate, 2)}%`;
   setTextIfChanged($('usageCacheHitRate'), rateText);
+  // 上游 Prompt 缓存率（次要显示）
+  const upstreamRateText = stats.cacheHitRate == null ? '-' : `${formatNumber(stats.cacheHitRate, 2)}%`;
+  setTextIfChanged($('usageCacheUpstreamRate'), 'Prompt Cache');
   setTextIfChanged($('usageCacheTokenTotal'), formatCompactToken(stats.totalTokens));
   setTextIfChanged($('usageCachePromptTotal'), formatCompactToken(stats.inputTokens));
   setTextIfChanged($('usageCachePromptCached'), formatCompactToken(stats.cachedTokens));
   setTextIfChanged($('usageCachePromptBillable'), formatCompactToken(stats.billablePrompt));
   const fill = $('usageCacheGaugeFill');
   if (fill) {
-    const rate = stats.cacheHitRate == null ? 0 : Math.min(100, Math.max(0, stats.cacheHitRate));
+    const rate = gaugeRate == null ? 0 : Math.min(100, Math.max(0, gaugeRate));
     const offset = CACHE_GAUGE_ARC_LENGTH * (1 - rate / 100);
     const nextOffset = String(offset);
     if (fill.getAttribute('stroke-dashoffset') !== nextOffset) {
@@ -356,33 +363,31 @@ function buildTokenHelpPopoverHtml() {
 
 function buildCacheHelpPopoverHtml() {
   return `
-    <div class="usage-popover-title">Prompt 缓存率说明</div>
+    <div class="usage-popover-title">缓存命中率说明</div>
     <div class="usage-popover-rows">
-      <div class="usage-popover-row"><span>Prompt 缓存率</span><span class="mono">缓存读取 ÷ Prompt 消耗</span></div>
+      <div class="usage-popover-row"><span>本地缓存命中率</span><span>本地 Relay 命中 ÷ 总查询</span></div>
+      <div class="usage-popover-row"><span>上游 Prompt 缓存率</span><span>缓存读取 ÷ Prompt 消耗</span></div>
+      <div class="usage-popover-row"><span>本地命中</span><span>本地 Relay 响应缓存命中次数</span></div>
+      <div class="usage-popover-row"><span>本地请求</span><span>本地 Relay 缓存查询总次数</span></div>
       <div class="usage-popover-row"><span>Token 消耗</span><span>输入 + 输出 Token 总量</span></div>
       <div class="usage-popover-row"><span>Prompt 消耗</span><span>全部 Prompt Token</span></div>
       <div class="usage-popover-row"><span>缓存读取</span><span>上游 API Prompt 缓存命中 Token</span></div>
-      <div class="usage-popover-row"><span>本地回放</span><span>表格「缓存」列中的 ⚡ 标记</span></div>
       <div class="usage-popover-row"><span>非缓存 Prompt</span><span>按官方定价计费的输入 Token</span></div>
     </div>
   `;
 }
 
-function computeRowCacheStatus(row, isLocalCacheHit) {
+function computeRowCacheStatus(row) {
   const inputTokens = Number(row.input_tokens) || 0;
   const cachedInputTokens = Number(row.cached_input_tokens) || 0;
-  const hasUpstreamCache = !isLocalCacheHit && cachedInputTokens > 0 && inputTokens > 0;
+  const hasUpstreamCache = cachedInputTokens > 0 && inputTokens > 0;
   const upstreamCacheRate = hasUpstreamCache ? (cachedInputTokens / inputTokens) * 100 : null;
   return { inputTokens, cachedInputTokens, hasUpstreamCache, upstreamCacheRate };
 }
 
-function buildCacheCellHtml(row, { isLocalCacheHit, cacheLayer, compact = false } = {}) {
-  const { cachedInputTokens, hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row, isLocalCacheHit);
+function buildCacheCellHtml(row, { compact = false } = {}) {
+  const { cachedInputTokens, hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row);
   const parts = [];
-  if (isLocalCacheHit) {
-    const layerLabel = cacheLayer ? cacheLayer.toUpperCase() : 'LOCAL';
-    parts.push(`<span class="usage-cache-detail usage-cache-local" title="本地缓存回放，跳过上游请求"><i class="fa fa-bolt" aria-hidden="true"></i>${compact ? layerLabel : `<strong>${layerLabel}</strong> 回放`}</span>`);
-  }
   if (hasUpstreamCache) {
     const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
     parts.push(`<span class="usage-cache-detail usage-cache-prompt" title="上游 Prompt 缓存读取 ${formatNumber(cachedInputTokens)} tokens"><i class="fa fa-minus-square" aria-hidden="true"></i>${compact ? rateText : `Prompt ${rateText}`}</span>`);
@@ -391,12 +396,9 @@ function buildCacheCellHtml(row, { isLocalCacheHit, cacheLayer, compact = false 
   return `<span class="usage-cache-stack${compact ? ' usage-cache-stack-compact' : ''}">${parts.join('')}</span>`;
 }
 
-function buildCompactCacheTags(row, isLocalCacheHit) {
-  const { hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row, isLocalCacheHit);
+function buildCompactCacheTags(row) {
+  const { hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row);
   const tags = [];
-  if (isLocalCacheHit) {
-    tags.push('<button type="button" class="usage-cache-tag usage-cache-tag-local usage-info-btn" data-popover="cache-local" aria-label="本地缓存回放说明">LOCAL</button>');
-  }
   if (hasUpstreamCache) {
     const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
     tags.push(`<button type="button" class="usage-cache-tag usage-cache-tag-prompt usage-info-btn" data-popover="cache-prompt" aria-label="上游 Prompt 缓存说明">PROMPT ${rateText}</button>`);
@@ -417,14 +419,6 @@ function attachUsagePopoverHandlers() {
       else if (type === 'cost') html = buildCostPopoverHtml(btn.dataset);
       else if (type === 'token-help') html = buildTokenHelpPopoverHtml();
       else if (type === 'cache-help') html = buildCacheHelpPopoverHtml();
-      else if (type === 'cache-local') html = `
-        <div class="usage-popover-title">本地回放说明</div>
-        <div class="usage-popover-rows">
-          <div class="usage-popover-row"><span>含义</span><span>本地 Relay 命中缓存，未发上游请求</span></div>
-          <div class="usage-popover-row"><span>效果</span><span>直接回放已缓存的响应文本</span></div>
-          <div class="usage-popover-row"><span>标记</span><span class="mono">LOCAL / CACHE</span></div>
-        </div>
-      `;
       else if (type === 'cache-prompt') html = `
         <div class="usage-popover-title">上游 Prompt 缓存说明</div>
         <div class="usage-popover-rows">
@@ -455,44 +449,27 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
   const isDetail = usageViewState.mode === USAGE_VIEW_MODES.detail;
   body.innerHTML = rows.map((row) => {
     const status = String(row.status || 'unknown');
-    // 解析缓存命中状态（优先从 status 字段判断，再从 meta_json 兜底）
-    let cacheHit = null;
-    if (status === 'cache_hit') {
-      try { cacheHit = JSON.parse(row.meta_json || '{}').cacheHit || { layer: 'unknown' }; } catch { cacheHit = { layer: 'unknown' }; }
-    } else {
-      try { cacheHit = JSON.parse(row.meta_json || '{}').cacheHit || null; } catch { /* ignore */ }
-    }
-    const isCacheHit = !!cacheHit || status === 'cache_hit';
-    const cacheLayer = cacheHit?.layer || '';
-    const statusClass = isCacheHit
-      ? 'usage-status-cache'
-      : status === 'success'
-        ? 'usage-status-ok'
-        : ['paid', 'pending'].includes(status)
-          ? 'usage-status-paid'
-          : ['stop', 'stopped', 'aborted', 'cancelled', 'canceled'].includes(status)
-            ? 'usage-status-stop'
-            : 'usage-status-warn';
-    const statusLabel = isCacheHit ? (cacheLayer ? `${cacheLayer.toUpperCase()} CACHE` : 'CACHE') : status.toUpperCase();
+    const normalizedStatus = status === 'cache_hit' ? 'success' : status;
+    const statusClass = normalizedStatus === 'success'
+      ? 'usage-status-ok'
+      : ['paid', 'pending'].includes(normalizedStatus)
+        ? 'usage-status-paid'
+        : ['stop', 'stopped', 'aborted', 'cancelled', 'canceled'].includes(normalizedStatus)
+          ? 'usage-status-stop'
+          : 'usage-status-warn';
+    const statusLabel = normalizedStatus.toUpperCase();
     const reasoningEffort = String(row.reasoning_effort || '').trim();
     const phase = String(row.phase || '-');
     const endpointMode = String(row.endpoint_mode || '').trim();
     const modeLabel = formatUsageModeLabel(row.mode);
-    const compactCacheTags = buildCompactCacheTags(row, isCacheHit);
+    const compactCacheTags = buildCompactCacheTags(row);
     const modelId = String(row.model || '').trim();
     const displayName = String(row.display_name || '').trim();
     const primaryModelText = displayName || modelId || '-';
     const showModelIdMeta = Boolean(modelId) && modelId !== primaryModelText;
-    // 缓存命中：费用归零显示，token 显示缓存标记
-    const displayCost = isCacheHit ? '$0.000000' : formatUsd(row.total_cost_usd);
-    // 构建状态单元格（含缓存标记）
-    const statusCellHtml = `<span class="usage-status ${statusClass}" title="${escapeHtml(row.error || '')}">${escapeHtml(statusLabel)}</span>`
-      + (isCacheHit
-        ? ` <span class="usage-cache-hit-badge" title="缓存回放 (${cacheLayer})"><i class="fa fa-bolt" aria-hidden="true"></i></span>`
-        : ''
-      );
+    const statusCellHtml = `<span class="usage-status ${statusClass}" title="${escapeHtml(row.error || '')}">${escapeHtml(statusLabel)}</span>`;
     return `
-      <tr class="${isCacheHit ? 'usage-row-cache-hit' : ''}">
+      <tr>
         <td class="mono usage-time">${escapeHtml(formatDate(row.created_at))}</td>
         <td class="usage-model-cell">
           <div class="usage-model${displayName ? '' : ' mono'}" title="${escapeHtml(primaryModelText)}">${escapeHtml(primaryModelText)}</div>
@@ -524,8 +501,8 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
         </td>
         <td class="usage-cost-cell">
           <div class="usage-cost-main">
-            <span class="usage-cost-value mono${isCacheHit ? ' usage-cost-cache' : ''}">${displayCost}</span>
-            ${!isCacheHit ? `<button type="button" class="usage-info-btn" aria-label="费用明细" data-popover="cost"
+            <span class="usage-cost-value mono">${formatUsd(row.total_cost_usd)}</span>
+            <button type="button" class="usage-info-btn" aria-label="费用明细" data-popover="cost"
               data-input-cost="${Number(row.input_cost_usd) || 0}"
               data-cached-input-cost="${Number(row.cached_input_cost_usd) || 0}"
               data-output-cost="${Number(row.output_cost_usd) || 0}"
@@ -537,11 +514,11 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
               data-points="${Number(row.billed_points) || Number(row.points) || 0}"
               data-price-source="${escapeHtml(row.price_source || '')}">
               <i class="fa fa-question-circle" aria-hidden="true"></i>
-            </button>` : ''}
+            </button>
           </div>
         </td>
         <td>${statusCellHtml}</td>
-        ${isDetail ? `<td class="usage-cache-cell">${buildCacheCellHtml(row, { isLocalCacheHit: isCacheHit, cacheLayer })}</td>` : ''}
+        ${isDetail ? `<td class="usage-cache-cell">${buildCacheCellHtml(row)}</td>` : ''}
         ${isDetail ? `<td class="mono usage-request" title="${escapeHtml(row.request_id || '')}">${escapeHtml(row.request_id || '-')}</td>` : ''}
       </tr>
     `;

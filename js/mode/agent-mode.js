@@ -56,11 +56,7 @@ function shouldUseNativeExecForTool(session, toolCall, helpers = {}) {
 
 function getUpstreamPhaseConfig(context = {}) {
   void context;
-  return {
-    fetch: {
-      preferredEndpointMode: 'chat',
-    },
-  };
+  return {};
 }
 
 module.exports = {
@@ -71,8 +67,6 @@ module.exports = {
   shouldUseNativeExecForTool,
   getUpstreamPhaseConfig,
   getUpstreamRequestOptions() {
-    return {
-      preferredEndpointMode: 'chat',
-    };
+    return {};
   },
 };

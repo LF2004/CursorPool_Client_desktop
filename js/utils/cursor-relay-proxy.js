@@ -290,7 +290,7 @@ function sanitizeRelayUpstream(upstream = null) {
     thinkingMode: ['enabled', 'disabled'].includes(String(upstream.thinkingMode || '').trim())
       ? String(upstream.thinkingMode || '').trim()
       : '',
-    contextWindow: Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 250000,
+    contextWindow: Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 200000,
   };
 }
 
@@ -324,7 +324,7 @@ function relayProfileToUpstream(profile = null) {
     endpointMode: String(profile.endpointMode || 'responses').trim() || 'responses',
     reasoningEffort: String(profile.reasoningEffort || 'medium').trim() || 'medium',
     thinkingMode: String(profile.thinkingMode || '').trim(),
-    contextWindow: Number(profile.contextWindow) > 0 ? Number(profile.contextWindow) : 250000,
+    contextWindow: Number(profile.contextWindow) > 0 ? Number(profile.contextWindow) : 200000,
   };
 }
 
@@ -346,7 +346,6 @@ function buildRelayStartOptionsFromConfig(config = null, overrides = {}) {
   const existing = config && typeof config === 'object' ? config : {};
   const nextMode = String(overrides.mode || existing.mode || 'local_relay');
   const isLocalRelay = nextMode === 'local_relay';
-  const hasReviewBridgeOverride = Object.prototype.hasOwnProperty.call(overrides, 'enableReviewBridge');
   const maxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(
     overrides.maxLocalToolCallsPerRound
       || existing.maxLocalToolCallsPerRound
@@ -363,12 +362,44 @@ function buildRelayStartOptionsFromConfig(config = null, overrides = {}) {
       : (overrides.emitLocalStepFrames === true || existing.emitLocalStepFrames === true),
     emitSyntheticLocalNativeToolFrames: false,
     maxLocalToolCallsPerRound,
-    enableReviewBridge: hasReviewBridgeOverride
+    enableReviewBridge: Object.prototype.hasOwnProperty.call(overrides, 'enableReviewBridge')
       ? overrides.enableReviewBridge === true
-      : Object.prototype.hasOwnProperty.call(existing, 'enableReviewBridge')
-        ? existing.enableReviewBridge === true
-        : DEFAULT_ENABLE_REVIEW_BRIDGE,
+      : DEFAULT_ENABLE_REVIEW_BRIDGE,
   };
+}
+
+function normalizeRelayEndpointMode(value) {
+  const mode = String(value || '').trim().toLowerCase();
+  return mode === 'chat' ? 'chat' : 'responses';
+}
+
+function normalizeRelayReasoningEffort(value) {
+  const effort = String(value || '').trim().toLowerCase();
+  if (!effort) return 'medium';
+  if (effort === 'xhigh') return 'extra-high';
+  return effort;
+}
+
+function normalizeRelayBaseUrlForCompare(value) {
+  return String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function normalizeRelayThinkingMode(value) {
+  const thinking = String(value || '').trim().toLowerCase();
+  return thinking === 'enabled' ? 'enabled' : thinking === 'disabled' ? 'disabled' : '';
+}
+
+function isSameRelayUpstreamConfig(current = null, next = null) {
+  if (!current || !next) return false;
+  return (
+    normalizeRelayBaseUrlForCompare(current.baseUrl) === normalizeRelayBaseUrlForCompare(next.baseUrl)
+    && String(current.modelName || '').trim() === String(next.modelName || '').trim()
+    && normalizeRelayEndpointMode(current.endpointMode) === normalizeRelayEndpointMode(next.endpointMode)
+    && normalizeRelayReasoningEffort(current.reasoningEffort) === normalizeRelayReasoningEffort(next.reasoningEffort)
+    && normalizeRelayThinkingMode(current.thinkingMode) === normalizeRelayThinkingMode(next.thinkingMode)
+    && Math.max(1, Number(current.contextWindow) || 0) === Math.max(1, Number(next.contextWindow) || 0)
+    && String(current.apiKey || '').trim() === String(next.apiKey || '').trim()
+  );
 }
 
 function getCursorUserDir() {
@@ -783,10 +814,9 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   const frontProxyPort = Number(payload.frontProxyPort || payload.proxyPort || payload.runnerPort || DEFAULT_PORT);
   const disableHttp2 = payload.disableHttp2 !== false;
   const proxyStrictSSL = payload.proxyStrictSSL === true;
-  const reviewBridgeStatus = readRelayReviewBridgePatchStatus(resolveMainJsPath());
   const enableReviewBridge = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge')
     ? payload.enableReviewBridge === true
-    : Boolean(reviewBridgeStatus.reviewBridgePatched);
+    : DEFAULT_ENABLE_REVIEW_BRIDGE;
   const restartCursor = requestedRestartCursor;
   let proxyServer = '';
   let proxyPacUrl = '';
@@ -833,31 +863,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   }
 
   let runner = null;
-  let cursorAuthEnsure = null;
-  if (upstream && runnerMode !== 'official_passthrough' && payload.ensureCursorAuth !== false && payload.skipCursorAuthEnsure !== true) {
-    // 优先用新的 account-store（defult_user.json 模板 → state.vscdb）
-    cursorAuthEnsure = await ensureCursorAccount({
-      credentials: payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
-      allowRunningCursor: false,
-    }).catch(async (err) => {
-      // account-store 失败时兜底走旧的 ensureCursorAuthIfNeeded
-      return ensureCursorAuthIfNeeded(
-        payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
-      );
-    });
-    // 兼容旧字段名
-    if (cursorAuthEnsure?.reason === 'no_account_available') {
-      cursorAuthEnsure = await ensureCursorAuthIfNeeded(
-        payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
-      );
-    }
-    if (cursorAuthEnsure?.reason === 'missing_local_guest' || cursorAuthEnsure?.reason === 'no_account_available') {
-      throw new Error('Cursor 未登录且未找到本地免登账号，请配置 js/hook/defult_user.json 或 js/utils/users.json（email + token）');
-    }
-    if (cursorAuthEnsure?.reason === 'state_vscdb_missing') {
-      throw new Error('state.vscdb 不存在，请先启动一次 Cursor');
-    }
-  }
+  const cursorAuthEnsure = null;
   if (upstream || runnerMode === 'official_passthrough') {
     const officialPassthrough = runnerMode === 'official_passthrough';
     const localNativeAgentTools = officialPassthrough ? false : true;
@@ -887,6 +893,8 @@ async function applyCursorRelayProxyConfig(payload = {}) {
       modelCatalogSyncResult = await syncCursorRelayModelCatalog({
         modelName: upstream.modelName,
         availableModels: upstream.availableModels,
+        contextWindow: upstream.contextWindow,
+        reasoningEffort: upstream.reasoningEffort,
       }).catch((error) => ({
         ok: false,
         skipped: false,
@@ -1124,7 +1132,7 @@ async function restartRelayRunnerAfterCertRepair(payload = {}) {
       mode,
       enableReviewBridge: Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge')
         ? payload.enableReviewBridge === true
-        : status.runner?.enableReviewBridge ?? lastConfig?.enableReviewBridge,
+        : DEFAULT_ENABLE_REVIEW_BRIDGE,
     });
     const runner = await startLocalRelayRunner({
       mode,
@@ -1209,9 +1217,7 @@ async function ensureCursorRelayRunner(payload = {}) {
   const lastConfig = readLastRelayRunnerConfig();
   const desiredReviewBridge = hasReviewBridgePreference
     ? payload.enableReviewBridge === true
-    : status.runner?.running
-      ? Boolean(status.runner?.enableReviewBridge)
-      : lastConfig?.enableReviewBridge === true;
+    : DEFAULT_ENABLE_REVIEW_BRIDGE;
   if (
     status.runner?.running
     && Number(status.runner?.port || port) === port
@@ -1280,6 +1286,13 @@ async function quickSwitchRelayModel(payload = {}) {
     availableModels: Array.isArray(store.configs)
       ? store.configs.map((item) => String(item?.modelName || '').trim()).filter(Boolean)
       : [profile.modelName],
+    contextWindow: profile.contextWindow,
+    reasoningEffort: profile.reasoningEffort,
+  }).catch(() => null);
+  await syncCursorRelayProviderConfig({
+    enabled: true,
+    baseUrl: 'http://127.0.0.1:17789/v1',
+    apiKey: 'cursor-relay-local',
   }).catch(() => null);
 
   const modelRoutes = buildRelayModelRoutesFromStore(store);
@@ -1296,6 +1309,10 @@ async function quickSwitchRelayModel(payload = {}) {
     String(status?.runner?.upstream?.modelName || '').trim(),
     String(status?.runner?.upstreamModelName || '').trim(),
   ].filter(Boolean));
+  const activeRunnerUpstream = status?.runner?.upstream && typeof status.runner.upstream === 'object'
+    ? status.runner.upstream
+    : null;
+  const sameRunnerUpstream = isSameRelayUpstreamConfig(activeRunnerUpstream, upstream);
 
   if (
     relayEnabled
@@ -1303,6 +1320,7 @@ async function quickSwitchRelayModel(payload = {}) {
     && !switchingFromOfficialPassthrough
     && (currentMode === 'local_relay' || !currentMode)
     && currentRunnerModelNames.has(String(profile.modelName || '').trim())
+    && sameRunnerUpstream
   ) {
     appendRunnerLog(`[info] quickSwitch hot-switch profileId=${profileId} model=${String(profile.modelName || '')} runnerRestart=0`, '');
     return {
@@ -1331,7 +1349,7 @@ async function quickSwitchRelayModel(payload = {}) {
       structuredAgentToolCalls: true,
       emitLocalToolInteractionFrames: true,
       emitLocalStepFrames: true,
-      enableReviewBridge: status?.runner?.enableReviewBridge === true,
+      enableReviewBridge: DEFAULT_ENABLE_REVIEW_BRIDGE,
       skipCursorAuthEnsure: true,
     });
     return {
@@ -1373,7 +1391,7 @@ async function quickSwitchRelayModel(payload = {}) {
       ? true
       : status?.runner?.emitLocalStepFrames === true,
     maxLocalToolCallsPerRound: status?.runner?.maxLocalToolCallsPerRound || 12,
-    enableReviewBridge: status?.runner?.enableReviewBridge === true,
+    enableReviewBridge: DEFAULT_ENABLE_REVIEW_BRIDGE,
     skipCursorAuthEnsure: true,
   });
   return {

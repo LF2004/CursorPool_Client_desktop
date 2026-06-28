@@ -18,7 +18,9 @@ async function main() {
   if (wb) {
     const wt = fs.readFileSync(wb, 'utf8');
     console.log('review signature found:', wt.includes('const S=lHg(e),E=aym(v),I=di(()=>y==="edit"&&a$g(t),[t,y]),R='));
-    console.log('review effect anchor found:', wt.includes('},[a,V,t,i]);const Be=di(()=>{'));
+    console.log('review effect anchor found:', wt.includes(review.REVIEW_BRIDGE_EFFECT_ANCHOR));
+    console.log('inline diff anchor found (legacy):', wt.includes(review.INLINE_DIFF_SERVICE_ANCHOR));
+    console.log('inline diff anchor found (current):', wt.includes(review.INLINE_DIFF_SERVICE_ANCHOR_VARIANT));
     console.log('review patched:', review.hasRelayReviewBridgePatch(wt));
   }
 

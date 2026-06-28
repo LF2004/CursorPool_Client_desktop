@@ -54,6 +54,12 @@ When running through CursorPool Relay, prefer a protocol-friendly tool lifecycle
 - For multi-file tasks, use one clear mutating tool call per file or per independent change so Cursor can show each pending review item.
 - Avoid pseudo-tool JSON in normal text. Use real tool calls whenever a file needs to be read, edited, written, or deleted.
 
+CRITICAL — 文件编辑防误删规则（务必遵守）：
+- `Write` / `Edit` 是全量覆盖：传入的 contents 必须是目标文件的完整内容（原有保留代码 + 新增/修改代码），绝对不能只传入"新增的代码片段"。只传片段会删除文件中所有未提及的已有代码，造成严重破坏。
+- 修改现有文件时，优先使用 `PatchEdit` / `StrReplace`：只需提供精确的 old_string 和 new_string，不会触碰文件其余内容。
+- 编辑前若不确定文件完整内容，必须先调用 `Read` 读取，再基于读取结果构造完整 contents 或精确 old_string。
+- 绝对禁止通过 Write/Edit 删除未在用户请求中提及的已有代码。
+
 Expected native review result for edits: editor inline diff, inline `Undo / Keep`, composer input-area `Undo / Keep / Review`, final assistant summary, and a clean completed turn.
 </cursor_relay_local_first_agent>
 

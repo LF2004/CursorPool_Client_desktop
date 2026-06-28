@@ -75,8 +75,6 @@ module.exports = {
   buildLocalRelayMessages,
   shouldUseNativeExecForTool,
   getUpstreamRequestOptions() {
-    return {
-      preferredEndpointMode: 'chat',
-    };
+    return {};
   },
 };

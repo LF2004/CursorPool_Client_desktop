@@ -44,6 +44,9 @@ const {
   closeUsageDbs,
 } = require('./js/utils/cursor-relay-usage-store');
 const {
+  getLocalRelayRunnerStatus,
+} = require('./js/utils/cursor-relay-runner-manager');
+const {
   loadRelayProfileStore,
   saveRelayProfileStore,
   closeProfileDbs,
@@ -410,9 +413,7 @@ ipcMain.handle('cursorRelay:openLogDir', async () => {
   return { ok: true, dir, displayPath: paths.displayPath };
 });
 
-ipcMain.handle('cursorRelayUsage:list', async (_event, payload = {}) => {
-  return listRelayUsage('', payload);
-});
+ipcMain.handle('cursorRelayUsage:list', async (_event, payload = {}) => listRelayUsage('', payload));
 ipcMain.handle('cursorRelayUsage:clear', async () => clearRelayUsage(''));
 ipcMain.handle('cursorRelayProfiles:load', async () => loadRelayProfileStore(''));
 ipcMain.handle('cursorRelayProfiles:save', async (_event, payload = {}) => saveRelayProfileStore(payload, ''));

@@ -107,10 +107,11 @@ function getLocalModelCatalogSnapshot() {
     .filter(Boolean);
   if (!availableModels.length) return null;
 
+  let activeProfile = null;
   let primaryModel = '';
   try {
     const store = loadRelayProfileStore('');
-    const activeProfile = Array.isArray(store?.configs)
+    activeProfile = Array.isArray(store?.configs)
       ? store.configs.find((item) => String(item?.id || '') === String(store?.activeId || ''))
       : null;
     primaryModel = String(activeProfile?.modelName || '').trim();
@@ -124,6 +125,8 @@ function getLocalModelCatalogSnapshot() {
   return {
     modelName: primaryModel,
     availableModels,
+    contextWindow: Number(activeProfile?.contextWindow) > 0 ? Number(activeProfile.contextWindow) : undefined,
+    reasoningEffort: String(activeProfile?.reasoningEffort || '').trim() || undefined,
   };
 }
 

@@ -1,4 +1,5 @@
 const { gunzipSync, inflateSync, brotliDecompressSync } = require('zlib');
+const { encodeMessageSync: encodeCursorProtoMessageSync } = require('./cursor-relay-protobuf');
 
 const AGENT_CLIENT_MESSAGE_FIELDS = {
   1: 'run_request',
@@ -452,15 +453,34 @@ function summarizeCreatePlanArgsPayload(payload) {
 function summarizeTaskArgsPayload(payload) {
   const fields = parseFields(payload || Buffer.alloc(0));
   const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
-  const subagentTypeFields = parseFields(getFieldBytes(argsFields, 3) || Buffer.alloc(0));
-  const subagentType = {};
-  if (getFieldBytes(subagentTypeFields, 1)) {
-    subagentType.explore = decodeUtf8(getFieldBytes(subagentTypeFields, 1) || Buffer.alloc(0)).trim() || 'explore';
-  }
+  const subagentTypeValue = decodeUtf8(getFieldBytes(argsFields, 3) || Buffer.alloc(0)).trim();
+  const subagentType = subagentTypeValue ? { [subagentTypeValue]: subagentTypeValue } : {};
   return {
     description: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
     prompt: decodeUtf8(getFieldBytes(argsFields, 2) || Buffer.alloc(0)).trim(),
     subagentType,
+    model: decodeUtf8(getFieldBytes(argsFields, 4) || Buffer.alloc(0)).trim(),
+    name: decodeUtf8(getFieldBytes(argsFields, 5) || Buffer.alloc(0)).trim(),
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeReportBugfixResultsArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const results = argsFields
+    .filter((field) => field.field === 2 && field.wireType === 2)
+    .map((field) => {
+      const resultFields = parseFields(field.bytes);
+      return {
+        title: decodeUtf8(getFieldBytes(resultFields, 1) || Buffer.alloc(0)).trim(),
+        summary: decodeUtf8(getFieldBytes(resultFields, 2) || Buffer.alloc(0)).trim(),
+        status: decodeUtf8(getFieldBytes(resultFields, 3) || Buffer.alloc(0)).trim(),
+      };
+    });
+  return {
+    summary: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    results,
     toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
   };
 }
@@ -532,20 +552,29 @@ function summarizeInteractionQuery(payload) {
   const createPlanPayload = getFieldBytes(fields, 7);
   const webSearchPayload = getFieldBytes(fields, 2);
   const taskPayload = getFieldBytes(fields, 19);
+  const taskV2Payload = getFieldBytes(fields, 69);
+  const reportBugfixPayload = getFieldBytes(fields, 78);
   return {
     id: getFieldVarint(fields, 1) ?? null,
     kind: askPayload
       ? 'ask_question_interaction_query'
       : createPlanPayload
         ? 'create_plan_request_query'
-        : taskPayload
+        : taskV2Payload || taskPayload
           ? 'task_tool_query'
+          : reportBugfixPayload
+            ? 'report_bugfix_results_query'
         : webSearchPayload
           ? 'web_search_request_query'
           : '',
     askQuestion: askPayload ? summarizeAskQuestionArgsPayload(askPayload) : null,
     createPlan: createPlanPayload ? summarizeCreatePlanArgsPayload(createPlanPayload) : null,
-    task: taskPayload ? summarizeTaskArgsPayload(taskPayload) : null,
+    task: taskV2Payload
+      ? summarizeTaskArgsPayload(taskV2Payload)
+      : taskPayload
+        ? summarizeTaskArgsPayload(taskPayload)
+        : null,
+    reportBugfixResults: reportBugfixPayload ? summarizeReportBugfixResultsArgsPayload(reportBugfixPayload) : null,
     webSearch: webSearchPayload
       ? {
           searchTerm: decodeUtf8(getFieldBytes(parseFields(webSearchPayload), 1) || Buffer.alloc(0)).trim(),
@@ -964,6 +993,8 @@ function mapAgentModeNumberToName(value) {
       return 'AGENT_MODE_TRIAGE';
     case 6:
       return 'AGENT_MODE_PROJECT';
+    case 7:
+      return 'AGENT_MODE_MULTITASK';
     default:
       return 'AGENT_MODE_UNSPECIFIED';
   }
@@ -1748,6 +1779,56 @@ function buildAgentInteractionFrame(innerField, innerPayload) {
   return buildAgentServerMessageField(1, interaction);
 }
 
+function buildAgentInteractionUpdateProtoFrame(interactionUpdate = {}) {
+  try {
+    const payload = encodeCursorProtoMessageSync('agent.v1.AgentServerMessage', {
+      interactionUpdate,
+    });
+    return connectFrame(0, payload);
+  } catch {
+    return Buffer.alloc(0);
+  }
+}
+
+function buildAgentBackgroundSubagentActionFrame(toolCallId = '') {
+  const normalizedToolCallId = String(toolCallId || '').trim();
+  if (!normalizedToolCallId) return Buffer.alloc(0);
+  return buildAgentInteractionUpdateProtoFrame({
+    conversationAction: {
+      backgroundSubagentAction: {
+        toolCallId: normalizedToolCallId,
+      },
+    },
+  });
+}
+
+function buildAgentBackgroundTaskCompletionActionFrame(record = {}) {
+  const taskId = String(record?.taskUuid || record?.agentId || '').trim();
+  const toolCallId = String(record?.parentToolCallId || taskId).trim();
+  if (!taskId || !toolCallId) return Buffer.alloc(0);
+  const status = String(record?.status || '').trim().toLowerCase();
+  return buildAgentInteractionUpdateProtoFrame({
+    conversationAction: {
+      backgroundTaskCompletionAction: {
+        completions: [{
+          taskId,
+          kind: 'BACKGROUND_TASK_KIND_SUBAGENT',
+          status: status === 'failed' ? 'BACKGROUND_TASK_COMPLETION_STATUS_ERROR' : 'BACKGROUND_TASK_COMPLETION_STATUS_SUCCESS',
+          title: String(record?.title || record?.name || 'Background task').trim() || 'Background task',
+          detail: String(record?.summary || record?.resultText || '').trim() || undefined,
+          outputPath: String(record?.outputPath || '').trim() || undefined,
+          threadId: String(record?.stableConversationId || '').trim() || undefined,
+          reason: status === 'failed'
+            ? 'BACKGROUND_TASK_COMPLETION_REASON_ERROR'
+            : 'BACKGROUND_TASK_COMPLETION_REASON_TASK_FINISHED',
+          subagentId: String(record?.agentId || taskId).trim() || undefined,
+          toolCallId,
+        }],
+      },
+    },
+  });
+}
+
 function buildAgentTextDeltaFrame(text) {
   return buildAgentInteractionFrame(1, encodeMessage([{ field: 1, value: String(text || '') }]));
 }
@@ -1914,10 +1995,16 @@ function buildAgentConversationCheckpointFrame(options = {}) {
   const workspaceRoot = normalizeCheckpointPath(options.workspaceRoot || '');
   const previousWorkspaceUri = options.previousWorkspaceUri || toWorkspaceUri(workspaceRoot);
   const rootPromptMessagesJson = Array.isArray(options.rootPromptMessagesJson) ? options.rootPromptMessagesJson : [];
+  const todos = Array.isArray(options.todos) ? options.todos : [];
   const turns = Array.isArray(options.turns) ? options.turns : [];
   const pendingToolCalls = Array.isArray(options.pendingToolCalls) ? options.pendingToolCalls : [];
   const readPaths = Array.isArray(options.readPaths) ? options.readPaths.map(normalizeCheckpointPath).filter(Boolean) : [];
   const fileStates = options.fileStates && typeof options.fileStates === 'object' ? options.fileStates : {};
+  const subagentStates = options.subagentStates && typeof options.subagentStates === 'object' ? options.subagentStates : {};
+  const subagentThreads = options.subagentThreads && typeof options.subagentThreads === 'object' ? options.subagentThreads : {};
+  const subagentRunsByParentToolCallId = options.subagentRunsByParentToolCallId && typeof options.subagentRunsByParentToolCallId === 'object'
+    ? options.subagentRunsByParentToolCallId
+    : {};
   const planText = typeof options.plan === 'string'
     ? options.plan
     : (typeof options.planText === 'string' ? options.planText : '');
@@ -1927,6 +2014,15 @@ function buildAgentConversationCheckpointFrame(options = {}) {
       normalizeCheckpointPath(key),
       encodeFileStateStructure(state),
     )));
+  const subagentStateEntries = Object.entries(subagentStates)
+    .filter(([key, value]) => key && value != null)
+    .map(([key, value]) => encodeBytesField(16, encodeStringMapEntry(String(key), Buffer.from(String(value), 'utf8'))));
+  const subagentThreadEntries = Object.entries(subagentThreads)
+    .filter(([key, value]) => key && value != null)
+    .map(([key, value]) => encodeBytesField(24, encodeStringMapEntry(String(key), Buffer.from(String(value), 'utf8'))));
+  const subagentRunEntries = Object.entries(subagentRunsByParentToolCallId)
+    .filter(([key, value]) => key && value != null)
+    .map(([key, value]) => encodeBytesField(30, encodeStringMapEntry(String(key), Buffer.from(String(value), 'utf8'))));
   const promptTokenBreakdown = options.breakdown && typeof options.breakdown === 'object'
     ? options.breakdown
     : (options.promptTokenBreakdown && typeof options.promptTokenBreakdown === 'object'
@@ -1943,6 +2039,7 @@ function buildAgentConversationCheckpointFrame(options = {}) {
   ]);
   const payload = concatBytes([
     ...rootPromptMessagesJson.map((item) => encodeBytesField(1, Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'))),
+    ...todos.map((item) => encodeBytesField(3, encodeAgentTodoItem(item))),
     ...pendingToolCalls.map((item) => encodeBytesField(4, String(item || ''))),
     encodeBytesField(5, tokenDetails),
     planText ? encodeBytesField(7, encodeConversationPlanStructure(planText)) : Buffer.alloc(0),
@@ -1950,7 +2047,10 @@ function buildAgentConversationCheckpointFrame(options = {}) {
     previousWorkspaceUri ? encodeBytesField(9, previousWorkspaceUri) : Buffer.alloc(0),
     encodeInt32Field(10, 1),
     ...fileStateEntries,
+    ...subagentStateEntries,
     ...readPaths.map((item) => encodeBytesField(18, item)),
+    ...subagentThreadEntries,
+    ...subagentRunEntries,
   ]);
   return buildAgentServerMessageField(3, payload);
 }
@@ -1987,7 +2087,69 @@ function getAgentNativeToolSpec(toolName) {
   if (normalized === 'task') return { field: 19, name: 'Task' };
   if (normalized === 'askquestion' || normalized === 'ask_question') return { field: 23, name: 'AskQuestion' };
   if (normalized === 'webfetch' || normalized === 'web_fetch' || normalized === 'fetch') return { field: 37, name: 'WebFetch' };
+  if (normalized === 'reportbugfixresults' || normalized === 'report_bugfix_results' || normalized === 'debuglogs' || normalized === 'reproductionsteps') {
+    return { field: 78, name: 'ReportBugfixResults' };
+  }
   return null;
+}
+
+function normalizeTaskSubagentType(subagentTypeValue) {
+  if (!subagentTypeValue) return '';
+  if (typeof subagentTypeValue === 'string') return String(subagentTypeValue).trim();
+  if (typeof subagentTypeValue !== 'object' || Array.isArray(subagentTypeValue)) return '';
+  const keys = Object.keys(subagentTypeValue).filter(Boolean);
+  if (!keys.length) return '';
+  const firstKey = String(keys[0]).trim();
+  const firstValue = String(subagentTypeValue[firstKey] || '').trim();
+  return firstValue || firstKey;
+}
+
+function encodeTaskSubagentType(subagentTypeValue) {
+  const normalized = normalizeTaskSubagentType(subagentTypeValue).trim().toLowerCase();
+  if (!normalized) {
+    return encodeBytesField(1, Buffer.alloc(0));
+  }
+  if (normalized.includes('debug')) {
+    return encodeBytesField(10, Buffer.alloc(0));
+  }
+  if (normalized.includes('explore')) {
+    return encodeBytesField(4, Buffer.alloc(0));
+  }
+  if (normalized.includes('shell')) {
+    return encodeBytesField(8, Buffer.alloc(0));
+  }
+  if (normalized.includes('computer')) {
+    return encodeBytesField(2, Buffer.alloc(0));
+  }
+  if (normalized.includes('browser')) {
+    return encodeBytesField(7, Buffer.alloc(0));
+  }
+  if (normalized.includes('bash')) {
+    return encodeBytesField(6, Buffer.alloc(0));
+  }
+  return encodeBytesField(3, concatBytes([
+    encodeOptionalStringField(1, normalizeTaskSubagentType(subagentTypeValue)),
+  ]));
+}
+
+function buildTaskSubagentTypeProto(subagentTypeValue) {
+  const normalized = normalizeTaskSubagentType(subagentTypeValue).trim();
+  const lower = normalized.toLowerCase();
+  if (!lower) return { unspecified: {} };
+  if (lower.includes('debug')) return { debug: {} };
+  if (lower.includes('explore')) return { explore: {} };
+  if (lower.includes('shell')) return { shell: {} };
+  if (lower.includes('computer')) return { computerUse: {} };
+  if (lower.includes('browser')) return { browserUse: {} };
+  if (lower.includes('bash')) {
+    return { bash: {} };
+  }
+  // general-purpose subagent maps to 'custom' (enum value 3) which Cursor UI
+  // recognises as a valid real subagent rather than unspecified/placeholder.
+  if (lower.includes('generalpurpose') || lower.includes('general-purpose') || lower.includes('general')) {
+    return { custom: {} };
+  }
+  return { custom: { name: normalized } };
 }
 
 function normalizeAgentTodoStatus(status = '') {
@@ -2365,24 +2527,50 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
   if (normalized === 'task') {
     const description = String(safeArgs.description || '').trim();
     const prompt = String(safeArgs.prompt || '').trim();
-    const subagentType = safeArgs.subagent_type || safeArgs.subagentType || {};
+    const includeResult = execution.includeResult !== false;
+    const taskToolCall = {
+      args: {
+        description,
+        prompt,
+        subagentType: buildTaskSubagentTypeProto(safeArgs.subagent_type || safeArgs.subagentType || ''),
+        model: String(safeArgs.model || '').trim(),
+        resume: String(safeArgs.resume || '').trim() || undefined,
+        agentId: String(execution.agentId || '').trim() || undefined,
+        attachments: Array.isArray(safeArgs.attachments) ? safeArgs.attachments : [],
+      },
+    };
+    if (includeResult) {
+      taskToolCall.result = execution.ok === false
+        ? { error: { error: String(execution.resultText || 'Task failed').trim() } }
+        : {
+          success: {
+            conversationSteps: Array.isArray(execution.conversationStepsJson) ? execution.conversationStepsJson : [],
+            agentId: String(execution.agentId || '').trim(),
+            isBackground: execution.isBackground === true,
+            durationMs: Number(execution.durationMs) || 0,
+            resultSuffix: String(execution.resultSuffix || '').trim() || undefined,
+            transcriptPath: String(execution.transcriptPath || '').trim() || undefined,
+          },
+        };
+    }
+    return { taskToolCall };
+  }
+  if (
+    normalized === 'reportbugfixresults'
+    || normalized === 'report_bugfix_results'
+    || normalized === 'debuglogs'
+    || normalized === 'reproductionsteps'
+  ) {
+    const errorText = String(execution.resultText || execution.error || 'ReportBugfixResults failed').trim();
     return {
-      taskToolCall: {
+      reportBugfixResultsToolCall: {
         args: {
-          description,
-          prompt,
-          subagentType,
-          toolCallId: callId || undefined,
+          summary: String(safeArgs.summary || '').trim(),
+          results: Array.isArray(safeArgs.results) ? safeArgs.results : [],
         },
         result: execution.ok === false
-          ? { error: { errorMessage: execution.resultText || 'Task failed' } }
-          : {
-            success: {
-              agentId: String(execution.agentId || '').trim(),
-              isBackground: execution.isBackground === true,
-              durationMs: Number(execution.durationMs) || 0,
-            },
-          },
+          ? { error: { errorMessage: errorText } }
+          : { success: {} },
       },
     };
   }
@@ -2497,19 +2685,25 @@ function encodeAgentToolArgsPayload(toolName, args = {}, toolCallId = '') {
         encodeOptionalStringField(2, toolCallId),
       ]);
     case 'Task': {
-      const subagentType = normalizedArgs.subagent_type || normalizedArgs.subagentType || {};
-      const exploreValue = typeof subagentType === 'object' && subagentType
-        ? String(subagentType.explore || '').trim()
-        : /explore/i.test(String(subagentType || '')) ? 'explore' : '';
       return concatBytes([
         encodeOptionalStringField(1, normalizedArgs.description),
         encodeOptionalStringField(2, normalizedArgs.prompt),
-        exploreValue
-          ? encodeBytesField(3, concatBytes([
-            encodeOptionalStringField(1, exploreValue),
-          ]))
-          : Buffer.alloc(0),
-        encodeOptionalStringField(4, toolCallId),
+        encodeBytesField(3, encodeTaskSubagentType(normalizedArgs.subagent_type || normalizedArgs.subagentType || '')),
+        encodeOptionalStringField(4, normalizedArgs.model),
+        encodeOptionalStringField(5, normalizedArgs.resume),
+        encodeOptionalStringField(6, normalizedArgs.agent_id || normalizedArgs.agentId),
+        encodeRepeatedStringField(7, normalizedArgs.attachments),
+      ]);
+    }
+    case 'ReportBugfixResults': {
+      const results = Array.isArray(normalizedArgs.results) ? normalizedArgs.results : [];
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.summary),
+        ...results.map((item) => encodeBytesField(2, concatBytes([
+          encodeOptionalStringField(1, item?.title),
+          encodeOptionalStringField(2, item?.summary),
+          encodeOptionalStringField(3, item?.status),
+        ]))),
       ]);
     }
     default:
@@ -2698,11 +2892,24 @@ function encodeAgentToolResultPayload(toolName, args = {}, execution = null, too
       return encodeMessage([{
         field: 1,
         value: concatBytes([
-          encodeOptionalStringField(2, execution.agentId || ''),
-          encodeOptionalBoolField(3, execution.isBackground === true),
+          encodeOptionalStringField(1, execution.agentId || ''),
+          encodeOptionalBoolField(2, execution.isBackground === true),
           encodeOptionalInt64Field(4, Number(execution.durationMs) || 0),
+          encodeOptionalStringField(5, execution.resultSuffix || ''),
+          encodeOptionalStringField(7, execution.transcriptPath || ''),
         ]),
       }]);
+    }
+    case 'ReportBugfixResults': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'ReportBugfixResults failed'),
+          ]),
+        }]);
+      }
+      return encodeMessage([{ field: 1, value: Buffer.alloc(0) }]);
     }
     case 'AskQuestion': {
       if (!execution.ok) {
@@ -2794,6 +3001,18 @@ function buildAgentToolCallStartedFrame(toolName, argumentsValue = {}, toolCallI
 
 function buildAgentToolCallCompletedFrame(toolName, argumentsValue = {}, toolCallId = '', modelCallId = '', options = {}) {
   const normalizedCallId = String(toolCallId || `tool_${Date.now().toString(36)}`);
+  if (String(toolName || '').trim().toLowerCase() === 'task') {
+    const structuredToolCall = buildStructuredToolCallSnapshot(toolName, argumentsValue, options.execution || {}, normalizedCallId);
+    if (structuredToolCall) {
+      return buildAgentInteractionUpdateProtoFrame({
+        toolCallCompleted: {
+          callId: normalizedCallId,
+          toolCall: structuredToolCall,
+          modelCallId: String(modelCallId || ''),
+        },
+      });
+    }
+  }
   return buildAgentInteractionFrame(3, concatBytes([
     encodeBytesField(1, normalizedCallId),
     encodeBytesField(2, encodeAgentToolCallPayload(toolName, argumentsValue, normalizedCallId, options)),
@@ -2808,6 +3027,65 @@ function buildAgentToolCallProgressFrame(toolName, argumentsValue = {}, toolCall
     encodeBytesField(2, encodeAgentToolCallPayload(toolName, argumentsValue, normalizedCallId, options)),
     encodeBytesField(3, String(modelCallId || '')),
   ]));
+}
+
+function buildAgentTaskToolCallDeltaFrame(updateKind = 'partial', argumentsValue = {}, toolCallId = '', modelCallId = '', options = {}) {
+  const normalizedCallId = String(toolCallId || `tool_${Date.now().toString(36)}`);
+  const execution = options.execution || {};
+  const structuredToolCall = buildStructuredToolCallSnapshot('Task', argumentsValue, execution, normalizedCallId);
+  if (!structuredToolCall) return Buffer.alloc(0);
+  // ToolCall message (agent.v1.ToolCall) carries metadata alongside the oneof tool:
+  //   tool_call_id = 57, started_at_ms = 59, completed_at_ms = 60.
+  // The UI uses tool_call_id to correlate the delta with TaskStreamLog requests, and
+  // the timestamps to render duration. Without these the client may fall back to a
+  // generic placeholder card.
+  structuredToolCall.toolCallId = normalizedCallId;
+  if (Number(execution.startedAtMs) > 0) {
+    structuredToolCall.startedAtMs = String(execution.startedAtMs);
+  }
+  if (Number(execution.completedAtMs) > 0) {
+    structuredToolCall.completedAtMs = String(execution.completedAtMs);
+  }
+  const nestedUpdate = {
+    partial: {
+      partialToolCall: {
+        callId: normalizedCallId,
+        toolCall: structuredToolCall,
+        modelCallId: String(modelCallId || ''),
+      },
+    },
+    started: {
+      toolCallStarted: {
+        callId: normalizedCallId,
+        toolCall: structuredToolCall,
+        modelCallId: String(modelCallId || ''),
+      },
+    },
+    completed: {
+      toolCallCompleted: {
+        callId: normalizedCallId,
+        toolCall: structuredToolCall,
+        modelCallId: String(modelCallId || ''),
+      },
+    },
+  }[String(updateKind || 'partial').trim().toLowerCase()] || {
+    partialToolCall: {
+      callId: normalizedCallId,
+      toolCall: structuredToolCall,
+      modelCallId: String(modelCallId || ''),
+    },
+  };
+  return buildAgentInteractionUpdateProtoFrame({
+    toolCallDelta: {
+      callId: normalizedCallId,
+      modelCallId: String(modelCallId || ''),
+      toolCallDelta: {
+        taskToolCallDelta: {
+          interactionUpdate: nestedUpdate,
+        },
+      },
+    },
+  });
 }
 
 function buildAgentEditToolCallDeltaFrame(text, toolCallId = '', modelCallId = '') {
@@ -2986,6 +3264,7 @@ module.exports = {
   buildAgentToolCallStartedFrame,
   buildAgentToolCallCompletedFrame,
   buildAgentToolCallProgressFrame,
+  buildAgentTaskToolCallDeltaFrame,
   buildAgentEditToolCallDeltaFrame,
   buildAgentTurnEndedFrame,
   buildAgentHeartbeatFrame,
