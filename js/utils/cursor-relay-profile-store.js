@@ -120,6 +120,7 @@ function openProfileDb(customRoot = '') {
       base_url TEXT NOT NULL DEFAULT '',
       api_key TEXT NOT NULL DEFAULT '',
       model_name TEXT NOT NULL DEFAULT '',
+      completion_model TEXT NOT NULL DEFAULT '',
       endpoint_mode TEXT NOT NULL DEFAULT 'responses',
       reasoning_effort TEXT NOT NULL DEFAULT 'medium',
       thinking_mode TEXT NOT NULL DEFAULT '',
@@ -130,6 +131,11 @@ function openProfileDb(customRoot = '') {
       updated_at INTEGER NOT NULL DEFAULT 0
     );
   `);
+  try {
+    db.prepare('ALTER TABLE relay_profiles ADD COLUMN completion_model TEXT NOT NULL DEFAULT \'\'').run();
+  } catch {
+    /* column already exists */
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS relay_profile_meta (
       key TEXT PRIMARY KEY,
@@ -189,6 +195,7 @@ function normalizeStore(store = {}) {
       baseUrl: String(item?.baseUrl || '').trim(),
       apiKey: String(item?.apiKey || '').trim(),
       modelName: String(item?.modelName || '').trim(),
+      completionModel: String(item?.completionModel || '').trim(),
       endpointMode: String(item?.endpointMode || 'responses').trim() || 'responses',
       reasoningEffort: String(item?.reasoningEffort || 'medium').trim() || 'medium',
       thinkingMode: String(item?.thinkingMode || '').trim(),
@@ -241,6 +248,7 @@ function loadRelayProfileStore(customRoot = '') {
       base_url,
       api_key,
       model_name,
+      completion_model,
       endpoint_mode,
       reasoning_effort,
       thinking_mode,
@@ -274,6 +282,7 @@ function loadRelayProfileStore(customRoot = '') {
         baseUrl: String(row.base_url || ''),
         apiKey: String(row.api_key || ''),
         modelName: String(row.model_name || ''),
+        completionModel: String(row.completion_model || ''),
         endpointMode: String(row.endpoint_mode || 'responses'),
         reasoningEffort: String(row.reasoning_effort || 'medium'),
         thinkingMode: String(row.thinking_mode || ''),
@@ -300,6 +309,7 @@ function saveRelayProfileStore(store = {}, customRoot = '') {
         base_url,
         api_key,
         model_name,
+        completion_model,
         endpoint_mode,
         reasoning_effort,
         thinking_mode,
@@ -315,6 +325,7 @@ function saveRelayProfileStore(store = {}, customRoot = '') {
         @base_url,
         @api_key,
         @model_name,
+        @completion_model,
         @endpoint_mode,
         @reasoning_effort,
         @thinking_mode,
@@ -333,6 +344,7 @@ function saveRelayProfileStore(store = {}, customRoot = '') {
         base_url: item.baseUrl,
         api_key: item.apiKey,
         model_name: item.modelName,
+        completion_model: item.completionModel,
         endpoint_mode: item.endpointMode,
         reasoning_effort: item.reasoningEffort,
         thinking_mode: item.thinkingMode,

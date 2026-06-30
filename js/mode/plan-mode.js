@@ -90,7 +90,9 @@ function isVagueUserIntent(userText = '') {
 }
 
 function buildPlanInitialPromptContexts(input = {}) {
-  const planReminder = readModeText('AGENT_MODE_PLAN', 'system_reminder.txt');
+  const planReminder = readModeText('AGENT_MODE_PLAN', 'system_reminder.txt', {
+    modelName: input.modelName || input.requestedModel || '',
+  });
   const userText = String(input?.userText || '').trim();
   const contexts = [
     {
@@ -542,11 +544,12 @@ function buildToolDefinitionsForResponses(options = {}) {
 }
 
 function buildLocalRelayMessages(input = {}) {
+  const promptOptions = { modelName: input.modelName || input.requestedModel || '' };
   return buildModeRelayMessages({
     ...input,
     modeName: 'AGENT_MODE_PLAN',
-    cursorAgentPrompt: readModeText('AGENT_MODE_PLAN', 'system_prompt.txt'),
-    cursorModeReminder: readModeText('AGENT_MODE_PLAN', 'system_reminder.txt'),
+    cursorAgentPrompt: readModeText('AGENT_MODE_PLAN', 'system_prompt.txt', promptOptions),
+    cursorModeReminder: readModeText('AGENT_MODE_PLAN', 'system_reminder.txt', promptOptions),
     promptContextMessages: buildPlanInitialPromptContexts(input),
     extraSystemLines: [
       'In plan mode, prioritize producing and confirming a plan before execution when the task is complex.',

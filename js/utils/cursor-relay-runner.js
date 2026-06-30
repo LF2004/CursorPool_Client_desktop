@@ -1294,6 +1294,8 @@ function buildLocalRelayMessages(userText, session = {}) {
     userText: user,
     requestId,
     workspaceRoot,
+    modelName: session.routedModel || session.requestedModel || session.lastUserMessageCapture?.modelName || '',
+    requestedModel: session.requestedModel || session.lastUserMessageCapture?.modelName || '',
     recentEditedFile,
     unfinishedContinuation,
     deepSeekGuidance,
@@ -7775,6 +7777,7 @@ function emitTaskProgressFrame(session = {}, record = {}) {
     // Pass the raw subagent-type string; buildTaskSubagentTypeProto() inside
     // buildStructuredToolCallSnapshot resolves it to the correct SubagentType oneof.
     subagent_type: String(record.subagentType || '').trim(),
+    agent_mode: String(record.agentMode || 'AGENT_MODE_SUBAGENT').trim(),
     model: String(record.model || '').trim(),
     tool_call_id: toolCallId,
     name: String(record.name || record.title || '').trim(),
@@ -7831,6 +7834,7 @@ function appendTaskHistoryLifecycle(session = {}, record = {}, phase = 'started'
     description: String(record.description || '').trim(),
     prompt: String(record.prompt || '').trim(),
     subagent_type: record.subagentType ? { [record.subagentType]: record.subagentType } : {},
+    agent_mode: String(record.agentMode || 'AGENT_MODE_SUBAGENT').trim(),
     model: String(record.model || '').trim(),
     tool_call_id: toolCallId,
     name: String(record.name || record.title || '').trim(),
@@ -7924,6 +7928,7 @@ function buildTaskContextSnapshot(session = {}, record = {}) {
     requestId: String(session.requestId || '').trim(),
     taskTitle: String(record.title || record.name || '').trim(),
     taskType: String(record.subagentType || '').trim(),
+    agentMode: String(record.agentMode || 'AGENT_MODE_SUBAGENT').trim(),
   };
 }
 
@@ -8088,6 +8093,7 @@ async function executeBackgroundTask(record = {}, args = {}, session = {}) {
   emitTaskProgressFrame(session, record);
   const childTaskIds = Array.isArray(record.childTaskIds) ? record.childTaskIds.slice() : [];
   appendTaskLog(record, 'thought', `Planning task: ${query}`, true);
+  appendTaskLog(record, 'thought', `Running child work with ${String(record.agentMode || 'AGENT_MODE_SUBAGENT').trim()} prompt assets.`, true);
   if (normalizedType.includes('debug')) {
     appendTaskLog(record, 'thought', 'Reading project files and diagnostics relevant to the issue.', true);
   } else {
@@ -8317,6 +8323,7 @@ function registerTaskSubagent(session = {}, payload = {}) {
     description: String(payload.description || '').trim(),
     prompt: String(payload.prompt || '').trim(),
     subagentType: String(payload.subagentType || '').trim() || 'generalPurpose',
+    agentMode: String(payload.agentMode || 'AGENT_MODE_SUBAGENT').trim() || 'AGENT_MODE_SUBAGENT',
     name: String(payload.name || '').trim(),
     model: String(payload.model || '').trim(),
     parentToolCallId: String(payload.parentToolCallId || '').trim(),
@@ -8765,6 +8772,7 @@ async function executeTaskTool(args = {}, session = {}) {
     description,
     prompt,
     subagentType: subagentType || 'generalPurpose',
+    agentMode: 'AGENT_MODE_SUBAGENT',
     title: getTaskTitle(args, subagentType),
     name: String(args.name || '').trim(),
     model: String(args.model || '').trim(),
@@ -8774,7 +8782,7 @@ async function executeTaskTool(args = {}, session = {}) {
     status: 'pending',
     log: [
       createTaskLogItem(1, 'instruction', prompt || description || 'Reviewing assigned task context.', true),
-      createTaskLogItem(2, 'thought', 'Subagent queued.', true),
+      createTaskLogItem(2, 'thought', 'Subagent queued with dedicated subagent prompt/tool profile.', true),
     ],
   });
   const childSteps = splitTaskIntoPlanSteps(record, args);
@@ -8794,6 +8802,7 @@ async function executeTaskTool(args = {}, session = {}) {
     args: {
       ...args,
       subagent_type: subagentType ? { [subagentType]: subagentType } : (args.subagent_type || args.subagentType || {}),
+      agent_mode: 'AGENT_MODE_SUBAGENT',
       model: String(args.model || '').trim(),
       name: String(args.name || '').trim(),
     },
@@ -12187,15 +12196,27 @@ function buildRuntimeDiagnostics(config, logger) {
     // 7. Mode registry — 所有已注册的模式
     try {
       const registry = require('../mode/registry');
-      const modeNames = ['AGENT_MODE_AGENT','AGENT_MODE_ASK','AGENT_MODE_PLAN','AGENT_MODE_DEBUG','AGENT_MODE_TRIAGE','AGENT_MODE_PROJECT','AGENT_MODE_MULTITASK'];
+      const modeNames = ['AGENT_MODE_AGENT','AGENT_MODE_ASK','AGENT_MODE_PLAN','AGENT_MODE_DEBUG','AGENT_MODE_TRIAGE','AGENT_MODE_PROJECT','AGENT_MODE_MULTITASK','AGENT_MODE_SUBAGENT'];
       diag.modeRegistry.registered = {};
       for (const mn of modeNames) {
         const dir = registry.getCursorModeDirectory(mn);
         const hasPrompt = registry.readModeText(mn, 'system_prompt.txt') ? true : false;
         const hasReminder = registry.readModeText(mn, 'system_reminder.txt') ? true : false;
-        const hasTools = registry.getCursorModeFilePath(mn, 'tools.json')
-          && require('fs').existsSync(registry.getCursorModeFilePath(mn, 'tools.json'));
-        diag.modeRegistry.registered[mn] = { dir, hasPrompt, hasReminder, hasTools };
+        const promptPath = registry.getCursorPromptFilePath?.(mn, 'prompt.md') || '';
+        const promptToolsPath = registry.getCursorPromptFilePath?.(mn, 'tools.json') || '';
+        const legacyToolsPath = registry.getCursorModeFilePath(mn, 'tools.json');
+        const hasPromptAsset = promptPath && require('fs').existsSync(promptPath);
+        const hasPromptTools = promptToolsPath && require('fs').existsSync(promptToolsPath);
+        const hasLegacyTools = legacyToolsPath && require('fs').existsSync(legacyToolsPath);
+        diag.modeRegistry.registered[mn] = {
+          dir,
+          hasPrompt,
+          hasReminder,
+          hasTools: Boolean(hasPromptTools || hasLegacyTools),
+          hasPromptAsset: Boolean(hasPromptAsset),
+          hasPromptTools: Boolean(hasPromptTools),
+          hasLegacyTools: Boolean(hasLegacyTools),
+        };
       }
     } catch (e) {
       diag.modeRegistry.error = e.message;
@@ -12391,6 +12412,7 @@ function startProxy(config) {
         port: config.port,
         directMitmPort: stats.directMitmPort,
         mode,
+        completionModel: String(config.completionModel || ''),
         upstreamBaseUrl: String(config.upstream?.baseUrl || ''),
         upstreamDisplayName: String(config.upstream?.displayName || config.upstream?.modelName || ''),
         upstreamModelName: String(config.upstream?.modelName || ''),

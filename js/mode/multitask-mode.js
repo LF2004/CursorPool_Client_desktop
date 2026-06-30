@@ -52,9 +52,10 @@ function buildToolDefinitionsForResponses(options = {}) {
 }
 
 function buildLocalRelayMessages(input = {}) {
-  const prompt = readModeText('AGENT_MODE_MULTITASK', 'system_prompt.txt')
-    || readModeText('AGENT_MODE_AGENT', 'system_prompt.txt');
-  const reminder = readModeText('AGENT_MODE_MULTITASK', 'system_reminder.txt');
+  const promptOptions = { modelName: input.modelName || input.requestedModel || '' };
+  const prompt = readModeText('AGENT_MODE_MULTITASK', 'system_prompt.txt', promptOptions)
+    || readModeText('AGENT_MODE_AGENT', 'system_prompt.txt', promptOptions);
+  const reminder = readModeText('AGENT_MODE_MULTITASK', 'system_reminder.txt', promptOptions);
   return buildModeRelayMessages({
     ...input,
     modeName: 'AGENT_MODE_MULTITASK',

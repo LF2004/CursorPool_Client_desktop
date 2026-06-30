@@ -42,11 +42,12 @@ function buildToolDefinitionsForResponses(options = {}) {
 }
 
 function buildLocalRelayMessages(input = {}) {
+  const promptOptions = { modelName: input.modelName || input.requestedModel || '' };
   return buildModeRelayMessages({
     ...input,
     modeName: 'AGENT_MODE_AGENT',
-    cursorAgentPrompt: readModeText('AGENT_MODE_AGENT', 'system_prompt.txt'),
-    cursorModeReminder: readModeText('AGENT_MODE_AGENT', 'system_reminder.txt'),
+    cursorAgentPrompt: readModeText('AGENT_MODE_AGENT', 'system_prompt.txt', promptOptions),
+    cursorModeReminder: readModeText('AGENT_MODE_AGENT', 'system_reminder.txt', promptOptions),
   });
 }
 

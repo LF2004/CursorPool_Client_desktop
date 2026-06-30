@@ -141,6 +141,7 @@ function collectModelsFromRunnerConfig(customRoot = '') {
       const displayName = String(source.displayName || source.name || source.modelName || '').trim();
       const candidates = [
         String(source.modelName || '').trim(),
+        String(source.completionModel || '').trim(),
         ...(Array.isArray(source.availableModels) ? source.availableModels.map((item) => String(item || '').trim()) : []),
       ].filter(Boolean);
       for (const modelName of candidates) {
@@ -181,19 +182,25 @@ function collectLocalModels() {
   try {
     const store = loadRelayProfileStore('');
     if (Array.isArray(store.configs)) {
-      models.push(...store.configs
-        .filter((c) => c && c.modelName)
-        .map((c) => ({
-          modelName: String(c.modelName).trim(),
-          displayName: String(c.name || c.modelName || '').trim(),
-          displayNameShort: String(c.name || c.modelName || '').trim().slice(0, 20),
-          profileId: String(c.id || ''),
-          modelId: String(c.modelName || '').trim(), // model_id 用 modelName
-          reasoningEffort: String(c.reasoningEffort || 'medium').trim() || 'medium',
-          thinkingMode: String(c.thinkingMode || '').trim(),
-          contextWindow: Number(c.contextWindow) > 0 ? Number(c.contextWindow) : 200000,
-          endpointMode: String(c.endpointMode || '').trim().toLowerCase() || 'responses',
-        })));
+      for (const c of store.configs.filter((item) => item && item.modelName)) {
+        const candidateNames = [
+          String(c.modelName || '').trim(),
+          String(c.completionModel || '').trim(),
+        ].filter(Boolean);
+        for (const modelName of candidateNames) {
+          models.push({
+            modelName,
+            displayName: String(c.name || modelName || '').trim(),
+            displayNameShort: String(c.name || modelName || '').trim().slice(0, 20),
+            profileId: String(c.id || ''),
+            modelId: modelName,
+            reasoningEffort: String(c.reasoningEffort || 'medium').trim() || 'medium',
+            thinkingMode: String(c.thinkingMode || '').trim(),
+            contextWindow: Number(c.contextWindow) > 0 ? Number(c.contextWindow) : 200000,
+            endpointMode: String(c.endpointMode || '').trim().toLowerCase() || 'responses',
+          });
+        }
+      }
     }
   } catch {
     // 忽略 profile store 读取失败，继续尝试 runner-config 兜底

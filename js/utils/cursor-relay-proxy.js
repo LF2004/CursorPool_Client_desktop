@@ -282,6 +282,7 @@ function sanitizeRelayUpstream(upstream = null) {
     baseUrl,
     apiKey,
     modelName,
+    completionModel: String(upstream.completionModel || '').trim(),
     availableModels: Array.isArray(upstream.availableModels)
       ? upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
       : [],
@@ -321,6 +322,7 @@ function relayProfileToUpstream(profile = null) {
     baseUrl,
     apiKey,
     modelName,
+    completionModel: String(profile.completionModel || '').trim(),
     endpointMode: String(profile.endpointMode || 'responses').trim() || 'responses',
     reasoningEffort: String(profile.reasoningEffort || 'medium').trim() || 'medium',
     thinkingMode: String(profile.thinkingMode || '').trim(),
@@ -353,6 +355,7 @@ function buildRelayStartOptionsFromConfig(config = null, overrides = {}) {
   ) || 12)));
   return {
     mode: nextMode,
+    completionModel: String(overrides.completionModel ?? existing.completionModel ?? '').trim(),
     directMitmPort: Number(overrides.directMitmPort ?? existing.directMitmPort) || 0,
     localNativeAgentTools: isLocalRelay ? overrides.localNativeAgentTools !== false : overrides.localNativeAgentTools !== false,
     structuredAgentToolCalls: isLocalRelay ? overrides.structuredAgentToolCalls !== false : overrides.structuredAgentToolCalls !== false,
@@ -971,7 +974,10 @@ async function applyCursorRelayProxyConfig(payload = {}) {
     const localNativeAgentTools = officialPassthrough ? false : true;
     const structuredAgentToolCalls = officialPassthrough ? false : payload.structuredAgentToolCalls !== false;
     if (installCert) {
-      certInstallResult = installRelayCaCertificate();
+      certInstallResult = installRelayCaCertificate(undefined, {
+        installMachineStore: payload.installMachineCert !== false,
+        requireMachineStore: payload.requireMachineCert !== false,
+      });
       if (!certInstallResult?.installed) {
         throw new Error(certInstallResult?.message || 'Relay CA certificate install failed.');
       }
@@ -980,6 +986,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
       mode: runnerMode,
       ...(upstream ? { upstream } : {}),
       modelRoutes: sanitizeRelayModelRoutes(payload.modelRoutes),
+      completionModel: String(payload.completionModel || upstream?.completionModel || '').trim(),
       port: frontProxyPort,
       forceRestartRunner: payload.forceRestartRunner === true,
       directMitmPort,
@@ -1312,7 +1319,10 @@ async function repairRelayCertificatesFull(payload = {}) {
 }
 
 async function installRelayCaCertificateFull(payload = {}) {
-  const install = installRelayCaCertificate(payload.customRoot);
+  const install = installRelayCaCertificate(payload.customRoot, {
+    installMachineStore: payload.installMachineCert !== false,
+    requireMachineStore: payload.requireMachineCert !== false,
+  });
   const changedTrust = Boolean(
     install.installed
     && (!install.alreadyInstalled || install.removedStale?.removed || payload.forceRestartCursor === true)
@@ -1494,6 +1504,7 @@ async function quickSwitchRelayModel(payload = {}) {
     ? status.runner.upstream
     : null;
   const sameRunnerUpstream = isSameRelayUpstreamConfig(activeRunnerUpstream, upstream);
+  const sameCompletionModel = String(status?.runner?.completionModel || '') === String(profile.completionModel || '');
 
   if (
     relayEnabled
@@ -1502,6 +1513,7 @@ async function quickSwitchRelayModel(payload = {}) {
     && (currentMode === 'local_relay' || !currentMode)
     && currentRunnerModelNames.has(String(profile.modelName || '').trim())
     && sameRunnerUpstream
+    && sameCompletionModel
   ) {
     appendRunnerLog(`[info] quickSwitch hot-switch profileId=${profileId} model=${String(profile.modelName || '')} runnerRestart=0`, '');
     return {
@@ -1519,6 +1531,7 @@ async function quickSwitchRelayModel(payload = {}) {
     const applied = await applyCursorRelayProxyConfig({
       upstream,
       modelRoutes,
+      completionModel: profile.completionModel || upstream.completionModel || '',
       forceRestartRunner: false,
       restartCursor: false,
       reloadCursor: false,
@@ -1548,6 +1561,7 @@ async function quickSwitchRelayModel(payload = {}) {
   const applied = await applyCursorRelayProxyConfig({
     upstream,
     modelRoutes,
+    completionModel: profile.completionModel || upstream.completionModel || '',
     forceRestartRunner: false,
     restartCursor: false,
     reloadCursor: false,
@@ -2139,7 +2153,10 @@ async function startRelayPlanUiMock(payload = {}) {
   await stopPlanUiMockProxy().catch(() => null);
   await stopLocalRelayRunner({ fast: true }).catch(() => null);
 
-  const certInstallResult = installRelayCaCertificate();
+  const certInstallResult = installRelayCaCertificate(undefined, {
+    installMachineStore: true,
+    requireMachineStore: true,
+  });
   if (!certInstallResult?.installed) {
     throw new Error(certInstallResult?.message || 'Plan UI Mock 证书安装失败。');
   }

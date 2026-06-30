@@ -1,5 +1,9 @@
 const fs = require('fs');
-const { getCursorModeFilePath, normalizeAgentModeName } = require('../registry');
+const {
+  getCursorModeFilePath,
+  getCursorPromptFilePath,
+  normalizeAgentModeName,
+} = require('../registry');
 
 const SUPPORTED_MODE_TOOL_NAMES = new Set([
   'Read',
@@ -22,11 +26,21 @@ const SUPPORTED_MODE_TOOL_NAMES = new Set([
   'DebugLogs',
   'ReproductionSteps',
   'SwitchMode',
+  'GetRelatedFiles',
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'Mcp',
+  'TodoRead',
+  'FetchRules',
 ]);
 
 function loadAgentModeToolDefinitionsForChat(modeName = 'AGENT_MODE_AGENT') {
   try {
-    const parsed = JSON.parse(fs.readFileSync(getCursorModeFilePath(modeName, 'tools.json'), 'utf8').replace(/^\uFEFF/, ''));
+    const normalizedMode = normalizeAgentModeName(modeName);
+    const promptToolsPath = getCursorPromptFilePath(normalizedMode, 'tools.json');
+    const legacyToolsPath = getCursorModeFilePath(normalizedMode, 'tools.json');
+    const toolPath = fs.existsSync(promptToolsPath) ? promptToolsPath : legacyToolsPath;
+    const parsed = JSON.parse(fs.readFileSync(toolPath, 'utf8').replace(/^\uFEFF/, ''));
     return (Array.isArray(parsed) ? parsed : [])
       .filter((tool) => tool?.type === 'function' && SUPPORTED_MODE_TOOL_NAMES.has(String(tool.function?.name || '')))
       .map((tool) => ({

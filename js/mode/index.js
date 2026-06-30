@@ -7,6 +7,7 @@ const debugMode = require('./debug-mode');
 const triageMode = require('./triage-mode');
 const projectMode = require('./project-mode');
 const multitaskMode = require('./multitask-mode');
+const subagentMode = require('./subagent-mode');
 
 const MODE_HANDLERS = {
   AGENT_MODE_AGENT: agentMode,
@@ -16,6 +17,7 @@ const MODE_HANDLERS = {
   AGENT_MODE_TRIAGE: triageMode,
   AGENT_MODE_PROJECT: projectMode,
   AGENT_MODE_MULTITASK: multitaskMode,
+  AGENT_MODE_SUBAGENT: subagentMode,
 };
 
 function getModeHandler(modeName = '') {

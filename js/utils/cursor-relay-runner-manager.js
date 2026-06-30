@@ -95,6 +95,7 @@ function buildStartOperationKey(options = {}) {
     port,
     mode,
     forceRestartRunner: options.forceRestartRunner === true,
+    completionModel: String(options.completionModel || '').trim(),
     localNativeAgentTools: options.localNativeAgentTools !== false,
     structuredAgentToolCalls: options.structuredAgentToolCalls !== false,
     nativeMutationTools: options.nativeMutationTools !== false,
@@ -230,6 +231,7 @@ function buildOfficialPassthroughUpstream() {
 function writeRunnerConfig({
   upstream,
   modelRoutes = [],
+  completionModel = '',
   port,
   customRoot,
   mode = RUNNER_MODE_OFFICIAL_PASSTHROUGH,
@@ -254,6 +256,7 @@ function writeRunnerConfig({
   const config = {
     port,
     mode,
+    completionModel: String(completionModel || '').trim(),
     directMitmPort: Number(directMitmPort) || 0,
     mockAgentTools: false,
     mockAgentProtoTools: false,
@@ -445,6 +448,7 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   if (String(healthPayload.runnerScriptMtime || '') !== fingerprint.mtime) return false;
   if (Number(healthPayload.runnerScriptSize) !== Number(fingerprint.size)) return false;
   if (String(healthPayload.mode || '') !== String(options.mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return false;
+  if (String(healthPayload.completionModel || '') !== String(options.completionModel || '')) return false;
   if (!outboundProxyMatches(healthPayload.outboundProxy || null, options.outboundProxy || null)) return false;
   const baseUrl = String(upstream.baseUrl || '').trim().replace(/\/+$/, '');
   const modelName = String(upstream.modelName || '').trim();
@@ -504,6 +508,7 @@ function getRunnerReuseMismatchReason(healthPayload, upstream, options = {}) {
   if (String(healthPayload.runnerScriptMtime || '') !== fingerprint.mtime) return 'runnerScriptMtime';
   if (Number(healthPayload.runnerScriptSize) !== Number(fingerprint.size)) return 'runnerScriptSize';
   if (String(healthPayload.mode || '') !== String(options.mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return 'mode';
+  if (String(healthPayload.completionModel || '') !== String(options.completionModel || '')) return 'completionModel';
   if (!outboundProxyMatches(healthPayload.outboundProxy || null, options.outboundProxy || null)) return 'outboundProxy';
   const baseUrl = String(upstream.baseUrl || '').trim().replace(/\/+$/, '');
   const modelName = String(upstream.modelName || '').trim();
@@ -794,6 +799,7 @@ async function startLocalRelayRunner(payload = {}) {
     ? buildOfficialPassthroughUpstream()
     : normalizeUpstream(upstreamPayload || {});
   const modelRoutes = normalizeModelRoutes(payload.modelRoutes);
+  const completionModel = String(payload.completionModel || upstream.completionModel || '').trim();
   const localNativeAgentTools = payload.localNativeAgentTools !== false
     && String(process.env.CURSOR_RELAY_LOCAL_NATIVE_TOOLS || '').trim() !== '0';
   const structuredAgentToolCalls = payload.structuredAgentToolCalls !== false
@@ -833,6 +839,7 @@ async function startLocalRelayRunner(payload = {}) {
     : resolveRelayOutboundProxy({ localProxyPorts: [port] });
   const reuseOptions = {
     mode,
+    completionModel,
     localNativeAgentTools,
     structuredAgentToolCalls,
     nativeMutationTools,
@@ -869,6 +876,7 @@ async function startLocalRelayRunner(payload = {}) {
       port,
       upstream,
       mode: existingHealth.payload?.mode || mode,
+      completionModel: String(existingHealth.payload?.completionModel || completionModel || ''),
       directMitmPort: Number(existingHealth.payload?.directMitmPort) || 0,
       localNativeAgentTools,
       structuredAgentToolCalls,
@@ -917,6 +925,7 @@ async function startLocalRelayRunner(payload = {}) {
     port,
     customRoot,
     mode,
+    completionModel,
     directMitmPort,
     mockAgentTools: false,
     mockAgentProtoTools: false,
@@ -1082,6 +1091,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     port: health.payload?.port || port,
     directMitmPort: health.payload?.directMitmPort || runnerConfig?.directMitmPort || 0,
     mode: health.payload?.mode || runnerConfig?.mode || '',
+    completionModel: String(health.payload?.completionModel || runnerConfig?.completionModel || ''),
     mockAgentTools: false,
     mockAgentProtoTools: false,
     localNativeAgentTools: Boolean(health.payload?.localNativeAgentTools || runnerConfig?.localNativeAgentTools),
@@ -1127,6 +1137,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
             displayName: runnerConfig.upstream.displayName || runnerConfig.upstream.modelName,
             baseUrl: runnerConfig.upstream.baseUrl,
             modelName: runnerConfig.upstream.modelName,
+            completionModel: String(runnerConfig.completionModel || runnerConfig.upstream.completionModel || ''),
             availableModels: Array.isArray(runnerConfig.upstream.availableModels)
               ? runnerConfig.upstream.availableModels
               : [runnerConfig.upstream.modelName],
@@ -1141,6 +1152,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
             displayName: health.payload.upstreamDisplayName || health.payload.upstreamModelName,
             baseUrl: health.payload.upstreamBaseUrl,
             modelName: health.payload.upstreamModelName,
+            completionModel: String(health.payload.completionModel || ''),
             availableModels: Array.isArray(health.payload.upstreamAvailableModels)
               ? health.payload.upstreamAvailableModels
               : [health.payload.upstreamModelName],

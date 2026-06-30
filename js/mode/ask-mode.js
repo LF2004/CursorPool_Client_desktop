@@ -36,11 +36,12 @@ function buildToolDefinitionsForResponses(options = {}) {
 }
 
 function buildLocalRelayMessages(input = {}) {
+  const promptOptions = { modelName: input.modelName || input.requestedModel || '' };
   return buildModeRelayMessages({
     ...input,
     modeName: 'AGENT_MODE_ASK',
-    cursorAgentPrompt: readModeText('AGENT_MODE_ASK', 'system_prompt.txt'),
-    cursorModeReminder: readModeText('AGENT_MODE_ASK', 'system_reminder.txt'),
+    cursorAgentPrompt: readModeText('AGENT_MODE_ASK', 'system_prompt.txt', promptOptions),
+    cursorModeReminder: readModeText('AGENT_MODE_ASK', 'system_reminder.txt', promptOptions),
     extraSystemLines: [
       'Ask mode is read-only exploration mode.',
       'Do not write, edit, patch, delete, or run mutating shell commands.',

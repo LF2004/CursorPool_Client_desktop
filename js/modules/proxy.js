@@ -216,13 +216,16 @@ function renderConfigCard(profile) {
   const endpointText = profile.providerId === 'anthropic'
     ? ''
     : ` · ${escapeHtml(endpointLabel(profile.endpointMode))}`;
+  const completionText = profile.completionModel
+    ? ` · Tab ${escapeHtml(profile.completionModel)}`
+    : '';
 
   return `
     <article class="relay-config-card${isActive ? ' active' : ''}" data-config-id="${escapeHtml(profile.id)}">
       <div class="relay-card-head">
         <div class="relay-card-title-wrap">
           <h4 class="relay-card-name">${escapeHtml(profile.name)}</h4>
-          <p class="relay-card-model mono">${escapeHtml(profile.modelName || '未填模型')}${endpointText}${escapeHtml(thinkingText)}</p>
+          <p class="relay-card-model mono">${escapeHtml(profile.modelName || '未填模型')}${endpointText}${escapeHtml(thinkingText)}${completionText}</p>
         </div>
         <span class="relay-card-provider">
           ${providerIconHtml(profile.providerId)}
@@ -499,6 +502,7 @@ function fillModalForm(profile) {
   setModalProviderTab(modalProviderId);
   if ($('relayModalName')) $('relayModalName').value = p.name || '';
   if ($('relayModalModel')) $('relayModalModel').value = p.modelName || '';
+  if ($('relayModalCompletionModel')) $('relayModalCompletionModel').value = p.completionModel || '';
   if ($('relayModalApiKey')) $('relayModalApiKey').value = p.apiKey || '';
   if ($('relayModalBaseUrl')) $('relayModalBaseUrl').value = p.baseUrl || PROVIDER_BASE_URLS[modalProviderId] || '';
   if ($('relayModalContext')) $('relayModalContext').value = String(p.contextWindow || DEFAULT_CONTEXT_WINDOW);
@@ -553,6 +557,7 @@ function collectModalFormProfile() {
     baseUrl: normalizeBaseUrlInput(rawBaseUrl),
     apiKey: ($('relayModalApiKey')?.value || '').trim() || existing?.apiKey || '',
     modelName: ($('relayModalModel')?.value || '').trim(),
+    completionModel: ($('relayModalCompletionModel')?.value || '').trim(),
     endpointMode: inferredEndpointMode,
     reasoningEffort: ($('relayModalReasoning')?.value || DEFAULT_REASONING_EFFORT).trim(),
     thinkingMode: modalProviderId === 'deepseek' || modalProviderId === 'mimo'
@@ -1214,6 +1219,7 @@ async function enableRelayForProfile(profileId) {
         local = await bridge.cursorRelayApply({
           upstream,
           modelRoutes: collectRelayModelRoutes(),
+          completionModel: active.completionModel || upstream.completionModel || '',
           forceRestartRunner: true,
           restartCursor: false,
           reloadCursor: false,

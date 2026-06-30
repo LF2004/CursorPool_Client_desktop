@@ -119,9 +119,6 @@
       <div class="relay-config-head">
         <div>
           <h3 class="adv-section-title relay-config-title"><i class="fa fa-random"></i> 模型配置</h3>
-          <p class="adv-hint relay-config-subtitle">
-            在 Cursor Auto 聊天中走您配置的第三方 API，不消耗官方额度。
-          </p>
           <p class="adv-hint relay-privacy-hint">
             <i class="fa fa-lock" aria-hidden="true"></i>
             API Key 仅保存在本机，不会上传至服务器。
@@ -329,6 +326,13 @@
             模型标识
           </label>
           <input id="relayModalModel" class="input mono" placeholder="如 gpt-4o-mini" />
+        </div>
+        <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalCompletionModel">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="completionModel" aria-label="Tab 补全模型说明"><i class="fa fa-info-circle"></i></button>
+            Tab 补全模型
+          </label>
+          <input id="relayModalCompletionModel" class="input mono" placeholder="留空则复用聊天模型" />
         </div>
         <div class="relay-modal-field">
           <label class="relay-modal-label" for="relayModalApiKey">
