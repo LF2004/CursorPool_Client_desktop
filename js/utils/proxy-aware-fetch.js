@@ -1,8 +1,13 @@
 const http = require('http');
 const https = require('https');
 const tls = require('tls');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const { Readable } = require('stream');
 const { normalizeProxyUrl, resolveRelayOutboundProxy } = require('./cursor-relay-system-proxy');
+
+let relayCaCache = { path: '', pem: '' };
 
 function normalizeHeaders(headers = {}) {
   const out = {};
@@ -31,6 +36,11 @@ function headersFromNode(headers = {}) {
   return out;
 }
 
+function responseStatusForbidsBody(statusCode) {
+  const status = Number(statusCode) || 0;
+  return status === 204 || status === 205 || status === 304;
+}
+
 function makeAbortError() {
   const error = new Error('Fetch aborted');
   error.name = 'AbortError';
@@ -52,12 +62,34 @@ function shouldBypassProxy(target) {
     || host.endsWith('.local');
 }
 
+function readRelayCaForProxy(proxy) {
+  const host = String(proxy?.hostname || '').toLowerCase();
+  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') return null;
+  const caPath = path.join(os.homedir(), '.cursorpool', 'relay', 'ca.crt');
+  try {
+    if (relayCaCache.path === caPath && relayCaCache.pem) return relayCaCache.pem;
+    const pem = fs.readFileSync(caPath, 'utf8');
+    relayCaCache = { path: caPath, pem };
+    return pem;
+  } catch {
+    return null;
+  }
+}
+
 function createNodeResponse(res, url) {
-  const body = typeof Readable.toWeb === 'function' ? Readable.toWeb(res) : res;
+  const status = res.statusCode || 0;
+  const headers = headersFromNode(res.headers);
+  const body = responseStatusForbidsBody(status)
+    ? null
+    : (typeof Readable.toWeb === 'function' ? Readable.toWeb(res) : res);
+  if (responseStatusForbidsBody(status)) {
+    headers.delete('content-length');
+    headers.delete('transfer-encoding');
+  }
   const response = new Response(body, {
-    status: res.statusCode || 0,
+    status,
     statusText: res.statusMessage || '',
-    headers: headersFromNode(res.headers),
+    headers,
   });
   try {
     Object.defineProperty(response, 'url', { value: url, configurable: true });
@@ -84,6 +116,7 @@ function requestHttpViaProxy(target, proxy, options, signal) {
     }, (res) => {
       resolve(createNodeResponse(res, target.href));
     });
+    req.on('error', reject);
 
     const abort = () => {
       req.destroy(makeAbortError());
@@ -97,7 +130,6 @@ function requestHttpViaProxy(target, proxy, options, signal) {
       req.on('close', () => signal.removeEventListener('abort', abort));
     }
 
-    req.on('error', reject);
     if (options.body !== undefined && options.body !== null) req.end(options.body);
     else req.end();
   });
@@ -123,6 +155,7 @@ function requestHttpsViaProxy(target, proxy, options, signal) {
       path: `${target.hostname}:${targetPort}`,
       headers: connectHeaders,
     });
+    connectReq.on('error', reject);
 
     const abort = () => {
       const error = makeAbortError();
@@ -151,6 +184,7 @@ function requestHttpsViaProxy(target, proxy, options, signal) {
         socket,
         servername: target.hostname,
         ALPNProtocols: ['http/1.1'],
+        ca: readRelayCaForProxy(proxy) || undefined,
       }, () => {
         const headers = normalizeHeaders(options.headers);
         if (!Object.keys(headers).some((key) => key.toLowerCase() === 'host')) {
@@ -170,8 +204,6 @@ function requestHttpsViaProxy(target, proxy, options, signal) {
       });
       secureSocket.on('error', reject);
     });
-
-    connectReq.on('error', reject);
     connectReq.end();
   });
 }

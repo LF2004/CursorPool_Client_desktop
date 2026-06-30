@@ -149,7 +149,7 @@ function buildRelayConversationMemory(session = {}, options = {}) {
 }
 
 function resolveRelayContextBudgetChars(config = {}) {
-  const contextTokens = Number(config?.upstream?.contextWindow) || 250000;
+  const contextTokens = Number(config?.upstream?.contextWindow) || 200000;
   const reservedOutputTokens = Math.max(1024, Number(config.relayReservedOutputTokens) || DEFAULT_RELAY_CONTEXT_RESERVED_OUTPUT_TOKENS);
   const ratio = Number(config.relayContextInputRatio);
   const inputRatio = Number.isFinite(ratio) && ratio > 0 && ratio <= 1 ? ratio : DEFAULT_RELAY_CONTEXT_INPUT_RATIO;
@@ -174,32 +174,39 @@ function compactRelayMessagesForContext(messages = [], config = {}, logger = nul
   const systemMessages = normalized.filter((message) => message?.role === 'system');
   const nonSystem = normalized.filter((message) => message?.role !== 'system');
   const kept = [...systemMessages];
-  const used = systemMessages.reduce((sum, message) => sum + estimateMessageChars(message), 0);
-  const firstUserIndex = nonSystem.findIndex((message) => message?.role === 'user');
-  const firstUser = firstUserIndex >= 0 ? nonSystem[firstUserIndex] : null;
-  const firstUserBudget = firstUser ? Math.min(Math.floor(budgetChars * 0.18), 12000) : 0;
-  if (firstUser) {
-    kept.push(compressSingleMessageContent(firstUser, firstUserBudget));
-  }
-  const reservedForLatest = Math.min(Math.floor(budgetChars * 0.45), Math.max(4000, budgetChars - used - firstUserBudget));
-  const latest = nonSystem[nonSystem.length - 1];
-  const older = nonSystem.slice(0, -1).filter((message, index) => index !== firstUserIndex);
-  const olderBudget = Math.max(0, budgetChars - used - firstUserBudget - reservedForLatest);
-  const selectedOlder = [];
+  let used = systemMessages.reduce((sum, message) => sum + estimateMessageChars(message), 0);
 
-  for (let index = older.length - 1; index >= 0; index -= 1) {
-    const message = older[index];
-    const chars = estimateMessageChars(message);
-    const selectedChars = selectedOlder.reduce((sum, item) => sum + estimateMessageChars(item), 0);
-    if (selectedChars + chars > olderBudget) continue;
-    selectedOlder.unshift(message);
-  }
-  kept.push(...selectedOlder);
-
-  if (latest && latest !== firstUser) {
-    const currentChars = kept.reduce((sum, message) => sum + estimateMessageChars(message), 0);
-    const latestBudget = Math.max(1000, budgetChars - currentChars);
-    kept.push(compressSingleMessageContent(latest, latestBudget));
+  // 按时间顺序保留消息前缀，优先截断旧消息内容而非跳选中间段，利于上游 Prompt 前缀缓存命中
+  for (let index = 0; index < nonSystem.length; index += 1) {
+    const message = nonSystem[index];
+    const isLatest = index === nonSystem.length - 1;
+    const remaining = nonSystem.length - index - 1;
+    const reservedForTail = isLatest ? 0 : Math.min(
+      Math.floor(budgetChars * 0.45),
+      Math.max(4000, (budgetChars - used) * 0.55),
+    );
+    const messageBudget = Math.max(
+      isLatest ? 1000 : 400,
+      budgetChars - used - reservedForTail,
+    );
+    let next = estimateMessageChars(message) <= messageBudget
+      ? message
+      : compressSingleMessageContent(message, messageBudget);
+    let nextChars = estimateMessageChars(next);
+    if (used + nextChars > budgetChars && !isLatest) {
+      // 从最早非 system 消息起 FIFO 丢弃，保持剩余前缀顺序稳定
+      while (kept.length > systemMessages.length && used + nextChars > budgetChars) {
+        used -= estimateMessageChars(kept[systemMessages.length]);
+        kept.splice(systemMessages.length, 1);
+      }
+      if (used + nextChars > budgetChars) {
+        next = compressSingleMessageContent(next, Math.max(400, budgetChars - used));
+        nextChars = estimateMessageChars(next);
+      }
+    }
+    if (used + nextChars > budgetChars && remaining > 0) break;
+    kept.push(next);
+    used += nextChars;
   }
 
   usage = buildUsageMetaFromMessages(kept);

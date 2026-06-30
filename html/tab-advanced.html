@@ -95,11 +95,22 @@
       <div class="adv-form-row">
         <span class="adv-label-inline">Cursor 自动更新</span>
         <div class="adv-input-with-btn">
-          <button type="button" id="advCheckUpdateBtn" class="ghost-btn">检查更新</button>
-          <button type="button" id="advInstallUpdateBtn" class="primary-btn hidden">下载并安装</button>
+          <button type="button" id="advCursorUpdateRefreshBtn" class="ghost-btn">版本检测</button>
+          <button type="button" id="advDisableCursorUpdateBtn" class="primary-btn">禁用自动更新</button>
+          <button type="button" id="advRestoreCursorUpdateBtn" class="ghost-btn hidden">恢复更新</button>
         </div>
       </div>
-      <p id="advUpdateStatus" class="adv-hint">可检查客户端新版本并自动下载、安装。</p>
+      <p id="advUpdateStatus" class="adv-hint">检测 Cursor 当前版本，并可禁止或恢复客户端自动更新。</p>
+
+      <div class="adv-form-row">
+        <span class="adv-label-inline">Cursor 实验注入</span>
+        <div class="adv-input-with-btn">
+          <button type="button" id="advReviewBridgeRefreshBtn" class="ghost-btn">检测状态</button>
+          <button type="button" id="advReviewBridgeApplyBtn" class="primary-btn">注入功能</button>
+          <button type="button" id="advReviewBridgeRestoreBtn" class="ghost-btn">还原功能</button>
+        </div>
+      </div>
+      <p id="advReviewBridgeStatus" class="adv-hint">仅在手动点击时执行注入/还原；建议先保存工作并完全退出 Cursor 后再操作。</p>
     </div>
   </div>
 
@@ -108,9 +119,6 @@
       <div class="relay-config-head">
         <div>
           <h3 class="adv-section-title relay-config-title"><i class="fa fa-random"></i> 模型配置</h3>
-          <p class="adv-hint relay-config-subtitle">
-            在 Cursor Auto 聊天中走您配置的第三方 API，不消耗官方额度。
-          </p>
           <p class="adv-hint relay-privacy-hint">
             <i class="fa fa-lock" aria-hidden="true"></i>
             API Key 仅保存在本机，不会上传至服务器。
@@ -206,7 +214,7 @@
     </div>
 
     <div id="relayAdminSection" class="adv-pref-block hidden">
-      <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 管理员诊断</h3>
+      <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 诊断</h3>
       <div class="adv-inject-row">
         <span class="adv-label-inline">Runner 进程:</span>
         <span id="relayRunnerBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
@@ -250,6 +258,12 @@
       <div class="adv-actions-row">
         <button type="button" id="relayRefreshBtn" class="ghost-btn">
           <i class="fa fa-refresh"></i> 刷新状态
+        </button>
+        <button type="button" id="relayPlanUiMockBtn" class="ghost-btn">
+          <i class="fa fa-flask"></i> Plan UI Mock
+        </button>
+        <button type="button" id="relayExploreUiMockBtn" class="ghost-btn">
+          <i class="fa fa-sitemap"></i> Multitask UI Mock
         </button>
         <button type="button" id="relayOfficialCaptureBtn" class="ghost-btn">
           <i class="fa fa-exchange"></i> 记录官方 Agent 流量
@@ -314,6 +328,13 @@
           <input id="relayModalModel" class="input mono" placeholder="如 gpt-4o-mini" />
         </div>
         <div class="relay-modal-field">
+          <label class="relay-modal-label" for="relayModalCompletionModel">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="completionModel" aria-label="Tab 补全模型说明"><i class="fa fa-info-circle"></i></button>
+            Tab 补全模型
+          </label>
+          <input id="relayModalCompletionModel" class="input mono" placeholder="留空则复用聊天模型" />
+        </div>
+        <div class="relay-modal-field">
           <label class="relay-modal-label" for="relayModalApiKey">
             <button type="button" class="relay-field-hint-btn" data-relay-field="apiKey" aria-label="访问密钥说明"><i class="fa fa-info-circle"></i></button>
             访问密钥
@@ -337,7 +358,7 @@
             <button type="button" class="relay-field-hint-btn" data-relay-field="contextWindow" aria-label="上下文窗口说明"><i class="fa fa-info-circle"></i></button>
             上下文窗口
           </label>
-          <input id="relayModalContext" class="input" inputmode="numeric" placeholder="250000" />
+          <input id="relayModalContext" class="input" inputmode="numeric" placeholder="200000" />
         </div>
         <div class="relay-modal-field">
           <label class="relay-modal-label" for="relayModalReasoning">

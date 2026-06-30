@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const net = require('net');
+const tls = require('tls');
 const { execFileSync, spawnSync } = require('child_process');
 
 const CA_SUBJECT = '/CN=CursorPool Relay CA/O=CursorPool/C=US';
@@ -17,6 +19,30 @@ const LEAF_SANS = [
   'agentn.api5.cursor.sh',
   'localhost',
   '127.0.0.1',
+  // Cursor 附属服务域名（MITM 证书需要覆盖，否则 ERR_CERT_COMMON_NAME_INVALID）
+  'marketplace.cursorapi.com',
+  'prod.authentication.cursor.sh',
+  'downloads.cursor.com',
+  'cursor-cdn.com',
+  '*.cursor.com',
+  '*.cursorapi.com',
+  '*.authentication.cursor.sh',
+];
+const DYNAMIC_TLS_CONTEXT_CACHE_LIMIT = 256;
+const dynamicTlsProviderCache = new Map();
+const WINDOWS_RELAY_CA_STORES = [
+  {
+    id: 'user',
+    label: 'CurrentUser\\Root',
+    psPath: 'Cert:\\CurrentUser\\Root',
+    certutilUserFlag: true,
+  },
+  {
+    id: 'machine',
+    label: 'LocalMachine\\Root',
+    psPath: 'Cert:\\LocalMachine\\Root',
+    certutilUserFlag: false,
+  },
 ];
 
 function getRelayDataDir(customRoot) {
@@ -147,6 +173,18 @@ function derOid(oid) {
   return der(0x06, Buffer.from(bytes));
 }
 
+function encodeIpSubjectAltName(name) {
+  const value = String(name || '').trim();
+  if (!value) return Buffer.alloc(0);
+  if (net.isIP(value) === 4) {
+    const parts = value.split('.').map((item) => Number(item));
+    if (parts.length === 4 && parts.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) {
+      return der(0x87, Buffer.from(parts));
+    }
+  }
+  return Buffer.alloc(0);
+}
+
 function derUtf8(value) {
   return der(0x0c, Buffer.from(String(value), 'utf8'));
 }
@@ -187,6 +225,61 @@ function certPemFromDer(certDer) {
   return `-----BEGIN CERTIFICATE-----\n${body}\n-----END CERTIFICATE-----\n`;
 }
 
+function certDerFromPem(certPem) {
+  const match = String(certPem || '').match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+  if (!match) throw new Error('Invalid certificate PEM.');
+  return Buffer.from(match[1].replace(/\s+/g, ''), 'base64');
+}
+
+function readDerLength(buffer, offset) {
+  if (offset >= buffer.length) throw new Error('Unexpected end of DER.');
+  const first = buffer[offset];
+  if ((first & 0x80) === 0) return { length: first, bytes: 1 };
+  const count = first & 0x7f;
+  if (!count || count > 4 || offset + count >= buffer.length) throw new Error('Invalid DER length.');
+  let length = 0;
+  for (let i = 0; i < count; i += 1) {
+    length = (length << 8) | buffer[offset + 1 + i];
+  }
+  return { length, bytes: 1 + count };
+}
+
+function readDerElement(buffer, offset, expectedTag = null) {
+  if (offset >= buffer.length) throw new Error('Unexpected end of DER.');
+  const tag = buffer[offset];
+  if (expectedTag !== null && tag !== expectedTag) {
+    throw new Error(`Unexpected DER tag 0x${tag.toString(16)}.`);
+  }
+  const len = readDerLength(buffer, offset + 1);
+  const headerLength = 1 + len.bytes;
+  const start = offset + headerLength;
+  const end = start + len.length;
+  if (end > buffer.length) throw new Error('DER element length exceeds buffer.');
+  return {
+    tag,
+    start,
+    end,
+    next: end,
+    raw: buffer.subarray(offset, end),
+    value: buffer.subarray(start, end),
+  };
+}
+
+function extractSubjectNameDerFromCertPem(certPem) {
+  const certDer = certDerFromPem(certPem);
+  const cert = readDerElement(certDer, 0, 0x30);
+  const tbs = readDerElement(cert.value, 0, 0x30);
+  let offset = 0;
+  if (tbs.value[offset] === 0xa0) {
+    offset = readDerElement(tbs.value, offset).next;
+  }
+  offset = readDerElement(tbs.value, offset, 0x02).next; // serial
+  offset = readDerElement(tbs.value, offset, 0x30).next; // signature
+  offset = readDerElement(tbs.value, offset, 0x30).next; // issuer
+  offset = readDerElement(tbs.value, offset, 0x30).next; // validity
+  return Buffer.from(readDerElement(tbs.value, offset, 0x30).raw);
+}
+
 function makeExtension(oid, valueDer, critical = false) {
   return derSeq(
     derOid(oid),
@@ -206,7 +299,158 @@ function makeKeyUsageExtension(bits) {
 }
 
 function makeSubjectAltName(names) {
-  return derSeq(...names.map((name) => der(0x82, Buffer.from(String(name), 'ascii'))));
+  return derSeq(...names.map((name) => {
+    const ipSan = encodeIpSubjectAltName(name);
+    if (ipSan.length) return ipSan;
+    return der(0x82, Buffer.from(String(name), 'ascii'));
+  }));
+}
+
+function buildCaNameDer() {
+  return nameDer([
+    ['2.5.4.6', 'US', true],
+    ['2.5.4.10', 'CursorPool', false],
+    ['2.5.4.3', 'CursorPool Relay CA', false],
+  ]);
+}
+
+function buildLeafNameDer(commonName) {
+  return nameDer([
+    ['2.5.4.6', 'US', true],
+    ['2.5.4.10', 'CursorPool', false],
+    ['2.5.4.3', commonName, false],
+  ]);
+}
+
+function normalizeDynamicLeafHost(rawHost) {
+  const value = String(rawHost || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!value) return '';
+  if (value.includes('/') || value.includes('\\') || /\s/.test(value)) return '';
+  return value.split(':')[0];
+}
+
+function buildDynamicLeafCertPem(host, materials) {
+  const normalizedHost = normalizeDynamicLeafHost(host);
+  if (!normalizedHost) throw new Error('Dynamic leaf host is empty.');
+  const certDer = buildCertificateDer({
+    subject: buildLeafNameDer(normalizedHost),
+    issuer: buildCaNameDer(),
+    publicKeyPem: materials.leafPublicKeyPem,
+    issuerPrivateKeyPem: materials.caKeyPem,
+    serial: crypto.randomBytes(16),
+    days: 825,
+    sans: [normalizedHost],
+  });
+  return certPemFromDer(certDer);
+}
+
+function createCertificateChainPem(leafCertPem, caCertPem) {
+  return `${String(leafCertPem || '').trim()}\n${String(caCertPem || '').trim()}\n`;
+}
+
+function loadDynamicTlsMaterials(paths) {
+  const caCertPem = fs.readFileSync(paths.caCertPath, 'utf8');
+  const defaultLeafCertPem = fs.readFileSync(paths.leafCertPath, 'utf8');
+  return {
+    caKeyPem: fs.readFileSync(paths.caKeyPath, 'utf8'),
+    caCertPem,
+    caSubjectDer: extractSubjectNameDerFromCertPem(caCertPem),
+    leafKeyPem: fs.readFileSync(paths.leafKeyPath, 'utf8'),
+    defaultLeafCertPem,
+    defaultFullChainCertPem: createCertificateChainPem(defaultLeafCertPem, caCertPem),
+    leafPublicKeyPem: crypto.createPublicKey(fs.readFileSync(paths.leafKeyPath, 'utf8')).export({
+      type: 'spki',
+      format: 'pem',
+    }),
+  };
+}
+
+function createRelayTlsContextProvider(customRoot = '', logger = null) {
+  const rootKey = String(customRoot || '');
+  const cached = dynamicTlsProviderCache.get(rootKey);
+  if (cached) return cached;
+
+  const paths = ensureRelayCertificates(customRoot);
+  const materials = loadDynamicTlsMaterials(paths);
+  const contexts = new Map();
+  const fallbackContext = tls.createSecureContext({
+    key: materials.leafKeyPem,
+    cert: materials.defaultFullChainCertPem,
+  });
+
+  function trimDynamicTlsContextCache() {
+    while (contexts.size > DYNAMIC_TLS_CONTEXT_CACHE_LIMIT) {
+      const oldestKey = contexts.keys().next().value;
+      if (!oldestKey) break;
+      contexts.delete(oldestKey);
+    }
+  }
+
+  function getOrCreateSecureContext(servername = '') {
+    const host = normalizeDynamicLeafHost(servername);
+    if (!host) {
+      return { host: '', secureContext: fallbackContext, cacheHit: true, dynamic: false };
+    }
+    const existing = contexts.get(host);
+    if (existing) {
+      contexts.delete(host);
+      contexts.set(host, existing);
+      return { host, secureContext: existing.secureContext, cacheHit: true, dynamic: true };
+    }
+    const certPem = certPemFromDer(buildCertificateDer({
+      subject: buildLeafNameDer(host),
+      issuer: materials.caSubjectDer,
+      publicKeyPem: materials.leafPublicKeyPem,
+      issuerPrivateKeyPem: materials.caKeyPem,
+      serial: crypto.randomBytes(16),
+      days: 825,
+      sans: [host],
+    }));
+    const secureContext = tls.createSecureContext({
+      key: materials.leafKeyPem,
+      cert: createCertificateChainPem(certPem, materials.caCertPem),
+    });
+    const entry = {
+      host,
+      secureContext,
+      certPem,
+      createdAt: Date.now(),
+    };
+    contexts.set(host, entry);
+    trimDynamicTlsContextCache();
+    logger?.info?.(`tls dynamic leaf issued host=${host} cacheSize=${contexts.size}`);
+    return { host, secureContext, cacheHit: false, dynamic: true };
+  }
+
+  const provider = {
+    paths,
+    key: materials.leafKeyPem,
+    cert: materials.defaultFullChainCertPem,
+    fallbackContext,
+    getSecureContext(servername = '') {
+      return getOrCreateSecureContext(servername);
+    },
+    SNICallback(servername, callback) {
+      try {
+        const resolved = getOrCreateSecureContext(servername);
+        if (typeof callback === 'function') callback(null, resolved.secureContext);
+        return resolved.secureContext;
+      } catch (error) {
+        logger?.warn?.(`tls dynamic leaf issue failed host=${String(servername || '-')}: ${error.message}`);
+        if (typeof callback === 'function') callback(null, fallbackContext);
+        return fallbackContext;
+      }
+    },
+    getCacheStats() {
+      return {
+        size: contexts.size,
+        limit: DYNAMIC_TLS_CONTEXT_CACHE_LIMIT,
+      };
+    },
+  };
+
+  dynamicTlsProviderCache.set(rootKey, provider);
+  return provider;
 }
 
 function buildCertificateDer({
@@ -294,6 +538,7 @@ function generateRelayCertificatesWithNode(paths) {
   fs.writeFileSync(paths.caCertPath, certPemFromDer(caDer), 'utf8');
   fs.writeFileSync(paths.leafKeyPath, leafKeys.privateKey, 'utf8');
   fs.writeFileSync(paths.leafCertPath, certPemFromDer(leafDer), 'utf8');
+  writeFullChainCertificate(paths);
 }
 
 function writeLeafSanConfig(configPath) {
@@ -321,13 +566,21 @@ function writeLeafSanConfig(configPath) {
 }
 
 function removeGeneratedHelperFiles(paths) {
-  [paths.fullChainCertPath, paths.sanConfigPath, paths.caSerialPath].forEach((filePath) => {
+  [paths.sanConfigPath, paths.caSerialPath].forEach((filePath) => {
     try {
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
     } catch {
       /* ignore */
     }
   });
+}
+
+function writeFullChainCertificate(paths) {
+  if (!fileReady(paths.leafCertPath) || !fileReady(paths.caCertPath)) return false;
+  const leafCertPem = fs.readFileSync(paths.leafCertPath, 'utf8');
+  const caCertPem = fs.readFileSync(paths.caCertPath, 'utf8');
+  fs.writeFileSync(paths.fullChainCertPath, createCertificateChainPem(leafCertPem, caCertPem), 'utf8');
+  return true;
 }
 
 function ensureRelayCertificates(customRoot) {
@@ -389,6 +642,7 @@ function ensureRelayCertificates(customRoot) {
     }
   }
 
+  writeFullChainCertificate(paths);
   removeGeneratedHelperFiles(paths);
 
   return {
@@ -429,15 +683,21 @@ function listInstalledRelayCas() {
   if (process.platform !== 'win32') return [];
   const script = [
     "$items = @();",
-    "Get-ChildItem Cert:\\CurrentUser\\Root -ErrorAction SilentlyContinue |",
-    "Where-Object { $_.Subject -like '*CursorPool Relay CA*' -or ($_.Subject -like '*CursorPool*' -and $_.Subject -like '*Relay CA*') } |",
-    "ForEach-Object {",
-    "  $items += [PSCustomObject]@{",
-    "    thumbprint = $_.Thumbprint;",
-    "    subject = $_.Subject;",
-    "    store = 'CurrentUser\\\\Root';",
+    "$stores = @(",
+    "  @{ Path = 'Cert:\\CurrentUser\\Root'; Label = 'CurrentUser\\Root' },",
+    "  @{ Path = 'Cert:\\LocalMachine\\Root'; Label = 'LocalMachine\\Root' }",
+    ");",
+    "foreach ($store in $stores) {",
+    "  Get-ChildItem $store.Path -ErrorAction SilentlyContinue |",
+    "  Where-Object { $_.Subject -like '*CursorPool Relay CA*' -or ($_.Subject -like '*CursorPool*' -and $_.Subject -like '*Relay CA*') } |",
+    "  ForEach-Object {",
+    "    $items += [PSCustomObject]@{",
+    "      thumbprint = $_.Thumbprint;",
+    "      subject = $_.Subject;",
+    "      store = $store.Label;",
+    "    }",
     "  }",
-    "};",
+    "}",
     "$items | ConvertTo-Json -Compress",
   ].join(' ');
   const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], {
@@ -465,9 +725,12 @@ function getRelayCaTrustState(customRoot) {
   const paths = getRelayCertPaths(customRoot);
   const fileThumbprint = readCertSha1Thumbprint(paths.caCertPath);
   const installed = listInstalledRelayCas();
-  const matching = Boolean(
-    fileThumbprint && installed.some((entry) => entry.thumbprint === fileThumbprint),
-  );
+  const matchingEntries = fileThumbprint
+    ? installed.filter((entry) => entry.thumbprint === fileThumbprint)
+    : [];
+  const matching = matchingEntries.length > 0;
+  const userMatching = matchingEntries.some((entry) => String(entry.store || '').toLowerCase() === 'currentuser\\root');
+  const machineMatching = matchingEntries.some((entry) => String(entry.store || '').toLowerCase() === 'localmachine\\root');
   const stale = fileThumbprint
     ? installed.filter((entry) => entry.thumbprint !== fileThumbprint)
     : installed.slice();
@@ -476,7 +739,10 @@ function getRelayCaTrustState(customRoot) {
   return {
     fileThumbprint,
     installed,
+    matchingEntries,
     matching,
+    userMatching,
+    machineMatching,
     stale,
     hasStaleTrust: stale.length > 0,
     trustMismatch,
@@ -490,16 +756,22 @@ function removeInstalledRelayCaEntry(entry) {
   if (!thumbprint) {
     return { ok: false, thumbprint: '', message: 'Relay CA thumbprint is missing.' };
   }
+  const storeLabel = String(entry?.store || 'CurrentUser\\Root').trim();
+  const store = WINDOWS_RELAY_CA_STORES.find((item) => item.label.toLowerCase() === storeLabel.toLowerCase())
+    || WINDOWS_RELAY_CA_STORES[0];
 
-  const certutilResult = spawnSync('certutil', ['-delstore', '-user', '-f', 'Root', thumbprint], {
+  const certutilArgs = ['-delstore'];
+  if (store.certutilUserFlag) certutilArgs.push('-user');
+  certutilArgs.push('-f', 'Root', thumbprint);
+  const certutilResult = spawnSync('certutil', certutilArgs, {
     encoding: 'utf8',
     windowsHide: true,
   });
   if (certutilResult.status === 0) {
-    return { ok: true, thumbprint, method: 'certutil' };
+    return { ok: true, thumbprint, store: store.label, method: 'certutil' };
   }
 
-  const psPath = `Cert:\\CurrentUser\\Root\\${thumbprint}`;
+  const psPath = `${store.psPath}\\${thumbprint}`;
   const psResult = spawnSync('powershell.exe', [
     '-NoProfile',
     '-ExecutionPolicy',
@@ -511,12 +783,15 @@ function removeInstalledRelayCaEntry(entry) {
     windowsHide: true,
   });
   if (psResult.status === 0) {
-    return { ok: true, thumbprint, method: 'powershell' };
+    return { ok: true, thumbprint, store: store.label, method: 'powershell' };
   }
 
-  const stillInstalled = listInstalledRelayCas().some((item) => item.thumbprint === thumbprint);
+  const stillInstalled = listInstalledRelayCas().some((item) => (
+    item.thumbprint === thumbprint
+    && String(item.store || '').toLowerCase() === store.label.toLowerCase()
+  ));
   if (!stillInstalled) {
-    return { ok: true, thumbprint, method: 'verify-missing' };
+    return { ok: true, thumbprint, store: store.label, method: 'verify-missing' };
   }
 
   const output = String(
@@ -529,8 +804,9 @@ function removeInstalledRelayCaEntry(entry) {
   return {
     ok: false,
     thumbprint,
+    store: store.label,
     method: 'failed',
-    message: output || `Failed to remove Relay CA ${thumbprint} from the current-user Root store.`,
+    message: output || `Failed to remove Relay CA ${thumbprint} from the ${store.label} store.`,
   };
 }
 
@@ -540,7 +816,7 @@ function removeInstalledRelayCas(entries = null) {
   }
   const targets = Array.isArray(entries) ? entries : listInstalledRelayCas();
   if (!targets.length) {
-    return { ok: true, removed: 0, message: 'No Relay CA entries found in the current-user Root store.' };
+    return { ok: true, removed: 0, message: 'No Relay CA entries found in Windows Root stores.' };
   }
 
   let removed = 0;
@@ -564,9 +840,9 @@ function removeInstalledRelayCas(entries = null) {
     remaining: remainingTargets,
     message: removed
       ? remainingTargets.length
-        ? `Removed ${removed} Relay CA entr${removed === 1 ? 'y' : 'ies'}, but ${remainingTargets.length} still remain in the current-user Root store.`
-        : `Removed ${removed} Relay CA entr${removed === 1 ? 'y' : 'ies'} from the current-user Root store.`
-      : (errors[0] || 'Failed to remove Relay CA from the current-user Root store.'),
+        ? `Removed ${removed} Relay CA entr${removed === 1 ? 'y' : 'ies'}, but ${remainingTargets.length} still remain in Windows Root stores.`
+        : `Removed ${removed} Relay CA entr${removed === 1 ? 'y' : 'ies'} from Windows Root stores.`
+      : (errors[0] || 'Failed to remove Relay CA from Windows Root stores.'),
   };
 }
 
@@ -577,7 +853,36 @@ function isRelayCaInstalled(customRoot) {
   return getRelayCaTrustState(customRoot).matching;
 }
 
-function installRelayCaCertificate(customRoot) {
+function installRelayCaCertificateIntoUserStore(paths) {
+  return spawnSync('certutil', ['-addstore', '-user', '-f', 'Root', paths.caCertPath], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+}
+
+function quotePowerShellSingle(value) {
+  return `'${String(value || '').replace(/'/g, "''")}'`;
+}
+
+function installRelayCaCertificateIntoMachineStore(paths) {
+  const script = [
+    `$process = Start-Process -FilePath 'certutil.exe' -ArgumentList @('-addstore','-f','Root',${quotePowerShellSingle(paths.caCertPath)}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru;`,
+    'exit $process.ExitCode',
+  ].join(' ');
+  return spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    script,
+  ], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+}
+
+function installRelayCaCertificate(customRoot, options = {}) {
   const paths = ensureRelayCertificates(customRoot);
   if (process.platform !== 'win32') {
     return {
@@ -590,7 +895,10 @@ function installRelayCaCertificate(customRoot) {
 
   invalidateCaInstallCache();
   const trustState = getRelayCaTrustState(customRoot);
-  if (trustState.matching) {
+  const requireMachineStore = options.requireMachineStore === true;
+  const installMachineStore = options.installMachineStore === true || requireMachineStore;
+  const hasRequiredTrust = trustState.matching && (!requireMachineStore || trustState.machineMatching);
+  if (hasRequiredTrust) {
     const removedStale = trustState.hasStaleTrust
       ? removeInstalledRelayCas(trustState.stale)
       : null;
@@ -600,9 +908,13 @@ function installRelayCaCertificate(customRoot) {
       alreadyInstalled: true,
       removedStale,
       caCertPath: paths.caCertPath,
+      userInstalled: trustState.userMatching,
+      machineInstalled: trustState.machineMatching,
       message: removedStale?.removed
         ? `Relay CA is already installed. Removed ${removedStale.removed} stale Relay CA entr${removedStale.removed === 1 ? 'y' : 'ies'}.`
-        : 'Relay CA is already installed in the current-user Root store.',
+        : trustState.machineMatching
+          ? 'Relay CA is already installed in Windows Root stores.'
+          : 'Relay CA is already installed in the current-user Root store.',
     };
   }
 
@@ -623,23 +935,46 @@ function installRelayCaCertificate(customRoot) {
     }
   }
 
-  const result = spawnSync('certutil', ['-addstore', '-user', '-f', 'Root', paths.caCertPath], {
-    encoding: 'utf8',
-    windowsHide: true,
-  });
-  const output = String(result.stdout || result.stderr || '').trim();
+  const userResult = trustState.userMatching
+    ? { status: 0, stdout: '', stderr: '' }
+    : installRelayCaCertificateIntoUserStore(paths);
+  let machineResult = null;
+  if (installMachineStore) {
+    const afterUserTrustState = getRelayCaTrustState(customRoot);
+    if (!afterUserTrustState.machineMatching) {
+      machineResult = installRelayCaCertificateIntoMachineStore(paths);
+    }
+  }
+  const output = String(
+    machineResult?.stdout
+    || machineResult?.stderr
+    || userResult.stdout
+    || userResult.stderr
+    || '',
+  ).trim();
   invalidateCaInstallCache();
-  const installed = result.status === 0 || isRelayCaInstalled(customRoot);
+  const finalTrustState = getRelayCaTrustState(customRoot);
+  const installed = finalTrustState.matching;
+  const machineInstalled = finalTrustState.machineMatching;
+  const requiredInstalled = installed && (!requireMachineStore || machineInstalled);
   return {
-    ok: installed,
-    installed,
+    ok: requiredInstalled,
+    installed: requiredInstalled,
+    userInstalled: finalTrustState.userMatching,
+    machineInstalled,
     removedStale,
     caCertPath: paths.caCertPath,
-    message: installed
+    machineInstallAttempted: Boolean(machineResult),
+    machineInstallExitCode: machineResult ? machineResult.status : null,
+    message: requiredInstalled
       ? (removedStale?.removed
         ? `Removed ${removedStale.removed} stale Relay CA entr${removedStale.removed === 1 ? 'y' : 'ies'} and installed the current CA.`
-        : 'Relay CA installed into the current-user Root store.')
-      : (output || 'Failed to install Relay CA with certutil.'),
+        : machineInstalled
+          ? 'Relay CA installed into Windows Root stores.'
+          : 'Relay CA installed into the current-user Root store.')
+      : (output || (requireMachineStore
+        ? 'Failed to install Relay CA into LocalMachine Root store. Please approve the Windows UAC prompt or run as administrator.'
+        : 'Failed to install Relay CA with certutil.')),
   };
 }
 
@@ -661,9 +996,11 @@ function getRelayCertStatusReadonly(customRoot) {
   const paths = getRelayCertPaths(customRoot);
   const trustState = getRelayCaTrustState(customRoot);
   const caInstalled = trustState.matching;
-  let installHint = '请将 ca.crt 导入当前用户「受信任的根证书」存储，否则 Cursor 可能拒绝 *.cursor.sh 的 MITM TLS。';
-  if (caInstalled) {
-    installHint = 'MITM 根证书已在本地受信任。';
+  let installHint = '请将 ca.crt 导入 Windows 受信任根证书存储，否则 Cursor 可能拒绝 *.cursor.sh 的 MITM TLS。';
+  if (trustState.machineMatching) {
+    installHint = 'MITM 根证书已在 Windows 系统根证书库受信任。';
+  } else if (trustState.userMatching) {
+    installHint = 'MITM 根证书仅安装到当前用户 Root；若 Cursor 仍报 unable to verify the first certificate，请安装到 LocalMachine Root。';
   } else if (trustState.trustMismatch) {
     installHint = '检测到旧版 Relay 根证书仍受信任，但当前 ca.crt 已变更；请执行「恢复证书」或重新安装根证书。';
   }
@@ -677,6 +1014,8 @@ function getRelayCertStatusReadonly(customRoot) {
     caReady: fileReady(paths.caCertPath) && fileReady(paths.caKeyPath),
     leafReady: fileReady(paths.leafCertPath) && fileReady(paths.leafKeyPath),
     caInstalled,
+    caUserInstalled: trustState.userMatching,
+    caMachineInstalled: trustState.machineMatching,
     caTrustMatching: caInstalled,
     caTrustStale: trustState.trustMismatch,
     caTrustExtraStale: trustState.hasExtraTrust,
@@ -783,7 +1122,7 @@ function repairRelayCertificates(customRoot) {
   const removedFromStore = removeInstalledRelayCas(trustBefore.installed);
   const removedFiles = resetRelayCertificateFiles(customRoot);
   const paths = ensureRelayCertificates(customRoot);
-  const install = installRelayCaCertificate(customRoot);
+  const install = installRelayCaCertificate(customRoot, { installMachineStore: true, requireMachineStore: true });
   invalidateCaInstallCache();
   const check = checkRelayCertificates(customRoot);
   return {
@@ -804,6 +1143,7 @@ function checkRelayCertificates(customRoot) {
   const paths = ensureRelayCertificates(customRoot);
   const trustState = getRelayCaTrustState(customRoot);
   const caInstalled = trustState.matching;
+  const caMachineInstalled = trustState.machineMatching;
   const leafVerify = verifyLeafSignedByCa(paths.leafCertPath, paths.caCertPath);
   const caExpiresAt = readCertEndDate(paths.caCertPath);
   const leafExpiresAt = readCertEndDate(paths.leafCertPath);
@@ -832,10 +1172,18 @@ function checkRelayCertificates(customRoot) {
       label: '根证书信任',
       ok: caInstalled,
       detail: caInstalled
-        ? '当前 ca.crt 已安装到当前用户 Root 存储'
+        ? `当前 ca.crt 已安装：CurrentUser=${trustState.userMatching ? '是' : '否'}，LocalMachine=${trustState.machineMatching ? '是' : '否'}`
         : trustState.trustMismatch
           ? `检测到 ${trustState.stale.length} 个旧版 Relay 根证书仍受信任，但与当前 ca.crt 指纹不一致`
           : '尚未安装到受信任的根证书存储',
+    },
+    {
+      id: 'ca_machine_trust',
+      label: '系统根证书信任',
+      ok: caMachineInstalled,
+      detail: caMachineInstalled
+        ? '当前 ca.crt 已安装到 LocalMachine\\Root（与参考实现一致）'
+        : '当前 ca.crt 尚未安装到 LocalMachine\\Root；部分 Cursor/Electron 请求可能不信任 CurrentUser\\Root',
     },
     {
       id: 'openssl',
@@ -856,13 +1204,15 @@ function checkRelayCertificates(customRoot) {
 
   const passed = checks.filter((item) => item.ok).length;
   const ok = checks.every((item) => item.id === 'openssl' ? true : item.ok);
-  const readyForMitm = paths.caReady && paths.leafReady && leafVerify.ok && caInstalled;
+  const readyForMitm = paths.caReady && paths.leafReady && leafVerify.ok && caInstalled && caMachineInstalled;
 
   let summary = '证书检查未通过，请重新启用 Relay 或手动导入 ca.crt。';
   if (readyForMitm) {
-    summary = '证书检查通过：MITM 所需 CA/Leaf 已就绪，且根证书已在本地受信任。';
+    summary = '证书检查通过：MITM 所需 CA/Leaf 已就绪，且根证书已安装到 Windows 系统根证书库。';
   } else if (trustState.trustMismatch) {
     summary = '证书文件已就绪，但本地仍信任旧版 Relay 根证书；MITM 会失败，请执行「恢复证书」。';
+  } else if (caInstalled && !caMachineInstalled) {
+    summary = '证书文件正常，当前 CA 仅在当前用户 Root；请安装到 LocalMachine Root 后重启 Cursor。';
   } else if (ok) {
     summary = '证书文件正常，但根证书尚未完全受信任，Cursor 可能仍报 TLS 错误。';
   }
@@ -879,6 +1229,8 @@ function checkRelayCertificates(customRoot) {
     caExpiresAt,
     leafExpiresAt,
     caInstalled,
+    caUserInstalled: trustState.userMatching,
+    caMachineInstalled,
     caTrustStale: trustState.trustMismatch,
     caTrustExtraStale: trustState.hasExtraTrust,
     caTrustNeedsCleanup: trustState.hasStaleTrust,
@@ -892,6 +1244,7 @@ module.exports = {
   getRelayDataDir,
   getRelayCertPaths,
   ensureRelayCertificates,
+  createRelayTlsContextProvider,
   getRelayCertStatus,
   getRelayCertStatusReadonly,
   installRelayCaCertificate,

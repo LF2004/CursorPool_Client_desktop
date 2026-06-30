@@ -6,10 +6,83 @@ const DB_FILE_NAME = 'model.db';
 
 let Database = null;
 let dbCache = new Map();
+let dbMode = '';
+
+function createStatementAdapter(statement, mode) {
+  if (mode === 'better-sqlite3') return statement;
+  return {
+    all(...params) {
+      return statement.all(...params);
+    },
+    pluck() {
+      return {
+        get: (...params) => {
+          const row = statement.get(...params);
+          if (row == null) return undefined;
+          if (Array.isArray(row)) return row[0];
+          if (typeof row === 'object') {
+            const firstKey = Object.keys(row)[0];
+            return firstKey ? row[firstKey] : undefined;
+          }
+          return row;
+        },
+      };
+    },
+    run(...params) {
+      const result = statement.run(...params);
+      return {
+        changes: Number(result?.changes || 0),
+        lastInsertRowid: result?.lastInsertRowid,
+      };
+    },
+  };
+}
+
+function createDbAdapter(rawDb, mode) {
+  return {
+    pragma(sql) {
+      if (mode === 'better-sqlite3') return rawDb.pragma(sql);
+      return rawDb.exec(`PRAGMA ${sql}`);
+    },
+    exec(sql) {
+      return rawDb.exec(sql);
+    },
+    prepare(sql) {
+      return createStatementAdapter(rawDb.prepare(sql), mode);
+    },
+    transaction(fn) {
+      if (mode === 'better-sqlite3') return rawDb.transaction(fn);
+      return (...args) => {
+        rawDb.exec('BEGIN IMMEDIATE');
+        try {
+          const result = fn(...args);
+          rawDb.exec('COMMIT');
+          return result;
+        } catch (error) {
+          try {
+            rawDb.exec('ROLLBACK');
+          } catch {
+            /* ignore */
+          }
+          throw error;
+        }
+      };
+    },
+    close() {
+      return rawDb.close();
+    },
+  };
+}
 
 function loadDatabaseCtor() {
   if (Database) return Database;
-  Database = require('better-sqlite3');
+  try {
+    Database = require('better-sqlite3');
+    dbMode = 'better-sqlite3';
+  } catch {
+    Database = require('node:sqlite').DatabaseSync;
+    dbMode = 'node:sqlite';
+  }
   return Database;
 }
 
@@ -24,7 +97,19 @@ function openProfileDb(customRoot = '') {
   const cached = dbCache.get(dbPath);
   if (cached) return cached;
   const DatabaseCtor = loadDatabaseCtor();
-  const db = new DatabaseCtor(dbPath);
+  let rawDb;
+  try {
+    rawDb = new DatabaseCtor(dbPath);
+  } catch (error) {
+    const message = String(error?.message || '');
+    if (dbMode !== 'better-sqlite3' || !/NODE_MODULE_VERSION|better_sqlite3\.node|ERR_DLOPEN_FAILED/i.test(message)) {
+      throw error;
+    }
+    Database = require('node:sqlite').DatabaseSync;
+    dbMode = 'node:sqlite';
+    rawDb = new Database(dbPath);
+  }
+  const db = createDbAdapter(rawDb, dbMode);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.exec(`
@@ -35,16 +120,22 @@ function openProfileDb(customRoot = '') {
       base_url TEXT NOT NULL DEFAULT '',
       api_key TEXT NOT NULL DEFAULT '',
       model_name TEXT NOT NULL DEFAULT '',
+      completion_model TEXT NOT NULL DEFAULT '',
       endpoint_mode TEXT NOT NULL DEFAULT 'responses',
       reasoning_effort TEXT NOT NULL DEFAULT 'medium',
       thinking_mode TEXT NOT NULL DEFAULT '',
-      context_window INTEGER NOT NULL DEFAULT 250000,
+      context_window INTEGER NOT NULL DEFAULT 200000,
       notes TEXT NOT NULL DEFAULT '',
       test_status_json TEXT NOT NULL DEFAULT '',
       created_at INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0
     );
   `);
+  try {
+    db.prepare('ALTER TABLE relay_profiles ADD COLUMN completion_model TEXT NOT NULL DEFAULT \'\'').run();
+  } catch {
+    /* column already exists */
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS relay_profile_meta (
       key TEXT PRIMARY KEY,
@@ -104,10 +195,11 @@ function normalizeStore(store = {}) {
       baseUrl: String(item?.baseUrl || '').trim(),
       apiKey: String(item?.apiKey || '').trim(),
       modelName: String(item?.modelName || '').trim(),
+      completionModel: String(item?.completionModel || '').trim(),
       endpointMode: String(item?.endpointMode || 'responses').trim() || 'responses',
       reasoningEffort: String(item?.reasoningEffort || 'medium').trim() || 'medium',
       thinkingMode: String(item?.thinkingMode || '').trim(),
-      contextWindow: Number(item?.contextWindow) > 0 ? Number(item.contextWindow) : 250000,
+      contextWindow: Math.max(1, Math.min(200000, Number(item?.contextWindow) > 0 ? Number(item.contextWindow) : 200000)),
       notes: String(item?.notes || '').trim(),
       testStatus: normalizeTestStatus(item?.testStatus),
       createdAt: Number(item?.createdAt) || 0,
@@ -156,6 +248,7 @@ function loadRelayProfileStore(customRoot = '') {
       base_url,
       api_key,
       model_name,
+      completion_model,
       endpoint_mode,
       reasoning_effort,
       thinking_mode,
@@ -189,10 +282,11 @@ function loadRelayProfileStore(customRoot = '') {
         baseUrl: String(row.base_url || ''),
         apiKey: String(row.api_key || ''),
         modelName: String(row.model_name || ''),
+        completionModel: String(row.completion_model || ''),
         endpointMode: String(row.endpoint_mode || 'responses'),
         reasoningEffort: String(row.reasoning_effort || 'medium'),
         thinkingMode: String(row.thinking_mode || ''),
-        contextWindow: Number(row.context_window) || 250000,
+        contextWindow: Math.max(1, Math.min(200000, Number(row.context_window) || 200000)),
         notes: String(row.notes || ''),
         testStatus,
         createdAt: Number(row.created_at) || 0,
@@ -215,6 +309,7 @@ function saveRelayProfileStore(store = {}, customRoot = '') {
         base_url,
         api_key,
         model_name,
+        completion_model,
         endpoint_mode,
         reasoning_effort,
         thinking_mode,
@@ -230,6 +325,7 @@ function saveRelayProfileStore(store = {}, customRoot = '') {
         @base_url,
         @api_key,
         @model_name,
+        @completion_model,
         @endpoint_mode,
         @reasoning_effort,
         @thinking_mode,
@@ -248,6 +344,7 @@ function saveRelayProfileStore(store = {}, customRoot = '') {
         base_url: item.baseUrl,
         api_key: item.apiKey,
         model_name: item.modelName,
+        completion_model: item.completionModel,
         endpoint_mode: item.endpointMode,
         reasoning_effort: item.reasoningEffort,
         thinking_mode: item.thinkingMode,

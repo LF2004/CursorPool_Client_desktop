@@ -105,6 +105,42 @@ function runCursorCommand(commandId, timeoutMs = 12000) {
   }
 }
 
+function startNewCursorAgentConversation(options = {}) {
+  if (!isCursorRunningHeuristic()) {
+    return { ok: false, skipped: true, message: 'Cursor 未运行' }
+  }
+
+  const timeoutMs = Number(options.timeoutMs || 4000)
+  const commands = [
+    'glass.newAgentFromKeyboard',
+    'aichat.newchataction',
+    'workbench.action.chat.openAgent',
+    'composerMode.agent',
+    'composer.focusComposer',
+  ]
+
+  const attempted = []
+  let succeeded = false
+  for (const commandId of commands) {
+    let ok = false
+    try {
+      ok = runCursorCommand(commandId, timeoutMs)
+    } catch {
+      ok = false
+    }
+    attempted.push({ commandId, ok })
+    if (ok) succeeded = true
+  }
+
+  return {
+    ok: succeeded,
+    attempted,
+    message: succeeded
+      ? '已尝试切到新的 Cursor Agent 对话'
+      : '未能触发新的 Cursor Agent 对话',
+  }
+}
+
 /** 向已运行的 Cursor 发送重载命令（不 launch 新窗口；异步触发，不阻塞主进程） */
 function reloadRunningCursorWindow() {
   if (!isCursorRunningHeuristic()) return false
@@ -1079,6 +1115,7 @@ module.exports = {
   isCursorRunningHeuristic,
   getCursorProcessSnapshot,
   resolveCursorExePath,
+  startNewCursorAgentConversation,
   closeCursorMainWindows,
   requestCursorQuitViaCli,
   gracefulQuitCursor,

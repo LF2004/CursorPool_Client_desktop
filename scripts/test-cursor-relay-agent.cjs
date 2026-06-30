@@ -14,6 +14,10 @@ const {
 } = require('../js/utils/cursor-relay-runner-manager');
 const { readRunnerLogTail } = require('../js/utils/cursor-relay-log');
 const { decodeBidiAppendRequest } = require('../js/utils/cursor-relay-protocol');
+const {
+  buildAgentBidiAppendPayload,
+  mapAgentModeNameToNumber,
+} = require('../js/utils/cursor-relay-agent-test');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -198,19 +202,6 @@ function extractAgentFrameInfo(frame) {
     return { kind: 'kv' };
   }
   return { kind: 'unknown' };
-}
-
-function buildAgentBidiAppendPayload(requestId, userText) {
-  const userMessage = encodeMessage([{ field: 1, value: userText }]);
-  const userAction = encodeMessage([{ field: 1, value: userMessage }]);
-  const conversationAction = encodeMessage([{ field: 1, value: userAction }]);
-  const runRequest = encodeMessage([{ field: 2, value: conversationAction }]);
-  const agentPayload = encodeMessage([{ field: 1, value: runRequest }]);
-  const requestIdMessage = encodeMessage([{ field: 1, value: requestId }]);
-  return encodeMessage([
-    { field: 1, value: agentPayload },
-    { field: 2, value: requestIdMessage },
-  ]);
 }
 
 function buildAgentExecClientPayload(requestId, execId, text = '') {
@@ -532,6 +523,8 @@ async function main() {
   const baseUrl = String(process.env.RELAY_TEST_BASE_URL || '').trim();
   const apiKey = String(process.env.RELAY_TEST_API_KEY || '').trim();
   const modelName = String(process.env.RELAY_TEST_MODEL || 'gpt-5.4').trim() || 'gpt-5.4';
+  const agentMode = String(process.env.RELAY_TEST_AGENT_MODE || 'AGENT_MODE_AGENT').trim() || 'AGENT_MODE_AGENT';
+  const agentModeNumber = mapAgentModeNameToNumber(agentMode);
   const port = Number(process.env.RELAY_TEST_PORT || 17790);
   const prompt = String(process.env.RELAY_TEST_PROMPT || 'Reply with exactly PONG and nothing else.').trim();
   const targetHost = String(process.env.RELAY_TEST_TARGET_HOST || 'api2.cursor.sh').trim() || 'api2.cursor.sh';
@@ -589,7 +582,7 @@ async function main() {
     const bidiResponse = await postBinary({
       port,
       path: '/aiserver.v1.BidiService/BidiAppend',
-      body: buildAgentBidiAppendPayload(requestId, prompt),
+      body: buildAgentBidiAppendPayload(requestId, prompt, { mode: agentMode }),
       targetHost,
       headers: {
         'Content-Type': 'application/proto',
@@ -620,6 +613,8 @@ async function main() {
       bidi: {
         statusCode: bidiResponse.statusCode,
         bodyLength: bidiResponse.body.length,
+        agentMode,
+        agentModeNumber,
       },
       sse: {
         statusCode: sseResult.statusCode,

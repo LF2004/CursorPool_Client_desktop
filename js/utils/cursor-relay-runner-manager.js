@@ -4,7 +4,7 @@ const http = require('http');
 const { execFileSync } = require('child_process');
 const { fork } = require('child_process');
 const { ensureRelayCertificates, getRelayDataDir } = require('./cursor-relay-cert');
-const { initRunnerLogs, getRunnerLogPaths, readRunnerLogTail } = require('./cursor-relay-log');
+const { initRunnerLogs, getRunnerLogPaths, readRunnerLogTail, appendRunnerLog } = require('./cursor-relay-log');
 const { DEFAULT_DIRECT_MITM_PORT } = require('./cursor-relay-transparent');
 const { normalizeBaseUrl } = require('./cursor-model-proxy');
 const { resolveRelayOutboundProxy } = require('./cursor-relay-system-proxy');
@@ -27,7 +27,55 @@ const runnerOperationState = {
 let runnerChild = null;
 let runnerConfig = null;
 
+// ── Runner 自动重启守护 ───────────────────────────────────
+// intentionalStop: 主动停止标志，exit handler 据此决定是否自动重启
+let intentionalStop = false;
+// 保存上次启动参数，供异常退出后自动重启使用
+let lastStartPayload = null;
+// 重启退避状态
+let restartBackoff = {
+  consecutiveCrashes: 0,
+  lastRestartAt: 0,
+};
+const RESTART_MAX_CONSECUTIVE = 5;
+const RESTART_BASE_DELAY = 1000;
+const RESTART_MAX_DELAY = 30000;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function tryParseJson(text = '') {
+  try {
+    const parsed = JSON.parse(String(text || '').trim());
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function findListeningPidsByPort(port) {
+  const targetPort = Number(port) || 0;
+  if (!targetPort || process.platform !== 'win32') return [];
+  try {
+    const output = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-NetTCPConnection -State Listen -LocalPort ${targetPort} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ConvertTo-Json -Compress`,
+      ],
+      { encoding: 'utf8', windowsHide: true, timeout: 10000 },
+    );
+    const parsed = tryParseJson(output);
+    const values = Array.isArray(parsed) ? parsed : (parsed == null ? [] : [parsed]);
+    return values
+      .map((item) => Number(item) || 0)
+      .filter(Boolean)
+      .filter((item, index, list) => list.indexOf(item) === index);
+  } catch {
+    return [];
+  }
+}
 
 function buildStartOperationKey(options = {}) {
   const port = Number(options.port || DEFAULT_PORT) || DEFAULT_PORT;
@@ -47,6 +95,7 @@ function buildStartOperationKey(options = {}) {
     port,
     mode,
     forceRestartRunner: options.forceRestartRunner === true,
+    completionModel: String(options.completionModel || '').trim(),
     localNativeAgentTools: options.localNativeAgentTools !== false,
     structuredAgentToolCalls: options.structuredAgentToolCalls !== false,
     nativeMutationTools: options.nativeMutationTools !== false,
@@ -54,6 +103,7 @@ function buildStartOperationKey(options = {}) {
     emitAgentKvBootstrap: options.emitAgentKvBootstrap === true,
     emitLocalMutationCheckpoints: options.emitLocalMutationCheckpoints === true,
     emitLocalToolInteractionFrames: options.emitLocalToolInteractionFrames !== false,
+    emitLocalStepFrames: options.emitLocalStepFrames === true,
     emitAgentExecServerFrames: options.emitAgentExecServerFrames !== false,
     maxLocalToolCallsPerRound: Math.max(1, Math.min(32, Math.floor(Number(options.maxLocalToolCallsPerRound) || 12))),
     enableReviewBridge: options.enableReviewBridge === true,
@@ -61,6 +111,7 @@ function buildStartOperationKey(options = {}) {
     outboundProxy: normalizeOutboundProxyForCompare(outboundProxy),
     upstream: {
       providerId: upstream.providerId,
+      displayName: upstream.displayName,
       baseUrl: upstream.baseUrl,
       modelName: upstream.modelName,
       availableModels: upstream.availableModels,
@@ -112,10 +163,11 @@ function normalizeUpstream(upstream = {}) {
   const baseUrl = rawBaseUrl ? normalizeBaseUrl(rawBaseUrl) : '';
   const apiKey = String(upstream.apiKey || '').trim();
   const modelName = String(upstream.modelName || 'gpt-4o-mini').trim() || 'gpt-4o-mini';
+  const displayName = String(upstream.displayName || upstream.name || modelName).trim() || modelName;
   const endpointMode = String(upstream.endpointMode || 'responses').trim().toLowerCase();
   const reasoningEffort = String(upstream.reasoningEffort || 'medium').trim().toLowerCase();
   const thinkingMode = String(upstream.thinkingMode || '').trim().toLowerCase();
-  const contextWindow = Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 250000;
+  const contextWindow = Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 200000;
   if (!baseUrl) throw new Error('Upstream baseUrl is required for the local relay runner');
   if (!apiKey) throw new Error('Upstream apiKey is required for the local relay runner');
   const availableModels = Array.isArray(upstream.availableModels)
@@ -126,6 +178,7 @@ function normalizeUpstream(upstream = {}) {
   if (!availableModels.includes(modelName)) availableModels.unshift(modelName);
   return {
     providerId: String(upstream.providerId || 'custom').trim() || 'custom',
+    displayName,
     baseUrl,
     apiKey,
     modelName,
@@ -164,19 +217,21 @@ function normalizeRunnerMode(value) {
 function buildOfficialPassthroughUpstream() {
   return {
     providerId: 'cursor_official',
+    displayName: 'Cursor Official',
     baseUrl: 'https://api2.cursor.sh',
     apiKey: 'official-passthrough',
     modelName: 'cursor-official',
     endpointMode: 'responses',
     reasoningEffort: 'medium',
     thinkingMode: '',
-    contextWindow: 250000,
+    contextWindow: 200000,
   };
 }
 
 function writeRunnerConfig({
   upstream,
   modelRoutes = [],
+  completionModel = '',
   port,
   customRoot,
   mode = RUNNER_MODE_OFFICIAL_PASSTHROUGH,
@@ -188,6 +243,7 @@ function writeRunnerConfig({
   emitAgentKvBootstrap = false,
   emitLocalMutationCheckpoints = false,
   emitLocalToolInteractionFrames = true,
+  emitLocalStepFrames = false,
   emitAgentExecServerFrames = true,
   maxLocalToolCallsPerRound = 12,
   enableReviewBridge = false,
@@ -200,6 +256,7 @@ function writeRunnerConfig({
   const config = {
     port,
     mode,
+    completionModel: String(completionModel || '').trim(),
     directMitmPort: Number(directMitmPort) || 0,
     mockAgentTools: false,
     mockAgentProtoTools: false,
@@ -210,6 +267,7 @@ function writeRunnerConfig({
     emitAgentKvBootstrap: Boolean(emitAgentKvBootstrap),
     emitLocalMutationCheckpoints: Boolean(emitLocalMutationCheckpoints),
     emitLocalToolInteractionFrames: Boolean(emitLocalToolInteractionFrames),
+    emitLocalStepFrames: Boolean(emitLocalStepFrames),
     emitSyntheticLocalNativeToolFrames: false,
     emitAgentExecServerFrames: Boolean(emitAgentExecServerFrames),
     maxLocalToolCallsPerRound: Math.max(1, Math.min(32, Math.floor(Number(maxLocalToolCallsPerRound) || 12))),
@@ -325,10 +383,11 @@ async function waitForRunnerHealth(port, options = {}) {
   const isExpected = typeof options.isExpected === 'function' ? options.isExpected : null;
   for (let i = 0; i < attempts; i += 1) {
     // eslint-disable-next-line no-await-in-loop
-    const health = await probeRunnerHealth(port);
+    const health = await probeRunnerHealth(port, i < 6 ? 120 : 250);
     if (health.ok && (!isExpected || isExpected(health))) return health;
+    // 前 8 次用短间隔(40ms)加速启动探测，之后用配置间隔
     // eslint-disable-next-line no-await-in-loop
-    await sleep(delayMs);
+    await sleep(i < 8 ? 40 : delayMs);
   }
   const finalHealth = await probeRunnerHealth(port);
   if (finalHealth.ok && isExpected && !isExpected(finalHealth)) {
@@ -389,6 +448,7 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   if (String(healthPayload.runnerScriptMtime || '') !== fingerprint.mtime) return false;
   if (Number(healthPayload.runnerScriptSize) !== Number(fingerprint.size)) return false;
   if (String(healthPayload.mode || '') !== String(options.mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return false;
+  if (String(healthPayload.completionModel || '') !== String(options.completionModel || '')) return false;
   if (!outboundProxyMatches(healthPayload.outboundProxy || null, options.outboundProxy || null)) return false;
   const baseUrl = String(upstream.baseUrl || '').trim().replace(/\/+$/, '');
   const modelName = String(upstream.modelName || '').trim();
@@ -418,6 +478,7 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   const wantKvBootstrap = options.emitAgentKvBootstrap === true;
   const wantLocalMutationCheckpoints = options.emitLocalMutationCheckpoints === true;
   const wantLocalToolInteractionFrames = options.emitLocalToolInteractionFrames === true;
+  const wantLocalStepFrames = options.emitLocalStepFrames === true;
   const wantSyntheticFrames = false;
   const wantExecServerFrames = options.emitAgentExecServerFrames === true;
   const wantMaxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(options.maxLocalToolCallsPerRound) || 12)));
@@ -429,11 +490,72 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   if (Boolean(healthPayload.emitAgentKvBootstrap) !== wantKvBootstrap) return false;
   if (Boolean(healthPayload.emitLocalMutationCheckpoints) !== wantLocalMutationCheckpoints) return false;
   if (Boolean(healthPayload.emitLocalToolInteractionFrames) !== wantLocalToolInteractionFrames) return false;
+  if (Boolean(healthPayload.emitLocalStepFrames) !== wantLocalStepFrames) return false;
   if (Boolean(healthPayload.emitSyntheticLocalNativeToolFrames) !== wantSyntheticFrames) return false;
   if (Boolean(healthPayload.emitAgentExecServerFrames) !== wantExecServerFrames) return false;
   if (Math.max(1, Math.floor(Number(healthPayload.maxLocalToolCallsPerRound) || 0)) !== wantMaxLocalToolCallsPerRound) return false;
   if (Boolean(healthPayload.enableReviewBridge) !== wantReviewBridge) return false;
   return true;
+}
+
+function getRunnerReuseMismatchReason(healthPayload, upstream, options = {}) {
+  if (!healthPayload) return 'health missing';
+  if (!upstream) return 'upstream missing';
+  const fingerprint = getRunnerScriptFingerprint();
+  if (String(healthPayload.runnerScriptPath || '').toLowerCase() !== String(fingerprint.path || '').toLowerCase()) {
+    return 'runnerScriptPath';
+  }
+  if (String(healthPayload.runnerScriptMtime || '') !== fingerprint.mtime) return 'runnerScriptMtime';
+  if (Number(healthPayload.runnerScriptSize) !== Number(fingerprint.size)) return 'runnerScriptSize';
+  if (String(healthPayload.mode || '') !== String(options.mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return 'mode';
+  if (String(healthPayload.completionModel || '') !== String(options.completionModel || '')) return 'completionModel';
+  if (!outboundProxyMatches(healthPayload.outboundProxy || null, options.outboundProxy || null)) return 'outboundProxy';
+  const baseUrl = String(upstream.baseUrl || '').trim().replace(/\/+$/, '');
+  const modelName = String(upstream.modelName || '').trim();
+  if (String(healthPayload.upstreamBaseUrl || '').trim().replace(/\/+$/, '') !== baseUrl) return 'upstreamBaseUrl';
+  if (String(healthPayload.upstreamModelName || '').trim() !== modelName) return 'upstreamModelName';
+  const currentAvailableModels = Array.isArray(healthPayload.upstreamAvailableModels)
+    ? healthPayload.upstreamAvailableModels.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const wantedAvailableModels = Array.isArray(upstream.availableModels)
+    ? upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  if (currentAvailableModels.join('\n') !== wantedAvailableModels.join('\n')) return 'upstreamAvailableModels';
+  const currentModelRoutes = Array.isArray(healthPayload.modelRoutes)
+    ? healthPayload.modelRoutes.map((item) => JSON.stringify(item)).filter(Boolean)
+    : [];
+  const wantedModelRoutes = Array.isArray(options.modelRoutes)
+    ? options.modelRoutes.map((item) => JSON.stringify(item)).filter(Boolean)
+    : [];
+  if (currentModelRoutes.join('\n') !== wantedModelRoutes.join('\n')) return 'modelRoutes';
+  if (String(healthPayload.upstreamEndpointMode || 'responses') !== String(upstream.endpointMode || 'responses')) {
+    return 'upstreamEndpointMode';
+  }
+  const wantLocalNative = options.localNativeAgentTools !== false;
+  const wantStructured = options.structuredAgentToolCalls !== false;
+  const wantNativeMutation = options.nativeMutationTools !== false;
+  const wantNativeMutationApplyMode = String(options.nativeMutationApplyMode || 'cursor');
+  const wantKvBootstrap = options.emitAgentKvBootstrap === true;
+  const wantLocalMutationCheckpoints = options.emitLocalMutationCheckpoints === true;
+  const wantLocalToolInteractionFrames = options.emitLocalToolInteractionFrames === true;
+  const wantLocalStepFrames = options.emitLocalStepFrames === true;
+  const wantSyntheticFrames = false;
+  const wantExecServerFrames = options.emitAgentExecServerFrames === true;
+  const wantMaxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(options.maxLocalToolCallsPerRound) || 12)));
+  const wantReviewBridge = options.enableReviewBridge === true;
+  if (Boolean(healthPayload.localNativeAgentTools) !== wantLocalNative) return 'localNativeAgentTools';
+  if (Boolean(healthPayload.structuredAgentToolCalls) !== wantStructured) return 'structuredAgentToolCalls';
+  if (Boolean(healthPayload.nativeMutationTools ?? true) !== wantNativeMutation) return 'nativeMutationTools';
+  if (String(healthPayload.nativeMutationApplyMode || 'cursor') !== wantNativeMutationApplyMode) return 'nativeMutationApplyMode';
+  if (Boolean(healthPayload.emitAgentKvBootstrap) !== wantKvBootstrap) return 'emitAgentKvBootstrap';
+  if (Boolean(healthPayload.emitLocalMutationCheckpoints) !== wantLocalMutationCheckpoints) return 'emitLocalMutationCheckpoints';
+  if (Boolean(healthPayload.emitLocalToolInteractionFrames) !== wantLocalToolInteractionFrames) return 'emitLocalToolInteractionFrames';
+  if (Boolean(healthPayload.emitLocalStepFrames) !== wantLocalStepFrames) return 'emitLocalStepFrames';
+  if (Boolean(healthPayload.emitSyntheticLocalNativeToolFrames) !== wantSyntheticFrames) return 'emitSyntheticLocalNativeToolFrames';
+  if (Boolean(healthPayload.emitAgentExecServerFrames) !== wantExecServerFrames) return 'emitAgentExecServerFrames';
+  if (Math.max(1, Math.floor(Number(healthPayload.maxLocalToolCallsPerRound) || 0)) !== wantMaxLocalToolCallsPerRound) return 'maxLocalToolCallsPerRound';
+  if (Boolean(healthPayload.enableReviewBridge) !== wantReviewBridge) return 'enableReviewBridge';
+  return '';
 }
 
 function buildRunnerStartResult({
@@ -460,6 +582,7 @@ function buildRunnerStartResult({
     emitAgentKvBootstrap: Boolean(written.config.emitAgentKvBootstrap),
     emitLocalMutationCheckpoints: Boolean(written.config.emitLocalMutationCheckpoints),
     emitLocalToolInteractionFrames: Boolean(written.config.emitLocalToolInteractionFrames),
+    emitLocalStepFrames: Boolean(written.config.emitLocalStepFrames),
     emitSyntheticLocalNativeToolFrames: false,
     emitAgentExecServerFrames: Boolean(written.config.emitAgentExecServerFrames),
     maxLocalToolCallsPerRound: Number(written.config.maxLocalToolCallsPerRound) || 12,
@@ -514,6 +637,7 @@ async function waitForRunnerDown(port, attempts = 10, delayMs = 100) {
 }
 
 async function stopLocalRelayRunner(payload = {}) {
+  intentionalStop = true;
   const port = Number(payload.port || runnerConfig?.port || DEFAULT_PORT);
   const knownChild = runnerChild;
   const knownPid = Number(knownChild?.pid) || 0;
@@ -556,18 +680,18 @@ async function stopLocalRelayRunner(payload = {}) {
     };
   }
 
-  await requestRunnerShutdown(port, 700).catch(() => null);
+  await requestRunnerShutdown(port, 400).catch(() => null);
 
   pidSet.forEach((pid) => {
     terminateRunnerPid(pid, { force: false });
   });
 
-  let down = await waitForRunnerDown(port, 8, 100);
+  let down = await waitForRunnerDown(port, 6, 60);
   if (!down) {
     pidSet.forEach((pid) => {
       terminateRunnerPid(pid, { force: true });
     });
-    down = await waitForRunnerDown(port, 6, 120);
+    down = await waitForRunnerDown(port, 4, 80);
   }
 
   return {
@@ -592,7 +716,68 @@ async function stopLocalRelayRunner(payload = {}) {
   }
 }
 
+async function scheduleRunnerRestart(payload, exitCode, exitSignal) {
+  const now = Date.now();
+  const sinceLast = now - restartBackoff.lastRestartAt;
+
+  // 距上次重启 < 5s 视为连续崩溃
+  if (sinceLast < 5000) {
+    restartBackoff.consecutiveCrashes += 1;
+  } else {
+    restartBackoff.consecutiveCrashes = 1;
+  }
+  restartBackoff.lastRestartAt = now;
+
+  if (restartBackoff.consecutiveCrashes > RESTART_MAX_CONSECUTIVE) {
+    console.error(
+      `[relay-runner] runner 异常退出 (code=${exitCode} signal=${exitSignal})，` +
+      `连续崩溃 ${restartBackoff.consecutiveCrashes} 次已超过上限，停止自动重启`,
+    );
+    return;
+  }
+
+  // 指数退避
+  const delay = Math.min(
+    RESTART_BASE_DELAY * (2 ** (restartBackoff.consecutiveCrashes - 1)),
+    RESTART_MAX_DELAY,
+  );
+
+  console.warn(
+    `[relay-runner] runner 异常退出 (code=${exitCode} signal=${exitSignal})，` +
+    `${delay}ms 后自动重启 (第 ${restartBackoff.consecutiveCrashes}/${RESTART_MAX_CONSECUTIVE} 次)`,
+  );
+
+  await sleep(delay);
+
+  // 延迟期间若被主动停止，取消重启
+  if (intentionalStop) {
+    console.log('[relay-runner] 延迟期间检测到主动停止，取消自动重启');
+    return;
+  }
+  // 已有新 runner 在运行则取消
+  if (runnerChild && !runnerChild.killed) {
+    console.log('[relay-runner] 已有 runner 在运行，取消自动重启');
+    return;
+  }
+
+  try {
+    console.log('[relay-runner] 正在自动重启 runner...');
+    const result = await startLocalRelayRunner({
+      ...payload,
+      forceRestartRunner: false,
+    });
+    if (result?.ok) {
+      restartBackoff.consecutiveCrashes = 0;
+      console.log('[relay-runner] 自动重启成功，pid=' + (result.runner?.pid || '-'));
+    }
+  } catch (e) {
+    console.error('[relay-runner] 自动重启失败:', e.message);
+  }
+}
+
 async function startLocalRelayRunner(payload = {}) {
+  intentionalStop = false;
+  lastStartPayload = { ...payload };
   const operationKey = buildStartOperationKey(payload);
   if (runnerOperationState.startPromise && runnerOperationState.startKey === operationKey) {
     return runnerOperationState.startPromise;
@@ -614,6 +799,7 @@ async function startLocalRelayRunner(payload = {}) {
     ? buildOfficialPassthroughUpstream()
     : normalizeUpstream(upstreamPayload || {});
   const modelRoutes = normalizeModelRoutes(payload.modelRoutes);
+  const completionModel = String(payload.completionModel || upstream.completionModel || '').trim();
   const localNativeAgentTools = payload.localNativeAgentTools !== false
     && String(process.env.CURSOR_RELAY_LOCAL_NATIVE_TOOLS || '').trim() !== '0';
   const structuredAgentToolCalls = payload.structuredAgentToolCalls !== false
@@ -638,6 +824,9 @@ async function startLocalRelayRunner(payload = {}) {
     || String(process.env.CURSOR_RELAY_LOCAL_MUTATION_CHECKPOINTS || '').trim() === '1';
   const emitLocalToolInteractionFrames = payload.emitLocalToolInteractionFrames !== false
     && String(process.env.CURSOR_RELAY_LOCAL_TOOL_INTERACTION_FRAMES || '').trim() !== '0';
+  const emitLocalStepFrames = payload.emitLocalStepFrames === true
+    || (mode === RUNNER_MODE_LOCAL_RELAY && emitLocalToolInteractionFrames)
+    || String(process.env.CURSOR_RELAY_EMIT_STEP_FRAMES || '').trim() === '1';
   const maxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(
     payload.maxLocalToolCallsPerRound
       || process.env.CURSOR_RELAY_MAX_LOCAL_TOOL_CALLS_PER_ROUND
@@ -650,6 +839,7 @@ async function startLocalRelayRunner(payload = {}) {
     : resolveRelayOutboundProxy({ localProxyPorts: [port] });
   const reuseOptions = {
     mode,
+    completionModel,
     localNativeAgentTools,
     structuredAgentToolCalls,
     nativeMutationTools,
@@ -657,6 +847,7 @@ async function startLocalRelayRunner(payload = {}) {
     emitAgentKvBootstrap,
     emitLocalMutationCheckpoints,
     emitLocalToolInteractionFrames,
+    emitLocalStepFrames,
     emitSyntheticLocalNativeToolFrames,
     emitAgentExecServerFrames,
     maxLocalToolCallsPerRound,
@@ -666,6 +857,15 @@ async function startLocalRelayRunner(payload = {}) {
   };
 
   const existingHealth = await probeRunnerHealth(port, 250);
+  if (!forceRestartRunner && existingHealth.ok) {
+    const mismatchReason = getRunnerReuseMismatchReason(existingHealth.payload, upstream, reuseOptions);
+    appendRunnerLog(
+      mismatchReason
+        ? `[info] runner reuse miss reason=${mismatchReason} requestedModel=${String(upstream.modelName || '')} currentModel=${String(existingHealth.payload?.upstreamModelName || '')}`
+        : `[info] runner reuse hit requestedModel=${String(upstream.modelName || '')} pid=${Number(existingHealth.payload?.pid) || 0}`,
+      customRoot,
+    );
+  }
   if (
     !forceRestartRunner
     && existingHealth.ok
@@ -676,6 +876,7 @@ async function startLocalRelayRunner(payload = {}) {
       port,
       upstream,
       mode: existingHealth.payload?.mode || mode,
+      completionModel: String(existingHealth.payload?.completionModel || completionModel || ''),
       directMitmPort: Number(existingHealth.payload?.directMitmPort) || 0,
       localNativeAgentTools,
       structuredAgentToolCalls,
@@ -684,6 +885,7 @@ async function startLocalRelayRunner(payload = {}) {
       emitAgentKvBootstrap,
       emitLocalMutationCheckpoints,
       emitLocalToolInteractionFrames,
+      emitLocalStepFrames,
       emitSyntheticLocalNativeToolFrames,
       emitAgentExecServerFrames,
       maxLocalToolCallsPerRound,
@@ -711,6 +913,10 @@ async function startLocalRelayRunner(payload = {}) {
   }
 
   await stopLocalRelayRunner({ port });
+  appendRunnerLog(
+    `[info] runner restart requested requestedModel=${String(upstream.modelName || '')} forceRestart=${forceRestartRunner ? '1' : '0'} mode=${mode}`,
+    customRoot,
+  );
 
   const logPaths = initRunnerLogs(customRoot);
   const directMitmPort = Number(payload.directMitmPort) || 0;
@@ -719,6 +925,7 @@ async function startLocalRelayRunner(payload = {}) {
     port,
     customRoot,
     mode,
+    completionModel,
     directMitmPort,
     mockAgentTools: false,
     mockAgentProtoTools: false,
@@ -729,6 +936,7 @@ async function startLocalRelayRunner(payload = {}) {
     emitAgentKvBootstrap,
     emitLocalMutationCheckpoints,
     emitLocalToolInteractionFrames,
+    emitLocalStepFrames,
     emitSyntheticLocalNativeToolFrames,
     emitAgentExecServerFrames,
     maxLocalToolCallsPerRound,
@@ -762,10 +970,18 @@ async function startLocalRelayRunner(payload = {}) {
   });
 
   const childPid = runnerChild.pid;
-  runnerChild.on('exit', () => {
+  const savedPayload = lastStartPayload;
+  runnerChild.on('exit', (code, signal) => {
     if (runnerChild && runnerChild.pid === childPid) {
       runnerChild = null;
-      runnerConfig = null;
+      // 主动停止时才清空 config；异常退出保留以供自动重启参考
+      if (intentionalStop) {
+        runnerConfig = null;
+      }
+    }
+    // 非主动停止 → 尝试自动重启
+    if (!intentionalStop && savedPayload) {
+      scheduleRunnerRestart(savedPayload, code, signal).catch(() => null);
     }
   });
   try {
@@ -798,6 +1014,33 @@ async function startLocalRelayRunner(payload = {}) {
   if (!health.ok) {
     const latestLog = await readRunnerLogTail(customRoot, 120).catch(() => null);
     const portOpen = await isPortOpen(port).catch(() => false);
+    const conflictingPids = portOpen ? findListeningPidsByPort(port) : [];
+    const stalePids = conflictingPids.filter((pid) => Number(pid) !== Number(childPid) && Number(pid) !== Number(runnerChild?.pid || 0));
+    const hasAddrInUse = /EADDRINUSE|address already in use/i.test(String(latestLog?.text || ''));
+    if (stalePids.length) {
+      stalePids.forEach((pid) => terminateRunnerPid(pid, { force: true }));
+      await sleep(400);
+      if (hasAddrInUse) {
+        const retryHealth = await waitForRunnerHealth(port, {
+          attempts: 12,
+          delayMs: 120,
+          isExpected: (result) => (
+            Number(result?.payload?.pid) === Number(childPid)
+            && String(result?.payload?.mode || '') === mode
+          ),
+        });
+        if (retryHealth.ok) {
+          return buildRunnerStartResult({
+            port,
+            written,
+            upstream,
+            health: retryHealth,
+            childPid,
+            reused: false,
+          });
+        }
+      }
+    }
     const logHint = String(latestLog?.text || '')
       .split(/\r?\n/)
       .filter((line) => /error|EADDRINUSE|listen|throw|failed|certificate|openssl|uncaught/i.test(line))
@@ -807,6 +1050,7 @@ async function startLocalRelayRunner(payload = {}) {
       `Local relay runner failed health check on 127.0.0.1:${port}`,
       health.unexpectedRunner ? 'An unexpected runner answered on the relay port.' : '',
       portOpen ? 'The relay port is still occupied after restart.' : '',
+      stalePids.length ? `Killed conflicting listener PID(s): ${stalePids.join(', ')}` : '',
       logHint ? `Recent runner log:\n${logHint}` : '',
     ].filter(Boolean).join('\n');
     await stopLocalRelayRunner({ port });
@@ -847,6 +1091,7 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     port: health.payload?.port || port,
     directMitmPort: health.payload?.directMitmPort || runnerConfig?.directMitmPort || 0,
     mode: health.payload?.mode || runnerConfig?.mode || '',
+    completionModel: String(health.payload?.completionModel || runnerConfig?.completionModel || ''),
     mockAgentTools: false,
     mockAgentProtoTools: false,
     localNativeAgentTools: Boolean(health.payload?.localNativeAgentTools || runnerConfig?.localNativeAgentTools),
@@ -866,6 +1111,9 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     emitLocalToolInteractionFrames: Object.prototype.hasOwnProperty.call(health.payload || {}, 'emitLocalToolInteractionFrames')
       ? Boolean(health.payload?.emitLocalToolInteractionFrames)
       : Boolean(runnerConfig?.emitLocalToolInteractionFrames),
+    emitLocalStepFrames: Object.prototype.hasOwnProperty.call(health.payload || {}, 'emitLocalStepFrames')
+      ? Boolean(health.payload?.emitLocalStepFrames)
+      : Boolean(runnerConfig?.emitLocalStepFrames),
     emitSyntheticLocalNativeToolFrames: false,
     emitAgentExecServerFrames: Boolean(
       health.payload?.emitAgentExecServerFrames || runnerConfig?.emitAgentExecServerFrames,
@@ -879,34 +1127,39 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     healthOk: health.ok,
     proxyServer: running ? `http://127.0.0.1:${health.payload?.port || port}` : '',
     outboundProxy: runnerConfig?.outboundProxy || health.payload?.outboundProxy || null,
+    cacheStats: health.payload?.cacheStats || null,
     configPath: paths.configPath,
     logPath: paths.logPath,
     interceptPath: CHAT_PATH,
     upstream: runnerConfig?.upstream
         ? {
             providerId: runnerConfig.upstream.providerId || 'custom',
+            displayName: runnerConfig.upstream.displayName || runnerConfig.upstream.modelName,
             baseUrl: runnerConfig.upstream.baseUrl,
             modelName: runnerConfig.upstream.modelName,
+            completionModel: String(runnerConfig.completionModel || runnerConfig.upstream.completionModel || ''),
             availableModels: Array.isArray(runnerConfig.upstream.availableModels)
               ? runnerConfig.upstream.availableModels
               : [runnerConfig.upstream.modelName],
             endpointMode: runnerConfig.upstream.endpointMode || 'responses',
             reasoningEffort: runnerConfig.upstream.reasoningEffort || 'medium',
             thinkingMode: runnerConfig.upstream.thinkingMode || '',
-            contextWindow: runnerConfig.upstream.contextWindow || 250000,
+            contextWindow: runnerConfig.upstream.contextWindow || 200000,
             apiKeyMasked: maskSecret(runnerConfig.upstream.apiKey),
           }
         : health.payload
         ? {
+            displayName: health.payload.upstreamDisplayName || health.payload.upstreamModelName,
             baseUrl: health.payload.upstreamBaseUrl,
             modelName: health.payload.upstreamModelName,
+            completionModel: String(health.payload.completionModel || ''),
             availableModels: Array.isArray(health.payload.upstreamAvailableModels)
               ? health.payload.upstreamAvailableModels
               : [health.payload.upstreamModelName],
             endpointMode: health.payload.upstreamEndpointMode || 'responses',
             reasoningEffort: health.payload.upstreamReasoningEffort || 'medium',
             thinkingMode: health.payload.upstreamThinkingMode || '',
-            contextWindow: health.payload.upstreamContextWindow || 250000,
+            contextWindow: health.payload.upstreamContextWindow || 200000,
             stats: health.payload.stats || null,
           }
         : null,

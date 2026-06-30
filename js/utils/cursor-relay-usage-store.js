@@ -1,19 +1,43 @@
 const fs = require('fs');
 const path = require('path');
 const { getRelayDataDir } = require('./cursor-relay-cert');
-const { matchModelPrice, getAllPriceSources, PRICE_SOURCES } = require('./model-pricing');
+const { matchModelPrice } = require('./model-pricing');
 
 const DB_FILE_NAME = 'usage.db';
-const PRICE_SOURCE = 'multi_provider_api_pricing_2026-06-10';
-const PRICE_SOURCE_URL = 'multi-provider official API pricing';
 const USD_PER_POINT = 0.02;
 
 let dbCache = new Map();
+let historySyncCache = new Map();
+const HISTORY_SYNC_MIN_INTERVAL_MS = 30000;
 let Database = null;
+let databaseDisabledReason = '';
+
+function disableDatabase(reason) {
+  if (!databaseDisabledReason) {
+    databaseDisabledReason = String(reason || 'usage_database_unavailable');
+    try {
+      console.warn(`[cursor-relay-usage-store] disabled: ${databaseDisabledReason}`);
+    } catch {
+      /* ignore console failures */
+    }
+  }
+}
+
+function isDatabaseDisabled() {
+  return Boolean(databaseDisabledReason);
+}
 
 function loadDatabaseCtor() {
+  if (databaseDisabledReason) {
+    throw new Error(databaseDisabledReason);
+  }
   if (Database) return Database;
-  Database = require('better-sqlite3');
+  try {
+    Database = require('better-sqlite3');
+  } catch (error) {
+    disableDatabase(error?.message || error);
+    throw error;
+  }
   return Database;
 }
 
@@ -28,10 +52,12 @@ function ensureRelayUsageSchema(db) {
     db.prepare('PRAGMA table_info(relay_usage)').all().map((column) => column.name),
   );
   const migrations = [
+    ['mode', 'ALTER TABLE relay_usage ADD COLUMN mode TEXT'],
     ['billed_points', 'ALTER TABLE relay_usage ADD COLUMN billed_points REAL DEFAULT 0'],
     ['cursor_agent_account', 'ALTER TABLE relay_usage ADD COLUMN cursor_agent_account TEXT'],
     ['reasoning_effort', 'ALTER TABLE relay_usage ADD COLUMN reasoning_effort TEXT'],
     ['platform_billing', 'ALTER TABLE relay_usage ADD COLUMN platform_billing INTEGER NOT NULL DEFAULT 0'],
+    ['display_name', 'ALTER TABLE relay_usage ADD COLUMN display_name TEXT'],
   ];
   for (const [column, sql] of migrations) {
     if (!columns.has(column)) db.prepare(sql).run();
@@ -39,11 +65,26 @@ function ensureRelayUsageSchema(db) {
 }
 
 function openUsageDb(customRoot) {
+  if (databaseDisabledReason) {
+    throw new Error(databaseDisabledReason);
+  }
   const dbPath = getUsageDbPath(customRoot);
   const cached = dbCache.get(dbPath);
   if (cached) return cached;
-  const DatabaseCtor = loadDatabaseCtor();
-  const db = new DatabaseCtor(dbPath);
+  let DatabaseCtor = null;
+  try {
+    DatabaseCtor = loadDatabaseCtor();
+  } catch (error) {
+    disableDatabase(error?.message || error);
+    throw error;
+  }
+  let db = null;
+  try {
+    db = new DatabaseCtor(dbPath);
+  } catch (error) {
+    disableDatabase(error?.message || error);
+    throw error;
+  }
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.exec(`
@@ -52,8 +93,10 @@ function openUsageDb(customRoot) {
       created_at TEXT NOT NULL,
       request_id TEXT NOT NULL,
       conversation_id TEXT,
+      mode TEXT,
       phase TEXT,
       endpoint_mode TEXT,
+      display_name TEXT,
       model TEXT,
       model_label TEXT,
       status TEXT NOT NULL,
@@ -122,6 +165,23 @@ function normalizeUsage(rawUsage = {}) {
     : {};
   const inputDetails = usage.input_tokens_details || usage.prompt_tokens_details || {};
   const outputDetails = usage.output_tokens_details || usage.completion_tokens_details || {};
+  const cacheReadCandidates = [
+    inputDetails.cached_tokens,
+    inputDetails.cached_input_tokens,
+    inputDetails.cache_read_input_tokens,
+    inputDetails.prompt_cache_hit_tokens,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.prompt_tokens_details?.cached_input_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.cached_input_tokens,
+    usage.cachedContentTokenCount,
+    usage.cache_read_input_tokens,
+    usage.cache_read_tokens,
+    usage.input_cached_tokens,
+    usageMeta.cachedContentTokenCount,
+    usageMeta.cacheReadInputTokens,
+    usageMeta.cacheReadTokens,
+  ];
   const deepSeekCacheHitTokens = toInt(usage.prompt_cache_hit_tokens);
   const deepSeekCacheMissTokens = toInt(usage.prompt_cache_miss_tokens);
   const inputTokens = toInt(usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount)
@@ -129,15 +189,9 @@ function normalizeUsage(rawUsage = {}) {
     || deepSeekCacheHitTokens + deepSeekCacheMissTokens;
   const outputTokens = toInt(usage.output_tokens ?? usage.completion_tokens ?? usage.candidatesTokenCount)
     || toInt(usageMeta.candidatesTokenCount);
-  const cachedInputTokens = toInt(
-    inputDetails.cached_tokens
-      ?? inputDetails.cached_input_tokens
-      ?? usage.prompt_tokens_details?.cached_tokens
-      ?? usage.prompt_cache_hit_tokens
-      ?? usage.cached_input_tokens
-      ?? usage.cachedContentTokenCount
-      ?? usageMeta.cachedContentTokenCount,
-  );
+  const cachedInputTokens = cacheReadCandidates.reduce((value, candidate) => (
+    value > 0 ? value : toInt(candidate)
+  ), 0);
   const totalTokens = toInt(usage.total_tokens) || inputTokens + outputTokens;
   return {
     inputTokens,
@@ -203,15 +257,28 @@ function recordRelayUsage(customRoot, payload = {}) {
   if (!hasRecordedTokenUsage(cost) && billedPoints == null && !forceRecord) {
     return { ok: true, skipped: true, reason: 'zero_token_usage', dbPath: getUsageDbPath(customRoot) };
   }
-  const db = openUsageDb(customRoot);
+  let db = null;
+  try {
+    db = openUsageDb(customRoot);
+  } catch (error) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'usage_db_unavailable',
+      dbPath: getUsageDbPath(customRoot),
+      error: error?.message || String(error),
+    };
+  }
   const createdAt = payload.createdAt || new Date().toISOString();
   const status = String(payload.status || 'unknown');
   const row = {
     created_at: createdAt,
     request_id: String(payload.requestId || ''),
     conversation_id: String(payload.conversationId || ''),
+    mode: String(payload.mode || ''),
     phase: String(payload.phase || ''),
     endpoint_mode: String(payload.endpointMode || ''),
+    display_name: String(payload.displayName || payload.model || '').trim(),
     model: String(payload.model || ''),
     model_label: cost.modelLabel,
     status,
@@ -248,7 +315,7 @@ function recordRelayUsage(customRoot, payload = {}) {
   };
   const stmt = db.prepare(`
     INSERT INTO relay_usage (
-      created_at, request_id, conversation_id, phase, endpoint_mode, model, model_label,
+      created_at, request_id, conversation_id, mode, phase, endpoint_mode, display_name, model, model_label,
       status, http_status, error, input_tokens, cached_input_tokens, output_tokens, total_tokens,
       input_price_per_million, cached_input_price_per_million, output_price_per_million,
       input_cost_usd, cached_input_cost_usd, output_cost_usd, total_cost_usd, points, billed_points,
@@ -256,7 +323,7 @@ function recordRelayUsage(customRoot, payload = {}) {
       upstream_base_url, price_source, price_source_url, raw_usage_json, meta_json, cursor_agent_account,
       reasoning_effort, platform_billing
     ) VALUES (
-      @created_at, @request_id, @conversation_id, @phase, @endpoint_mode, @model, @model_label,
+      @created_at, @request_id, @conversation_id, @mode, @phase, @endpoint_mode, @display_name, @model, @model_label,
       @status, @http_status, @error, @input_tokens, @cached_input_tokens, @output_tokens, @total_tokens,
       @input_price_per_million, @cached_input_price_per_million, @output_price_per_million,
       @input_cost_usd, @cached_input_cost_usd, @output_cost_usd, @total_cost_usd, @points, @billed_points,
@@ -269,7 +336,23 @@ function recordRelayUsage(customRoot, payload = {}) {
   return { ok: true, id: info.lastInsertRowid, dbPath: getUsageDbPath(customRoot), row };
 }
 
+function appendRelayUsageMeta(customRoot, usageId, extraMeta = {}) {
+  if (!usageId || !extraMeta || typeof extraMeta !== 'object') return { ok: false };
+  if (isDatabaseDisabled()) return { ok: false, skipped: true, reason: databaseDisabledReason };
+  const db = openUsageDb(customRoot);
+  const row = db.prepare('SELECT meta_json FROM relay_usage WHERE id = ?').get(usageId);
+  if (!row) return { ok: false };
+  let existing = {};
+  try { existing = JSON.parse(row.meta_json || '{}'); } catch { /* empty */ }
+  const merged = JSON.stringify({ ...existing, ...extraMeta });
+  db.prepare('UPDATE relay_usage SET meta_json = ? WHERE id = ?').run(merged, usageId);
+  return { ok: true };
+}
+
 function deleteZeroTokenRelayUsage(customRoot) {
+  if (isDatabaseDisabled()) {
+    return { ok: false, skipped: true, reason: databaseDisabledReason, deleted: 0, dbPath: getUsageDbPath(customRoot) };
+  }
   const db = openUsageDb(customRoot);
   const info = db.prepare(`
     DELETE FROM relay_usage
@@ -291,6 +374,9 @@ function syncUsageFromHistory(customRoot) {
   const dataDir = getRelayDataDir(customRoot);
   const historyRoot = path.join(dataDir, 'history');
   if (!fs.existsSync(historyRoot)) return { ok: true, inserted: 0, skipped: true };
+  if (isDatabaseDisabled()) {
+    return { ok: false, inserted: 0, skipped: true, reason: databaseDisabledReason };
+  }
   const db = openUsageDb(customRoot);
   let lastRunnerConfig = null;
   try {
@@ -323,12 +409,20 @@ function syncUsageFromHistory(customRoot) {
     for (const item of completed) {
       const requestId = String(item.payload.value.request_id || item.request_id || '').trim();
       if (!requestId) continue;
-      const exists = db.prepare('SELECT id FROM relay_usage WHERE request_id = ? LIMIT 1').get(requestId);
+      const request = items.find((candidate) => (
+        candidate?.request_id === requestId
+        && candidate?.kind === 'user_message'
+      ));
+      const exists = db.prepare('SELECT id, model, display_name FROM relay_usage WHERE request_id = ? LIMIT 1').get(requestId);
       if (exists) {
-        if (upstream.modelName) {
+        if (upstream.modelName || request?.payload?.mode) {
+          const shouldBackfillDisplayName = !String(exists.display_name || '').trim()
+            && (!String(exists.model || '').trim() || String(exists.model || '').trim() === String(upstream.modelName || '').trim());
           db.prepare(`
             UPDATE relay_usage
             SET
+              mode = CASE WHEN COALESCE(mode, '') = '' THEN @mode ELSE mode END,
+              display_name = CASE WHEN COALESCE(display_name, '') = '' AND @shouldBackfillDisplayName = 1 THEN @displayName ELSE display_name END,
               model = CASE WHEN COALESCE(model, '') = '' THEN @model ELSE model END,
               endpoint_mode = CASE WHEN COALESCE(endpoint_mode, '') = '' THEN @endpointMode ELSE endpoint_mode END,
               upstream_base_url = CASE WHEN COALESCE(upstream_base_url, '') = '' THEN @baseUrl ELSE upstream_base_url END,
@@ -336,6 +430,9 @@ function syncUsageFromHistory(customRoot) {
             WHERE id = @id
           `).run({
             id: exists.id,
+            mode: String(request?.payload?.mode || ''),
+            displayName: String(upstream.displayName || upstream.modelName || ''),
+            shouldBackfillDisplayName: shouldBackfillDisplayName ? 1 : 0,
             model: String(upstream.modelName || ''),
             endpointMode: String(upstream.endpointMode || ''),
             baseUrl: String(upstream.baseUrl || ''),
@@ -348,18 +445,16 @@ function syncUsageFromHistory(customRoot) {
         candidate?.request_id === requestId
         && candidate?.kind === 'assistant_text'
       ));
-      const request = items.find((candidate) => (
-        candidate?.request_id === requestId
-        && candidate?.kind === 'user_message'
-      ));
       const createdAt = String(item.created_at || assistant?.created_at || request?.created_at || context.updated_at || new Date().toISOString());
       const responseText = String(assistant?.payload?.text || '');
       const result = recordRelayUsage(customRoot, {
         createdAt,
         requestId,
         conversationId: String(context.conversation_id || ''),
+        mode: String(request?.payload?.mode || ''),
         phase: 'history',
         endpointMode: String(upstream.endpointMode || ''),
+        displayName: String(upstream.displayName || upstream.modelName || ''),
         model: String(upstream.modelName || ''),
         status: item.payload.value.status === 'failed' ? 'failed' : 'success',
         usage: {},
@@ -396,7 +491,7 @@ function buildWhere(filters = {}) {
     params.status = String(filters.status);
   }
   if (filters.model) {
-    where.push('model LIKE @model');
+    where.push('(model LIKE @model OR display_name LIKE @model)');
     params.model = `%${String(filters.model)}%`;
   }
   if (filters.requestId) {
@@ -414,7 +509,38 @@ function buildWhere(filters = {}) {
 }
 
 function listRelayUsage(customRoot, options = {}) {
-  syncUsageFromHistory(customRoot);
+  if (isDatabaseDisabled()) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: databaseDisabledReason,
+      page: Math.max(1, toInt(options.page) || 1),
+      pageSize: Math.min(100, Math.max(1, toInt(options.pageSize) || 20)),
+      total: 0,
+      list: [],
+      summary: {
+        count: 0,
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        total_cost_usd: 0,
+        points: 0,
+        billed_points: 0,
+        effective_points: 0,
+        success_count: 0,
+        pending_count: 0,
+        error_count: 0,
+      },
+    };
+  }
+  const dbPath = getUsageDbPath(customRoot);
+  const forceHistorySync = options.syncHistory === true;
+  const lastHistorySyncAt = historySyncCache.get(dbPath) || 0;
+  if (forceHistorySync || Date.now() - lastHistorySyncAt >= HISTORY_SYNC_MIN_INTERVAL_MS) {
+    syncUsageFromHistory(customRoot);
+    historySyncCache.set(dbPath, Date.now());
+  }
   const db = openUsageDb(customRoot);
   const pageSize = Math.min(100, Math.max(1, toInt(options.pageSize) || 20));
   const page = Math.max(1, toInt(options.page) || 1);
@@ -450,16 +576,13 @@ function listRelayUsage(customRoot, options = {}) {
     total,
     list: rows,
     summary,
-    dbPath: getUsageDbPath(customRoot),
-    priceSource: PRICE_SOURCE,
-    priceSourceUrl: PRICE_SOURCE_URL,
-    priceSources: getAllPriceSources(),
   };
 }
 
 function updateRelayUsageBilledPoints(customRoot, usageId, billedPoints, serverEstimatedPoints = null) {
   const amount = Number(billedPoints);
   if (!Number.isFinite(amount) || amount <= 0) return { ok: false, skipped: true };
+  if (isDatabaseDisabled()) return { ok: false, skipped: true, reason: databaseDisabledReason };
   const db = openUsageDb(customRoot);
   const serverPoints = Number(serverEstimatedPoints);
   const info = Number.isFinite(serverPoints) && serverPoints > 0
@@ -472,6 +595,7 @@ function updateRelayUsageStatusForRequest(customRoot, requestId, fromStatus, toS
   const rid = String(requestId || '').trim();
   const nextStatus = String(toStatus || '').trim();
   if (!rid || !nextStatus) return { ok: false, skipped: true };
+  if (isDatabaseDisabled()) return { ok: false, skipped: true, reason: databaseDisabledReason };
   const db = openUsageDb(customRoot);
   const params = {
     request_id: rid,
@@ -491,6 +615,9 @@ function updateRelayUsageStatusForRequest(customRoot, requestId, fromStatus, toS
 }
 
 function clearRelayUsage(customRoot) {
+  if (isDatabaseDisabled()) {
+    return { ok: false, skipped: true, reason: databaseDisabledReason, deleted: 0, dbPath: getUsageDbPath(customRoot) };
+  }
   const db = openUsageDb(customRoot);
   const info = db.prepare('DELETE FROM relay_usage').run();
   try {
@@ -502,15 +629,15 @@ function clearRelayUsage(customRoot) {
 }
 
 module.exports = {
-  PRICE_SOURCE,
-  PRICE_SOURCE_URL,
   getUsageDbPath,
   estimateCost,
   recordRelayUsage,
+  appendRelayUsageMeta,
   deleteZeroTokenRelayUsage,
   updateRelayUsageBilledPoints,
   updateRelayUsageStatusForRequest,
   listRelayUsage,
   clearRelayUsage,
   closeUsageDbs,
+  isDatabaseDisabled,
 };

@@ -1,0 +1,16 @@
+<system_reminder>
+Multitask mode is active. The user has given a request that spans multiple independent subtasks. Your job is to decompose the work, track each subtask, and drive them all to completion.
+
+Workflow:
+1. Decompose. Break the request into discrete, independently verifiable subtasks. Use TodoWrite early to record the full list with one item in_progress at a time.
+2. Batch reads, serialize writes. Group read-only inspection (Read/Grep/Glob/LS/SemanticSearch) across subtasks where it reduces round-trips, but keep every file mutation deliberate and individually reviewable (one clear mutating tool call per file or per independent change).
+3. Execute and verify each subtask in turn. After a subtask's edits, run the relevant check (ReadLints, a Shell test/build command) and mark it completed in TodoWrite before moving on.
+4. Reconcile. After all subtasks finish, do one final pass to ensure the subtasks compose correctly (imports line up, shared types agree, no conflicting edits).
+5. Summarize. Close with a concise per-subtask summary of what changed and the verification result.
+
+Rules:
+- Keep exactly one todo in_progress at a time; mark completed immediately when done.
+- If a subtask is blocked or ambiguous, use AskQuestion rather than stalling the whole request.
+- If the subtasks are deeply interdependent or require architecture decisions, consider CreatePlan first or switch to Project mode.
+- Do not drop a subtask silently. If one cannot be completed, report it explicitly with the reason.
+</system_reminder>

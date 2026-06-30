@@ -1,4 +1,5 @@
 const { gunzipSync, inflateSync, brotliDecompressSync } = require('zlib');
+const { encodeMessageSync: encodeCursorProtoMessageSync } = require('./cursor-relay-protobuf');
 
 const AGENT_CLIENT_MESSAGE_FIELDS = {
   1: 'run_request',
@@ -123,6 +124,10 @@ function encodeInt32Field(field, value) {
     encodeVarint((field << 3) | 0),
     encodeVarint(Number(value) || 0),
   ]);
+}
+
+function encodeBoolField(field, value) {
+  return encodeInt32Field(field, value ? 1 : 0);
 }
 
 function encodeMessage(fields = []) {
@@ -335,10 +340,20 @@ function summarizeAgentClientMessagePayload(payload) {
     } else if (out.oneof === 'run_request') {
       const requestedModelField = getFieldBytes(innerFields, 9);
       const requestedModelFields = parseFields(requestedModelField || Buffer.alloc(0));
+      const conversationStateFields = parseFields(getFieldBytes(innerFields, 8) || Buffer.alloc(0));
+      const runMode = getFieldVarint(innerFields, 10);
+      const conversationMode = getFieldVarint(conversationStateFields, 10);
+      const actionFields = parseFields(getFieldBytes(innerFields, 2) || Buffer.alloc(0));
       out.runRequest = {
         stableConversationId: decodeUtf8(getFieldBytes(innerFields, 5) || Buffer.alloc(0)).trim(),
         requestedModelId: decodeUtf8(getFieldBytes(requestedModelFields, 1) || Buffer.alloc(0)).trim(),
+        mode: mapAgentModeNumberToName(runMode || conversationMode || 0),
+        action: actionFields.length ? summarizeConversationActionPayload(actionFields) : null,
       };
+    } else if (out.oneof === 'conversation_action') {
+      out.conversationAction = summarizeConversationActionPayload(innerFields);
+    } else if (out.oneof === 'interaction_response') {
+      out.interactionResponse = summarizeInteractionResponse(innerFields);
     }
   }
   return out;
@@ -374,11 +389,198 @@ function summarizeAgentServerMessagePayload(payload) {
       shape: summarizeFieldShape(interactionFields),
     };
   }
+  if (oneof === 'interaction_query' && oneofField?.bytes?.length) {
+    out.interactionQuery = summarizeInteractionQuery(oneofField.bytes);
+  }
   return out;
 }
 
 function getFieldVarint(fields, fieldNumber) {
   return fields.find((field) => field.field === fieldNumber && field.wireType === 0)?.varint;
+}
+
+function summarizeAskQuestionArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const questions = argsFields
+    .filter((field) => field.field === 2 && field.wireType === 2)
+    .map((field) => {
+      const questionFields = parseFields(field.bytes);
+      return {
+        id: decodeUtf8(getFieldBytes(questionFields, 1) || Buffer.alloc(0)).trim(),
+        prompt: decodeUtf8(getFieldBytes(questionFields, 2) || Buffer.alloc(0)).trim(),
+        allowMultiple: Boolean(getFieldVarint(questionFields, 4)),
+        options: questionFields
+          .filter((optionField) => optionField.field === 3 && optionField.wireType === 2)
+          .map((optionField) => {
+            const optionFields = parseFields(optionField.bytes);
+            return {
+              id: decodeUtf8(getFieldBytes(optionFields, 1) || Buffer.alloc(0)).trim(),
+              label: decodeUtf8(getFieldBytes(optionFields, 2) || Buffer.alloc(0)).trim(),
+            };
+          }),
+      };
+    });
+  return {
+    title: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    questions,
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeCreatePlanArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const todos = argsFields
+    .filter((field) => field.field === 2 && field.wireType === 2)
+    .map((field) => {
+      const todoFields = parseFields(field.bytes);
+      return {
+        id: decodeUtf8(getFieldBytes(todoFields, 1) || Buffer.alloc(0)).trim(),
+        content: decodeUtf8(getFieldBytes(todoFields, 2) || Buffer.alloc(0)).trim(),
+        status: decodeUtf8(getFieldBytes(todoFields, 3) || Buffer.alloc(0)).trim(),
+      };
+    });
+  return {
+    plan: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    todos,
+    overview: decodeUtf8(getFieldBytes(argsFields, 3) || Buffer.alloc(0)).trim(),
+    name: decodeUtf8(getFieldBytes(argsFields, 4) || Buffer.alloc(0)).trim(),
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeTaskArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const subagentTypeValue = decodeUtf8(getFieldBytes(argsFields, 3) || Buffer.alloc(0)).trim();
+  const subagentType = subagentTypeValue ? { [subagentTypeValue]: subagentTypeValue } : {};
+  return {
+    description: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    prompt: decodeUtf8(getFieldBytes(argsFields, 2) || Buffer.alloc(0)).trim(),
+    subagentType,
+    model: decodeUtf8(getFieldBytes(argsFields, 4) || Buffer.alloc(0)).trim(),
+    name: decodeUtf8(getFieldBytes(argsFields, 5) || Buffer.alloc(0)).trim(),
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeReportBugfixResultsArgsPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const argsFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const results = argsFields
+    .filter((field) => field.field === 2 && field.wireType === 2)
+    .map((field) => {
+      const resultFields = parseFields(field.bytes);
+      return {
+        title: decodeUtf8(getFieldBytes(resultFields, 1) || Buffer.alloc(0)).trim(),
+        summary: decodeUtf8(getFieldBytes(resultFields, 2) || Buffer.alloc(0)).trim(),
+        status: decodeUtf8(getFieldBytes(resultFields, 3) || Buffer.alloc(0)).trim(),
+      };
+    });
+  return {
+    summary: decodeUtf8(getFieldBytes(argsFields, 1) || Buffer.alloc(0)).trim(),
+    results,
+    toolCallId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeAskQuestionInteractionResponsePayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const resultFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  const answers = parseFields(getFieldBytes(resultFields, 1) || Buffer.alloc(0))
+    .filter((field) => field.field === 1 && field.wireType === 2)
+    .map((field) => {
+      const answerFields = parseFields(field.bytes);
+      return {
+        questionId: decodeUtf8(getFieldBytes(answerFields, 1) || Buffer.alloc(0)).trim(),
+        selectedOptionIds: answerFields
+          .filter((answerField) => answerField.field === 2 && answerField.wireType === 2)
+          .map((answerField) => decodeUtf8(answerField.bytes || Buffer.alloc(0)).trim())
+          .filter(Boolean),
+        freeformText: decodeUtf8(getFieldBytes(answerFields, 3) || Buffer.alloc(0)).trim(),
+      };
+    });
+  return {
+    kind: getFieldBytes(resultFields, 1)
+      ? 'success'
+      : getFieldBytes(resultFields, 2)
+        ? 'error'
+        : getFieldBytes(resultFields, 3)
+          ? 'rejected'
+          : getFieldBytes(resultFields, 4)
+            ? 'async'
+            : '',
+    error: decodeUtf8(getFieldBytes(parseFields(getFieldBytes(resultFields, 2) || Buffer.alloc(0)), 1) || Buffer.alloc(0)).trim(),
+    rejectedReason: decodeUtf8(getFieldBytes(parseFields(getFieldBytes(resultFields, 3) || Buffer.alloc(0)), 1) || Buffer.alloc(0)).trim(),
+    answers,
+  };
+}
+
+function summarizeCreatePlanInteractionResponsePayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const resultFields = parseFields(getFieldBytes(fields, 1) || Buffer.alloc(0));
+  return {
+    kind: getFieldBytes(resultFields, 1) ? 'success' : getFieldBytes(resultFields, 2) ? 'error' : '',
+    planUri: decodeUtf8(getFieldBytes(resultFields, 3) || Buffer.alloc(0)).trim(),
+    error: decodeUtf8(getFieldBytes(parseFields(getFieldBytes(resultFields, 2) || Buffer.alloc(0)), 1) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeInteractionResponse(fields = []) {
+  const askPayload = getFieldBytes(fields, 3);
+  const createPlanPayload = getFieldBytes(fields, 7);
+  const webSearchPayload = getFieldBytes(fields, 2);
+  return {
+    id: getFieldVarint(fields, 1) ?? null,
+    kind: askPayload
+      ? 'ask_question_interaction_response'
+      : createPlanPayload
+        ? 'create_plan_request_response'
+        : webSearchPayload
+          ? 'web_search_request_response'
+          : '',
+    askQuestion: askPayload ? summarizeAskQuestionInteractionResponsePayload(askPayload) : null,
+    createPlan: createPlanPayload ? summarizeCreatePlanInteractionResponsePayload(createPlanPayload) : null,
+    webSearchApproved: Boolean(webSearchPayload && getFieldBytes(parseFields(webSearchPayload), 1)),
+  };
+}
+
+function summarizeInteractionQuery(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const askPayload = getFieldBytes(fields, 3);
+  const createPlanPayload = getFieldBytes(fields, 7);
+  const webSearchPayload = getFieldBytes(fields, 2);
+  const taskPayload = getFieldBytes(fields, 19);
+  const taskV2Payload = getFieldBytes(fields, 69);
+  const reportBugfixPayload = getFieldBytes(fields, 78);
+  return {
+    id: getFieldVarint(fields, 1) ?? null,
+    kind: askPayload
+      ? 'ask_question_interaction_query'
+      : createPlanPayload
+        ? 'create_plan_request_query'
+        : taskV2Payload || taskPayload
+          ? 'task_tool_query'
+          : reportBugfixPayload
+            ? 'report_bugfix_results_query'
+        : webSearchPayload
+          ? 'web_search_request_query'
+          : '',
+    askQuestion: askPayload ? summarizeAskQuestionArgsPayload(askPayload) : null,
+    createPlan: createPlanPayload ? summarizeCreatePlanArgsPayload(createPlanPayload) : null,
+    task: taskV2Payload
+      ? summarizeTaskArgsPayload(taskV2Payload)
+      : taskPayload
+        ? summarizeTaskArgsPayload(taskPayload)
+        : null,
+    reportBugfixResults: reportBugfixPayload ? summarizeReportBugfixResultsArgsPayload(reportBugfixPayload) : null,
+    webSearch: webSearchPayload
+      ? {
+          searchTerm: decodeUtf8(getFieldBytes(parseFields(webSearchPayload), 1) || Buffer.alloc(0)).trim(),
+        }
+      : null,
+  };
 }
 
 function summarizeExecServerToolArgs(tool, payload) {
@@ -649,13 +851,7 @@ function decodeCursorChatRequest(bodyBuffer) {
 }
 
 function extractUserTextFromConversationAction(convAction) {
-  const convFields = parseFields(convAction);
-  const userAction = getFieldBytes(convFields, 1);
-  if (!userAction?.length) return '';
-  const userFields = parseFields(userAction);
-  const userMessage = getFieldBytes(userFields, 1);
-  if (!userMessage?.length) return '';
-  return decodeUtf8(getFieldBytes(parseFields(userMessage), 1) || Buffer.alloc(0)).trim();
+  return String(summarizeConversationActionPayload(convAction)?.userText || '').trim();
 }
 
 function extractUserTextFromAgentPayload(payload) {
@@ -676,6 +872,175 @@ function extractUserTextFromAgentPayload(payload) {
     if (text) return text;
   }
   return collectTextParts(fields);
+}
+
+function summarizeUserMessagePayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  return {
+    text: decodeUtf8(getFieldBytes(fields, 1) || Buffer.alloc(0)).trim(),
+    messageId: decodeUtf8(getFieldBytes(fields, 2) || Buffer.alloc(0)).trim(),
+    mode: mapAgentModeNumberToName(getFieldVarint(fields, 4) || 0),
+    richText: decodeUtf8(getFieldBytes(fields, 8) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeConversationPlanPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  return {
+    plan: decodeUtf8(getFieldBytes(fields, 1) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeRequestContextPayload(payload) {
+  const fields = parseFields(payload || Buffer.alloc(0));
+  const envFields = parseFields(getFieldBytes(fields, 4) || Buffer.alloc(0));
+  return {
+    workspacePaths: envFields
+      .filter((field) => field.field === 2 && field.wireType === 2)
+      .map((field) => decodeUtf8(field.bytes || Buffer.alloc(0)).trim())
+      .filter(Boolean),
+    projectFolder: decodeUtf8(getFieldBytes(envFields, 11) || Buffer.alloc(0)).trim(),
+    shell: decodeUtf8(getFieldBytes(envFields, 3) || Buffer.alloc(0)).trim(),
+    timeZone: decodeUtf8(getFieldBytes(envFields, 10) || Buffer.alloc(0)).trim(),
+    userIntentSummary: decodeUtf8(getFieldBytes(fields, 21) || Buffer.alloc(0)).trim(),
+  };
+}
+
+function summarizeConversationActionPayload(payload) {
+  const fields = Array.isArray(payload) ? payload : parseFields(payload || Buffer.alloc(0));
+  const actionField = fields.find((field) => [1, 2, 3, 4, 5, 6, 7, 8, 10].includes(field.field) && field.wireType === 2);
+  const kind = actionField
+    ? ({
+      1: 'user_message_action',
+      2: 'resume_action',
+      3: 'cancel_action',
+      4: 'summarize_action',
+      5: 'shell_command_action',
+      6: 'start_plan_action',
+      7: 'execute_plan_action',
+      8: 'async_ask_question_completion_action',
+      10: 'cancel_subagent_action',
+    }[actionField.field] || '')
+    : '';
+  const summary = {
+    kind,
+    userText: '',
+    cancelReason: '',
+    executionMode: 'AGENT_MODE_UNSPECIFIED',
+    plan: '',
+    planFileUri: '',
+    planFileContent: '',
+    isSpec: false,
+    messageId: '',
+    requestContext: null,
+    fields: getFieldNumbers(fields),
+  };
+  if (!actionField?.bytes?.length) return summary;
+  const actionFields = parseFields(actionField.bytes);
+  switch (kind) {
+    case 'user_message_action': {
+      const userMessage = summarizeUserMessagePayload(getFieldBytes(actionFields, 1) || Buffer.alloc(0));
+      summary.userText = userMessage.text;
+      summary.messageId = userMessage.messageId;
+      summary.executionMode = userMessage.mode;
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      break;
+    }
+    case 'start_plan_action': {
+      const userMessage = summarizeUserMessagePayload(getFieldBytes(actionFields, 1) || Buffer.alloc(0));
+      summary.userText = userMessage.text;
+      summary.messageId = userMessage.messageId;
+      summary.executionMode = userMessage.mode;
+      summary.isSpec = Boolean(getFieldVarint(actionFields, 3));
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      break;
+    }
+    case 'execute_plan_action': {
+      const planSummary = summarizeConversationPlanPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      summary.plan = planSummary.plan;
+      summary.planFileUri = decodeUtf8(getFieldBytes(actionFields, 3) || Buffer.alloc(0)).trim();
+      summary.planFileContent = decodeUtf8(getFieldBytes(actionFields, 4) || Buffer.alloc(0)).trim();
+      summary.executionMode = mapAgentModeNumberToName(getFieldVarint(actionFields, 5) || 0);
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 1) || Buffer.alloc(0));
+      break;
+    }
+    case 'cancel_action':
+      summary.cancelReason = decodeUtf8(getFieldBytes(actionFields, 1) || Buffer.alloc(0)).trim();
+      break;
+    case 'resume_action':
+      summary.requestContext = summarizeRequestContextPayload(getFieldBytes(actionFields, 2) || Buffer.alloc(0));
+      break;
+    case 'cancel_subagent_action':
+      summary.subagentId = decodeUtf8(getFieldBytes(actionFields, 1) || Buffer.alloc(0)).trim();
+      break;
+    default:
+      break;
+  }
+  return summary;
+}
+
+function mapAgentModeNumberToName(value) {
+  switch (Number(value) || 0) {
+    case 1:
+      return 'AGENT_MODE_AGENT';
+    case 2:
+      return 'AGENT_MODE_ASK';
+    case 3:
+      return 'AGENT_MODE_PLAN';
+    case 4:
+      return 'AGENT_MODE_DEBUG';
+    case 5:
+      return 'AGENT_MODE_TRIAGE';
+    case 6:
+      return 'AGENT_MODE_PROJECT';
+    case 7:
+      return 'AGENT_MODE_MULTITASK';
+    default:
+      return 'AGENT_MODE_UNSPECIFIED';
+  }
+}
+
+function extractAgentModeFromPayload(payload) {
+  if (!payload?.length) return 'AGENT_MODE_UNSPECIFIED';
+  const fields = parseFields(payload);
+  const runRequest = getFieldBytes(fields, 1);
+  if (runRequest?.length) {
+    const runFields = parseFields(runRequest);
+    const directMode = mapAgentModeNumberToName(getFieldVarint(runFields, 10));
+    if (directMode !== 'AGENT_MODE_UNSPECIFIED') return directMode;
+    const convAction = getFieldBytes(runFields, 2);
+    if (convAction?.length) {
+      const convFields = parseFields(convAction);
+      const userAction = getFieldBytes(convFields, 1);
+      if (userAction?.length) {
+        const userActionFields = parseFields(userAction);
+        const userMessage = getFieldBytes(userActionFields, 1);
+        if (userMessage?.length) {
+          const userFields = parseFields(userMessage);
+          const userMode = mapAgentModeNumberToName(getFieldVarint(userFields, 4));
+          if (userMode !== 'AGENT_MODE_UNSPECIFIED') return userMode;
+        }
+      }
+    }
+    const conversationStateFields = parseFields(getFieldBytes(runFields, 8) || Buffer.alloc(0));
+    const stateMode = mapAgentModeNumberToName(getFieldVarint(conversationStateFields, 10));
+    if (stateMode !== 'AGENT_MODE_UNSPECIFIED') return stateMode;
+  }
+  const convAction = getFieldBytes(fields, 4);
+  if (convAction?.length) {
+    const convFields = parseFields(convAction);
+    const userAction = getFieldBytes(convFields, 1);
+    if (userAction?.length) {
+      const userActionFields = parseFields(userAction);
+      const userMessage = getFieldBytes(userActionFields, 1);
+      if (userMessage?.length) {
+        const userFields = parseFields(userMessage);
+        const userMode = mapAgentModeNumberToName(getFieldVarint(userFields, 4));
+        if (userMode !== 'AGENT_MODE_UNSPECIFIED') return userMode;
+      }
+    }
+  }
+  return 'AGENT_MODE_UNSPECIFIED';
 }
 
 function unwrapBidiDataField(dataBytes) {
@@ -1153,6 +1518,7 @@ function decodeBidiAppendRequest(bodyBuffer) {
     debug.dataLength = data.length;
     debug.agentPayloadLength = agentPayload.length;
     debug.agentClientMessage = summarizeAgentClientMessagePayload(agentPayload);
+    debug.agentMode = extractAgentModeFromPayload(agentPayload);
     debug.agentShape = summarizeFieldShape(agentFields);
     debug.dataTextPreview = decodeUtf8Safe(data);
     debug.uuidCandidates = collectUuidCandidatesFromBuffers([raw, payload, chosen.bytes, data, agentPayload]);
@@ -1164,6 +1530,8 @@ function decodeBidiAppendRequest(bodyBuffer) {
       hasBlobId: Boolean(blobIdBase64),
     }));
     const agentOneof = debug.agentClientMessage?.oneof || '';
+    const runRequestActionKind = String(debug.agentClientMessage?.runRequest?.action?.kind || '').trim();
+    debug.runRequestActionKind = runRequestActionKind;
     if (agentOneof === 'kv_client_message' || firstField === 3) {
       return { requestId, userText: '', kind: 'kv_client', debug };
     }
@@ -1179,13 +1547,37 @@ function decodeBidiAppendRequest(bodyBuffer) {
     if (agentOneof === 'client_heartbeat' || firstField === 7) {
       return { requestId, userText: '', kind: 'client_heartbeat', debug };
     }
+    if (agentOneof === 'run_request' && runRequestActionKind && runRequestActionKind !== 'user_message_action') {
+      return {
+        requestId,
+        userText: '',
+        selectedImages,
+        mode: debug.agentMode || debug.agentClientMessage?.runRequest?.mode || 'AGENT_MODE_UNSPECIFIED',
+        kind: 'run_request',
+        debug,
+      };
+    }
     const userText = extractUserTextFromAgentPayload(agentPayload);
     if (userText) {
-      return { requestId, userText, selectedImages, kind: agentOneof === 'run_request' || firstField === 1 ? 'user_message' : agentOneof || 'user_message', debug };
+      return {
+        requestId,
+        userText,
+        selectedImages,
+        mode: debug.agentMode || debug.agentClientMessage?.runRequest?.mode || 'AGENT_MODE_UNSPECIFIED',
+        kind: agentOneof === 'run_request' || firstField === 1 ? 'user_message' : agentOneof || 'user_message',
+        debug,
+      };
     }
     const fallbackText = collectTextParts(agentFields).trim();
     if ((agentOneof === 'run_request' || firstField === 1) && fallbackText.length >= 2) {
-      return { requestId, userText: fallbackText, selectedImages, kind: 'user_message', debug };
+      return {
+        requestId,
+        userText: fallbackText,
+        selectedImages,
+        mode: debug.agentMode || debug.agentClientMessage?.runRequest?.mode || 'AGENT_MODE_UNSPECIFIED',
+        kind: 'user_message',
+        debug,
+      };
     }
     if (agentOneof) {
       return { requestId, userText: '', kind: agentOneof, debug };
@@ -1200,6 +1592,7 @@ function decodeBidiAppendRequest(bodyBuffer) {
       return {
         requestId,
         userText: lexicalTexts[0],
+        mode: 'AGENT_MODE_UNSPECIFIED',
         kind: 'user_message',
         debug,
       };
@@ -1386,6 +1779,56 @@ function buildAgentInteractionFrame(innerField, innerPayload) {
   return buildAgentServerMessageField(1, interaction);
 }
 
+function buildAgentInteractionUpdateProtoFrame(interactionUpdate = {}) {
+  try {
+    const payload = encodeCursorProtoMessageSync('agent.v1.AgentServerMessage', {
+      interactionUpdate,
+    });
+    return connectFrame(0, payload);
+  } catch {
+    return Buffer.alloc(0);
+  }
+}
+
+function buildAgentBackgroundSubagentActionFrame(toolCallId = '') {
+  const normalizedToolCallId = String(toolCallId || '').trim();
+  if (!normalizedToolCallId) return Buffer.alloc(0);
+  return buildAgentInteractionUpdateProtoFrame({
+    conversationAction: {
+      backgroundSubagentAction: {
+        toolCallId: normalizedToolCallId,
+      },
+    },
+  });
+}
+
+function buildAgentBackgroundTaskCompletionActionFrame(record = {}) {
+  const taskId = String(record?.taskUuid || record?.agentId || '').trim();
+  const toolCallId = String(record?.parentToolCallId || taskId).trim();
+  if (!taskId || !toolCallId) return Buffer.alloc(0);
+  const status = String(record?.status || '').trim().toLowerCase();
+  return buildAgentInteractionUpdateProtoFrame({
+    conversationAction: {
+      backgroundTaskCompletionAction: {
+        completions: [{
+          taskId,
+          kind: 'BACKGROUND_TASK_KIND_SUBAGENT',
+          status: status === 'failed' ? 'BACKGROUND_TASK_COMPLETION_STATUS_ERROR' : 'BACKGROUND_TASK_COMPLETION_STATUS_SUCCESS',
+          title: String(record?.title || record?.name || 'Background task').trim() || 'Background task',
+          detail: String(record?.summary || record?.resultText || '').trim() || undefined,
+          outputPath: String(record?.outputPath || '').trim() || undefined,
+          threadId: String(record?.stableConversationId || '').trim() || undefined,
+          reason: status === 'failed'
+            ? 'BACKGROUND_TASK_COMPLETION_REASON_ERROR'
+            : 'BACKGROUND_TASK_COMPLETION_REASON_TASK_FINISHED',
+          subagentId: String(record?.agentId || taskId).trim() || undefined,
+          toolCallId,
+        }],
+      },
+    },
+  });
+}
+
 function buildAgentTextDeltaFrame(text) {
   return buildAgentInteractionFrame(1, encodeMessage([{ field: 1, value: String(text || '') }]));
 }
@@ -1429,6 +1872,38 @@ function buildAgentHeartbeatFrame() {
   return buildAgentInteractionFrame(13, encodeMessage([]));
 }
 
+function buildAgentInteractionQueryFrame(queryField, queryPayload, queryId = 1) {
+  const interactionQuery = concatBytes([
+    encodeInt32Field(1, Math.max(1, Number(queryId) || 1)),
+    encodeBytesField(queryField, queryPayload),
+  ]);
+  return buildAgentServerMessageField(7, interactionQuery);
+}
+
+function buildAgentAskQuestionQueryFrame(argumentsValue = {}, toolCallId = '', queryId = 1) {
+  const argsPayload = encodeAgentToolArgsPayload('AskQuestion', argumentsValue, toolCallId);
+  return buildAgentInteractionQueryFrame(
+    3,
+    concatBytes([
+      argsPayload.length ? encodeBytesField(1, argsPayload) : Buffer.alloc(0),
+      encodeOptionalStringField(2, toolCallId),
+    ]),
+    queryId,
+  );
+}
+
+function buildAgentCreatePlanQueryFrame(argumentsValue = {}, toolCallId = '', queryId = 1) {
+  const argsPayload = encodeAgentToolArgsPayload('CreatePlan', argumentsValue, toolCallId);
+  return buildAgentInteractionQueryFrame(
+    7,
+    concatBytes([
+      argsPayload.length ? encodeBytesField(1, argsPayload) : Buffer.alloc(0),
+      encodeOptionalStringField(2, toolCallId),
+    ]),
+    queryId,
+  );
+}
+
 function normalizeCheckpointPath(filePath) {
   const normalized = String(filePath || '').replace(/\//g, '\\');
   return normalized.replace(/^([A-Z]):\\/, (match, drive) => `${drive.toLowerCase()}:\\`);
@@ -1456,33 +1931,126 @@ function encodeStringMapEntry(key, valuePayload) {
   ]);
 }
 
+function encodeConversationPlanStructure(planText = '') {
+  const text = typeof planText === 'string' ? planText : '';
+  return concatBytes([
+    encodeOptionalStringField(1, text),
+  ]);
+}
+
+function encodePromptTokenBreakdownCategory(category = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, category.id),
+    encodeOptionalStringField(2, category.label),
+    encodeOptionalIntField(3, category.estimatedTokens),
+    encodeOptionalIntField(4, category.characterCount),
+  ]);
+}
+
+function encodePromptTokenBreakdownSnapshot(snapshot = {}) {
+  const categories = Array.isArray(snapshot.categories) ? snapshot.categories : [];
+  return concatBytes([
+    encodeOptionalIntField(1, snapshot.totalUsedTokens),
+    encodeOptionalIntField(2, snapshot.maxTokens),
+    ...categories.map((category) => encodeBytesField(3, encodePromptTokenBreakdownCategory(category))),
+  ]);
+}
+
+function encodePromptContextSourceRef(source = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, source.sourceType),
+    encodeOptionalIntField(3, source.messageIndex),
+    encodeOptionalStringField(4, source.contentPath),
+    encodeOptionalIntField(5, source.startOffset),
+    encodeOptionalIntField(6, source.endOffset),
+  ]);
+}
+
+function encodePromptContextNode(node = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, node.id),
+    encodeOptionalStringField(2, node.parentId),
+    encodeOptionalStringField(3, node.kind),
+    encodeOptionalStringField(4, node.label),
+    encodeOptionalStringField(5, node.categoryId),
+    encodeOptionalIntField(6, node.estimatedTokens),
+    encodeOptionalIntField(7, node.characterCount),
+    typeof node.contentAvailable === 'boolean' ? encodeBoolField(9, node.contentAvailable) : Buffer.alloc(0),
+    node.source && typeof node.source === 'object'
+      ? encodeBytesField(11, encodePromptContextSourceRef(node.source))
+      : Buffer.alloc(0),
+    encodeOptionalStringField(12, node.inlineContent),
+  ]);
+}
+
+function encodePromptContextUsageTree(tree = {}) {
+  const nodes = Array.isArray(tree.nodes) ? tree.nodes : [];
+  return concatBytes([
+    encodeOptionalIntField(1, tree.schemaVersion),
+    ...nodes.map((node) => encodeBytesField(2, encodePromptContextNode(node))),
+  ]);
+}
+
 function buildAgentConversationCheckpointFrame(options = {}) {
   const workspaceRoot = normalizeCheckpointPath(options.workspaceRoot || '');
   const previousWorkspaceUri = options.previousWorkspaceUri || toWorkspaceUri(workspaceRoot);
   const rootPromptMessagesJson = Array.isArray(options.rootPromptMessagesJson) ? options.rootPromptMessagesJson : [];
+  const todos = Array.isArray(options.todos) ? options.todos : [];
   const turns = Array.isArray(options.turns) ? options.turns : [];
   const pendingToolCalls = Array.isArray(options.pendingToolCalls) ? options.pendingToolCalls : [];
   const readPaths = Array.isArray(options.readPaths) ? options.readPaths.map(normalizeCheckpointPath).filter(Boolean) : [];
   const fileStates = options.fileStates && typeof options.fileStates === 'object' ? options.fileStates : {};
+  const subagentStates = options.subagentStates && typeof options.subagentStates === 'object' ? options.subagentStates : {};
+  const subagentThreads = options.subagentThreads && typeof options.subagentThreads === 'object' ? options.subagentThreads : {};
+  const subagentRunsByParentToolCallId = options.subagentRunsByParentToolCallId && typeof options.subagentRunsByParentToolCallId === 'object'
+    ? options.subagentRunsByParentToolCallId
+    : {};
+  const planText = typeof options.plan === 'string'
+    ? options.plan
+    : (typeof options.planText === 'string' ? options.planText : '');
   const fileStateEntries = Object.entries(fileStates)
     .filter(([key, state]) => key && state && typeof state === 'object')
     .map(([key, state]) => encodeBytesField(15, encodeStringMapEntry(
       normalizeCheckpointPath(key),
       encodeFileStateStructure(state),
     )));
+  const subagentStateEntries = Object.entries(subagentStates)
+    .filter(([key, value]) => key && value != null)
+    .map(([key, value]) => encodeBytesField(16, encodeStringMapEntry(String(key), Buffer.from(String(value), 'utf8'))));
+  const subagentThreadEntries = Object.entries(subagentThreads)
+    .filter(([key, value]) => key && value != null)
+    .map(([key, value]) => encodeBytesField(24, encodeStringMapEntry(String(key), Buffer.from(String(value), 'utf8'))));
+  const subagentRunEntries = Object.entries(subagentRunsByParentToolCallId)
+    .filter(([key, value]) => key && value != null)
+    .map(([key, value]) => encodeBytesField(30, encodeStringMapEntry(String(key), Buffer.from(String(value), 'utf8'))));
+  const promptTokenBreakdown = options.breakdown && typeof options.breakdown === 'object'
+    ? options.breakdown
+    : (options.promptTokenBreakdown && typeof options.promptTokenBreakdown === 'object'
+      ? options.promptTokenBreakdown
+      : null);
+  const promptContextUsageTree = options.promptContextUsageTree && typeof options.promptContextUsageTree === 'object'
+    ? options.promptContextUsageTree
+    : null;
   const tokenDetails = concatBytes([
     encodeInt32Field(1, Number(options.usedTokens) || 1),
     encodeInt32Field(2, Number(options.maxTokens) || 200000),
+    promptTokenBreakdown ? encodeBytesField(3, encodePromptTokenBreakdownSnapshot(promptTokenBreakdown)) : Buffer.alloc(0),
+    promptContextUsageTree ? encodeBytesField(4, encodePromptContextUsageTree(promptContextUsageTree)) : Buffer.alloc(0),
   ]);
   const payload = concatBytes([
     ...rootPromptMessagesJson.map((item) => encodeBytesField(1, Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'))),
+    ...todos.map((item) => encodeBytesField(3, encodeAgentTodoItem(item))),
     ...pendingToolCalls.map((item) => encodeBytesField(4, String(item || ''))),
     encodeBytesField(5, tokenDetails),
+    planText ? encodeBytesField(7, encodeConversationPlanStructure(planText)) : Buffer.alloc(0),
     ...turns.map((item) => encodeBytesField(8, Buffer.isBuffer(item) ? item : Buffer.from(String(item || ''), 'base64'))),
     previousWorkspaceUri ? encodeBytesField(9, previousWorkspaceUri) : Buffer.alloc(0),
     encodeInt32Field(10, 1),
     ...fileStateEntries,
+    ...subagentStateEntries,
     ...readPaths.map((item) => encodeBytesField(18, item)),
+    ...subagentThreadEntries,
+    ...subagentRunEntries,
   ]);
   return buildAgentServerMessageField(3, payload);
 }
@@ -1513,9 +2081,75 @@ function getAgentNativeToolSpec(toolName) {
   if (normalized === 'write' || normalized === 'edit' || normalized === 'patchedit') return { field: 12, name: 'Edit' };
   if (normalized === 'ls') return { field: 13, name: 'LS' };
   if (normalized === 'readlints' || normalized === 'diagnostics') return { field: 14, name: 'ReadLints' };
+  if (normalized === 'semanticsearch' || normalized === 'semsearch' || normalized === 'semantic_search') return { field: 16, name: 'SemanticSearch' };
+  if (normalized === 'createplan' || normalized === 'create_plan') return { field: 17, name: 'CreatePlan' };
   if (normalized === 'websearch' || normalized === 'web_search') return { field: 18, name: 'WebSearch' };
+  if (normalized === 'task') return { field: 19, name: 'Task' };
+  if (normalized === 'askquestion' || normalized === 'ask_question') return { field: 23, name: 'AskQuestion' };
   if (normalized === 'webfetch' || normalized === 'web_fetch' || normalized === 'fetch') return { field: 37, name: 'WebFetch' };
+  if (normalized === 'reportbugfixresults' || normalized === 'report_bugfix_results' || normalized === 'debuglogs' || normalized === 'reproductionsteps') {
+    return { field: 78, name: 'ReportBugfixResults' };
+  }
   return null;
+}
+
+function normalizeTaskSubagentType(subagentTypeValue) {
+  if (!subagentTypeValue) return '';
+  if (typeof subagentTypeValue === 'string') return String(subagentTypeValue).trim();
+  if (typeof subagentTypeValue !== 'object' || Array.isArray(subagentTypeValue)) return '';
+  const keys = Object.keys(subagentTypeValue).filter(Boolean);
+  if (!keys.length) return '';
+  const firstKey = String(keys[0]).trim();
+  const firstValue = String(subagentTypeValue[firstKey] || '').trim();
+  return firstValue || firstKey;
+}
+
+function encodeTaskSubagentType(subagentTypeValue) {
+  const normalized = normalizeTaskSubagentType(subagentTypeValue).trim().toLowerCase();
+  if (!normalized) {
+    return encodeBytesField(1, Buffer.alloc(0));
+  }
+  if (normalized.includes('debug')) {
+    return encodeBytesField(10, Buffer.alloc(0));
+  }
+  if (normalized.includes('explore')) {
+    return encodeBytesField(4, Buffer.alloc(0));
+  }
+  if (normalized.includes('shell')) {
+    return encodeBytesField(8, Buffer.alloc(0));
+  }
+  if (normalized.includes('computer')) {
+    return encodeBytesField(2, Buffer.alloc(0));
+  }
+  if (normalized.includes('browser')) {
+    return encodeBytesField(7, Buffer.alloc(0));
+  }
+  if (normalized.includes('bash')) {
+    return encodeBytesField(6, Buffer.alloc(0));
+  }
+  return encodeBytesField(3, concatBytes([
+    encodeOptionalStringField(1, normalizeTaskSubagentType(subagentTypeValue)),
+  ]));
+}
+
+function buildTaskSubagentTypeProto(subagentTypeValue) {
+  const normalized = normalizeTaskSubagentType(subagentTypeValue).trim();
+  const lower = normalized.toLowerCase();
+  if (!lower) return { unspecified: {} };
+  if (lower.includes('debug')) return { debug: {} };
+  if (lower.includes('explore')) return { explore: {} };
+  if (lower.includes('shell')) return { shell: {} };
+  if (lower.includes('computer')) return { computerUse: {} };
+  if (lower.includes('browser')) return { browserUse: {} };
+  if (lower.includes('bash')) {
+    return { bash: {} };
+  }
+  // general-purpose subagent maps to 'custom' (enum value 3) which Cursor UI
+  // recognises as a valid real subagent rather than unspecified/placeholder.
+  if (lower.includes('generalpurpose') || lower.includes('general-purpose') || lower.includes('general')) {
+    return { custom: {} };
+  }
+  return { custom: { name: normalized } };
 }
 
 function normalizeAgentTodoStatus(status = '') {
@@ -1816,6 +2450,130 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
       },
     };
   }
+  if (normalized === 'websearch' || normalized === 'web_search') {
+    const results = Array.isArray(execution.results) ? execution.results : [];
+    const references = Array.isArray(execution.references) ? execution.references : [];
+    const normalizedResults = results.length
+      ? results
+      : references
+        .filter((reference) => String(reference?.url || '').trim())
+        .map((reference, index) => ({
+          id: String(index + 1),
+          title: String(reference?.title || '').trim(),
+          url: String(reference?.url || '').trim(),
+          snippet: String(reference?.snippet || reference?.chunk || '').trim(),
+          rank: index + 1,
+        }));
+    return {
+      webSearchToolCall: {
+        args: {
+          searchTerm: String(safeArgs.search_term || safeArgs.searchTerm || safeArgs.query || execution.args?.search_term || '').trim(),
+          toolCallId: callId || undefined,
+        },
+        result: execution.ok === false
+          ? { error: { error: execution.resultText || 'Web search failed' } }
+          : {
+            success: {
+              references: normalizedResults.map((item) => ({
+                title: String(item?.title || '').trim(),
+                url: String(item?.url || '').trim(),
+                chunk: String(item?.snippet || '').trim(),
+              })),
+            },
+        },
+      },
+    };
+  }
+  if (normalized === 'askquestion' || normalized === 'ask_question') {
+    const questions = Array.isArray(safeArgs.questions) ? safeArgs.questions : [];
+    const answers = Array.isArray(execution.answers) ? execution.answers : [];
+    const errorText = String(execution.resultText || execution.error || 'AskQuestion failed').trim();
+    return {
+      askQuestionToolCall: {
+        args: {
+          title: String(safeArgs.title || '').trim(),
+          questions,
+        },
+        result: execution.ok === false
+          ? { error: { errorMessage: errorText } }
+          : {
+            success: {
+              answers,
+            },
+          },
+      },
+    };
+  }
+  if (normalized === 'createplan' || normalized === 'create_plan') {
+    const todos = Array.isArray(safeArgs.todos) ? safeArgs.todos : [];
+    const errorText = String(execution.resultText || execution.error || 'CreatePlan failed').trim();
+    return {
+      createPlanToolCall: {
+        args: {
+          plan: String(safeArgs.plan || '').trim(),
+          overview: String(safeArgs.overview || '').trim(),
+          name: String(safeArgs.name || '').trim(),
+          todos,
+        },
+        result: execution.ok === false
+          ? { error: { errorMessage: errorText } }
+          : {
+            planUri: String(execution.planPath || execution.planUri || safeArgs.planUri || '').trim(),
+            success: {},
+          },
+      },
+    };
+  }
+  if (normalized === 'task') {
+    const description = String(safeArgs.description || '').trim();
+    const prompt = String(safeArgs.prompt || '').trim();
+    const includeResult = execution.includeResult !== false;
+    const taskToolCall = {
+      args: {
+        description,
+        prompt,
+        subagentType: buildTaskSubagentTypeProto(safeArgs.subagent_type || safeArgs.subagentType || ''),
+        model: String(safeArgs.model || '').trim(),
+        resume: String(safeArgs.resume || '').trim() || undefined,
+        agentId: String(execution.agentId || '').trim() || undefined,
+        attachments: Array.isArray(safeArgs.attachments) ? safeArgs.attachments : [],
+      },
+    };
+    if (includeResult) {
+      taskToolCall.result = execution.ok === false
+        ? { error: { error: String(execution.resultText || 'Task failed').trim() } }
+        : {
+          success: {
+            conversationSteps: Array.isArray(execution.conversationStepsJson) ? execution.conversationStepsJson : [],
+            agentId: String(execution.agentId || '').trim(),
+            isBackground: execution.isBackground === true,
+            durationMs: Number(execution.durationMs) || 0,
+            resultSuffix: String(execution.resultSuffix || '').trim() || undefined,
+            transcriptPath: String(execution.transcriptPath || '').trim() || undefined,
+          },
+        };
+    }
+    return { taskToolCall };
+  }
+  if (
+    normalized === 'reportbugfixresults'
+    || normalized === 'report_bugfix_results'
+    || normalized === 'debuglogs'
+    || normalized === 'reproductionsteps'
+  ) {
+    const errorText = String(execution.resultText || execution.error || 'ReportBugfixResults failed').trim();
+    return {
+      reportBugfixResultsToolCall: {
+        args: {
+          summary: String(safeArgs.summary || '').trim(),
+          results: Array.isArray(safeArgs.results) ? safeArgs.results : [],
+        },
+        result: execution.ok === false
+          ? { error: { errorMessage: errorText } }
+          : { success: {} },
+      },
+    };
+  }
   return null;
 }
 
@@ -1903,11 +2661,51 @@ function encodeAgentToolArgsPayload(toolName, args = {}, toolCallId = '') {
         encodeOptionalStringField(1, normalizedArgs.search_term || normalizedArgs.searchTerm || normalizedArgs.query),
         encodeOptionalStringField(2, toolCallId),
       ]);
+    case 'SemanticSearch':
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.query),
+        encodeRepeatedStringField(2, normalizedArgs.target_directories || normalizedArgs.targetDirectories),
+        encodeOptionalStringField(3, normalizedArgs.explanation),
+      ]);
+    case 'CreatePlan':
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.plan),
+        ...(Array.isArray(normalizedArgs.todos) ? normalizedArgs.todos : []).map((todo) => encodeBytesField(2, encodeAgentTodoItem(todo))),
+        encodeOptionalStringField(3, normalizedArgs.overview),
+        encodeOptionalStringField(4, normalizedArgs.name),
+      ]);
+    case 'AskQuestion':
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.title),
+        ...(Array.isArray(normalizedArgs.questions) ? normalizedArgs.questions : []).map((question) => encodeBytesField(2, encodeAskQuestionQuestion(question))),
+      ]);
     case 'WebFetch':
       return concatBytes([
         encodeOptionalStringField(1, normalizedArgs.url),
         encodeOptionalStringField(2, toolCallId),
       ]);
+    case 'Task': {
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.description),
+        encodeOptionalStringField(2, normalizedArgs.prompt),
+        encodeBytesField(3, encodeTaskSubagentType(normalizedArgs.subagent_type || normalizedArgs.subagentType || '')),
+        encodeOptionalStringField(4, normalizedArgs.model),
+        encodeOptionalStringField(5, normalizedArgs.resume),
+        encodeOptionalStringField(6, normalizedArgs.agent_id || normalizedArgs.agentId),
+        encodeRepeatedStringField(7, normalizedArgs.attachments),
+      ]);
+    }
+    case 'ReportBugfixResults': {
+      const results = Array.isArray(normalizedArgs.results) ? normalizedArgs.results : [];
+      return concatBytes([
+        encodeOptionalStringField(1, normalizedArgs.summary),
+        ...results.map((item) => encodeBytesField(2, concatBytes([
+          encodeOptionalStringField(1, item?.title),
+          encodeOptionalStringField(2, item?.summary),
+          encodeOptionalStringField(3, item?.status),
+        ]))),
+      ]);
+    }
     default:
       return Buffer.alloc(0);
   }
@@ -1918,6 +2716,47 @@ function encodeWebSearchReference(reference = {}) {
     encodeOptionalStringField(1, reference.title),
     encodeOptionalStringField(2, reference.url),
     encodeOptionalStringField(3, reference.chunk),
+  ]);
+}
+
+function encodeAskQuestionOption(option = {}) {
+  return concatBytes([
+    encodeOptionalStringField(1, option.id),
+    encodeOptionalStringField(2, option.label),
+  ]);
+}
+
+function encodeAskQuestionQuestion(question = {}) {
+  const options = Array.isArray(question.options) ? question.options : [];
+  return concatBytes([
+    encodeOptionalStringField(1, question.id),
+    encodeOptionalStringField(2, question.prompt),
+    ...options.map((option) => encodeBytesField(3, encodeAskQuestionOption(option))),
+    encodeOptionalBoolField(4, question.allow_multiple === true || question.allowMultiple === true),
+  ]);
+}
+
+function encodeSemSearchCodeResult(result = {}) {
+  const codeBlock = result.codeBlock || {};
+  const range = codeBlock.range && typeof codeBlock.range === 'object'
+    ? concatBytes([
+      encodeBytesField(1, concatBytes([
+        encodeOptionalIntField(1, Number(codeBlock.range.startLine) || 0),
+        encodeOptionalIntField(2, Number(codeBlock.range.startColumn) || 0),
+      ])),
+      encodeBytesField(2, concatBytes([
+        encodeOptionalIntField(1, Number(codeBlock.range.endLine) || 0),
+        encodeOptionalIntField(2, Number(codeBlock.range.endColumn) || 0),
+      ])),
+    ])
+    : Buffer.alloc(0);
+  return concatBytes([
+    encodeBytesField(1, concatBytes([
+      encodeOptionalStringField(1, codeBlock.relativeWorkspacePath),
+      encodeOptionalStringField(4, codeBlock.contents),
+      range.length ? encodeBytesField(3, range) : Buffer.alloc(0),
+    ])),
+    encodeOptionalIntField(2, Number(result.score) || 0),
   ]);
 }
 
@@ -2009,6 +2848,88 @@ function encodeAgentToolResultPayload(toolName, args = {}, execution = null, too
           encodeOptionalIntField(3, Number(execution.diagnosticCount) || 0),
         ]),
       }]);
+    case 'SemanticSearch': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'Semantic search failed'),
+          ]),
+        }]);
+      }
+      const matches = Array.isArray(execution.matches) ? execution.matches : [];
+      return encodeMessage([{
+        field: 1,
+        value: concatBytes([
+          encodeOptionalStringField(1, resultText),
+          ...matches.map((item) => encodeBytesField(2, encodeSemSearchCodeResult(item))),
+        ]),
+      }]);
+    }
+    case 'CreatePlan': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'CreatePlan failed'),
+          ]),
+        }]);
+      }
+      return concatBytes([
+        encodeBytesField(1, Buffer.alloc(0)),
+        encodeOptionalStringField(3, execution.planPath || execution.planUri || ''),
+      ]);
+    }
+    case 'Task': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'Task failed'),
+          ]),
+        }]);
+      }
+      return encodeMessage([{
+        field: 1,
+        value: concatBytes([
+          encodeOptionalStringField(1, execution.agentId || ''),
+          encodeOptionalBoolField(2, execution.isBackground === true),
+          encodeOptionalInt64Field(4, Number(execution.durationMs) || 0),
+          encodeOptionalStringField(5, execution.resultSuffix || ''),
+          encodeOptionalStringField(7, execution.transcriptPath || ''),
+        ]),
+      }]);
+    }
+    case 'ReportBugfixResults': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'ReportBugfixResults failed'),
+          ]),
+        }]);
+      }
+      return encodeMessage([{ field: 1, value: Buffer.alloc(0) }]);
+    }
+    case 'AskQuestion': {
+      if (!execution.ok) {
+        return encodeMessage([{
+          field: 2,
+          value: concatBytes([
+            encodeOptionalStringField(1, execution.resultText || execution.error || 'AskQuestion failed'),
+          ]),
+        }]);
+      }
+      const answers = Array.isArray(execution.answers) ? execution.answers : [];
+      return encodeMessage([{
+        field: 1,
+        value: concatBytes(answers.map((answer) => encodeBytesField(1, concatBytes([
+          encodeOptionalStringField(1, answer.questionId || answer.question_id),
+          encodeRepeatedStringField(2, answer.selectedOptionIds || answer.selected_option_ids),
+          encodeOptionalStringField(3, answer.freeformText || answer.freeform_text),
+        ])))),
+      }]);
+    }
     case 'WebSearch': {
       if (!execution.ok) {
         return encodeMessage([{
@@ -2080,6 +3001,18 @@ function buildAgentToolCallStartedFrame(toolName, argumentsValue = {}, toolCallI
 
 function buildAgentToolCallCompletedFrame(toolName, argumentsValue = {}, toolCallId = '', modelCallId = '', options = {}) {
   const normalizedCallId = String(toolCallId || `tool_${Date.now().toString(36)}`);
+  if (String(toolName || '').trim().toLowerCase() === 'task') {
+    const structuredToolCall = buildStructuredToolCallSnapshot(toolName, argumentsValue, options.execution || {}, normalizedCallId);
+    if (structuredToolCall) {
+      return buildAgentInteractionUpdateProtoFrame({
+        toolCallCompleted: {
+          callId: normalizedCallId,
+          toolCall: structuredToolCall,
+          modelCallId: String(modelCallId || ''),
+        },
+      });
+    }
+  }
   return buildAgentInteractionFrame(3, concatBytes([
     encodeBytesField(1, normalizedCallId),
     encodeBytesField(2, encodeAgentToolCallPayload(toolName, argumentsValue, normalizedCallId, options)),
@@ -2094,6 +3027,65 @@ function buildAgentToolCallProgressFrame(toolName, argumentsValue = {}, toolCall
     encodeBytesField(2, encodeAgentToolCallPayload(toolName, argumentsValue, normalizedCallId, options)),
     encodeBytesField(3, String(modelCallId || '')),
   ]));
+}
+
+function buildAgentTaskToolCallDeltaFrame(updateKind = 'partial', argumentsValue = {}, toolCallId = '', modelCallId = '', options = {}) {
+  const normalizedCallId = String(toolCallId || `tool_${Date.now().toString(36)}`);
+  const execution = options.execution || {};
+  const structuredToolCall = buildStructuredToolCallSnapshot('Task', argumentsValue, execution, normalizedCallId);
+  if (!structuredToolCall) return Buffer.alloc(0);
+  // ToolCall message (agent.v1.ToolCall) carries metadata alongside the oneof tool:
+  //   tool_call_id = 57, started_at_ms = 59, completed_at_ms = 60.
+  // The UI uses tool_call_id to correlate the delta with TaskStreamLog requests, and
+  // the timestamps to render duration. Without these the client may fall back to a
+  // generic placeholder card.
+  structuredToolCall.toolCallId = normalizedCallId;
+  if (Number(execution.startedAtMs) > 0) {
+    structuredToolCall.startedAtMs = String(execution.startedAtMs);
+  }
+  if (Number(execution.completedAtMs) > 0) {
+    structuredToolCall.completedAtMs = String(execution.completedAtMs);
+  }
+  const nestedUpdate = {
+    partial: {
+      partialToolCall: {
+        callId: normalizedCallId,
+        toolCall: structuredToolCall,
+        modelCallId: String(modelCallId || ''),
+      },
+    },
+    started: {
+      toolCallStarted: {
+        callId: normalizedCallId,
+        toolCall: structuredToolCall,
+        modelCallId: String(modelCallId || ''),
+      },
+    },
+    completed: {
+      toolCallCompleted: {
+        callId: normalizedCallId,
+        toolCall: structuredToolCall,
+        modelCallId: String(modelCallId || ''),
+      },
+    },
+  }[String(updateKind || 'partial').trim().toLowerCase()] || {
+    partialToolCall: {
+      callId: normalizedCallId,
+      toolCall: structuredToolCall,
+      modelCallId: String(modelCallId || ''),
+    },
+  };
+  return buildAgentInteractionUpdateProtoFrame({
+    toolCallDelta: {
+      callId: normalizedCallId,
+      modelCallId: String(modelCallId || ''),
+      toolCallDelta: {
+        taskToolCallDelta: {
+          interactionUpdate: nestedUpdate,
+        },
+      },
+    },
+  });
 }
 
 function buildAgentEditToolCallDeltaFrame(text, toolCallId = '', modelCallId = '') {
@@ -2246,6 +3238,7 @@ module.exports = {
   decodeCursorChatRequest,
   decodeRunSseRequestId,
   decodeBidiAppendRequest,
+  extractAgentModeFromPayload,
   readConnectFrames,
   summarizeConnectFrames,
   summarizeAgentServerStream,
@@ -2271,9 +3264,13 @@ module.exports = {
   buildAgentToolCallStartedFrame,
   buildAgentToolCallCompletedFrame,
   buildAgentToolCallProgressFrame,
+  buildAgentTaskToolCallDeltaFrame,
   buildAgentEditToolCallDeltaFrame,
   buildAgentTurnEndedFrame,
   buildAgentHeartbeatFrame,
+  buildAgentInteractionQueryFrame,
+  buildAgentAskQuestionQueryFrame,
+  buildAgentCreatePlanQueryFrame,
   buildAgentConversationCheckpointFrame,
   buildAgentToolCallFrame,
   buildStructuredToolCallSnapshot,

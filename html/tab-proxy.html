@@ -62,7 +62,7 @@
 
     <div class="adv-form-row">
       <label class="adv-label-inline" for="relayContextWindow">上下文窗口</label>
-      <input id="relayContextWindow" class="input flex-1" inputmode="numeric" placeholder="250000" />
+      <input id="relayContextWindow" class="input flex-1" inputmode="numeric" placeholder="200000" />
     </div>
     <p class="adv-hint">Relay 会按上下文窗口预算自动压缩较早对话，优先保留最近消息、关键摘要和工作区上下文。</p>
 
@@ -105,7 +105,7 @@
   </div>
 
   <div id="relayAdminSection" class="adv-pref-block hidden">
-    <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 管理员诊断</h3>
+    <h3 class="adv-section-title"><i class="fa fa-wrench"></i> 诊断</h3>
     <div class="adv-inject-row">
       <span class="adv-label-inline">Runner 进程:</span>
       <span id="relayRunnerBadge" class="adv-inject-badge adv-inject-badge-muted">加载中...</span>
@@ -157,6 +157,12 @@
     <div class="adv-actions-row">
       <button type="button" id="relayRefreshBtn" class="ghost-btn">
         <i class="fa fa-refresh"></i> 刷新状态
+      </button>
+      <button type="button" id="relayPlanUiMockBtn" class="ghost-btn">
+        <i class="fa fa-flask"></i> Plan UI Mock
+      </button>
+      <button type="button" id="relayExploreUiMockBtn" class="ghost-btn">
+        <i class="fa fa-search"></i> Explore UI Mock
       </button>
       <button type="button" id="relayOfficialCaptureBtn" class="ghost-btn">
         <i class="fa fa-exchange"></i> 记录官方 Agent 流量

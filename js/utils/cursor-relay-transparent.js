@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFileSync } = require('child_process');
+const { execFileSync, execFile } = require('child_process');
 
 const HOSTS_BEGIN = '# BEGIN CURSORPOOL RELAY';
 const HOSTS_END = '# END CURSORPOOL RELAY';
@@ -15,6 +15,10 @@ const TRANSPARENT_HOSTS = [
   'agent.api5.cursor.sh',
   'agentn.api5.cursor.sh',
   'metrics.cursor.sh',
+  'prod.authentication.cursor.sh',
+  'marketplace.cursorapi.com',
+  'downloads.cursor.com',
+  'cursor-cdn.com',
   'cursor.sh',
   'www.cursor.sh',
 ];
@@ -88,14 +92,25 @@ function readHostsFile() {
 function applyTransparentHosts(hosts = TRANSPARENT_HOSTS) {
   const hostsPath = getHostsPath();
   const current = readHostsFile();
-  if (current.hasBlock) {
+  const desiredBlock = buildHostsBlock(hosts).trim();
+  const existingBlockMatch = String(current.content || '').match(
+    new RegExp(`${HOSTS_BEGIN}[\\s\\S]*?${HOSTS_END}`, 'm'),
+  );
+  const existingBlock = existingBlockMatch ? existingBlockMatch[0].trim() : '';
+  if (current.hasBlock && existingBlock === desiredBlock) {
     return { ok: true, hostsPath, alreadyApplied: true, hosts };
   }
 
   const next = `${stripHostsBlock(current.content)}${os.EOL}${os.EOL}${buildHostsBlock(hosts)}`;
   try {
     fs.writeFileSync(hostsPath, next, 'utf8');
-    return { ok: true, hostsPath, alreadyApplied: false, hosts };
+    return {
+      ok: true,
+      hostsPath,
+      alreadyApplied: false,
+      updatedExistingBlock: Boolean(current.hasBlock),
+      hosts,
+    };
   } catch (error) {
     return {
       ok: false,
@@ -172,6 +187,50 @@ function snapshotCursorTcpConnections() {
   }
 }
 
+// 异步版本：避免 execFileSync 阻塞 main 进程事件循环导致 IPC 超时
+function snapshotCursorTcpConnectionsAsync(timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') {
+      resolve({ supported: false, lines: [], text: 'TCP 归属快照仅支持 Windows' });
+      return;
+    }
+    const script = [
+      '$pids = @(Get-Process -Name Cursor -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id);',
+      'if (-not $pids.Count) { Write-Output "NO_CURSOR_PROCESS"; exit 0 };',
+      '$rows = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object { $pids -contains $_.OwningProcess -and $_.RemotePort -eq 443 } | Select-Object -First 40 OwningProcess, LocalAddress, LocalPort, RemoteAddress, RemotePort);',
+      'if (-not $rows.Count) { Write-Output "NO_CURSOR_443"; exit 0 };',
+      '$rows | ForEach-Object { "{0}`t{1}:{2}`t->`t{3}:{4}" -f $_.OwningProcess, $_.LocalAddress, $_.LocalPort, $_.RemoteAddress, $_.RemotePort }',
+    ].join(' ');
+    let settled = false;
+    const done = (val) => {
+      if (!settled) { settled = true; resolve(val); }
+    };
+    const timer = setTimeout(() => {
+      done({ supported: true, lines: [], text: 'TCP 快照超时跳过', error: 'timeout' });
+    }, timeoutMs);
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { encoding: 'utf8', windowsHide: true, timeout: timeoutMs },
+      (error, stdout) => {
+        clearTimeout(timer);
+        if (error) {
+          done({ supported: true, lines: [], text: `TCP 快照失败: ${error.message || String(error)}`, error: error.message || String(error) });
+          return;
+        }
+        const raw = String(stdout || '').trim();
+        const lines = raw ? raw.split(/\r?\n/).filter(Boolean) : [];
+        done({
+          supported: true,
+          lines,
+          text: lines.length ? lines.join('\n') : raw || '（无 Cursor :443 连接）',
+          cursorRunning: !lines.includes('NO_CURSOR_PROCESS') && raw !== 'NO_CURSOR_PROCESS',
+        });
+      },
+    );
+  });
+}
+
 module.exports = {
   DEFAULT_DIRECT_MITM_PORT,
   TRANSPARENT_HOSTS,
@@ -179,5 +238,6 @@ module.exports = {
   clearTransparentHosts,
   readTransparentHostsStatus,
   snapshotCursorTcpConnections,
+  snapshotCursorTcpConnectionsAsync,
   isProcessElevated,
 };

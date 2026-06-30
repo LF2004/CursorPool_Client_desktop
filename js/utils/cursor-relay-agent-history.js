@@ -66,7 +66,7 @@ function loadConversation(config = {}, conversationId = '', options = {}) {
     current_request_id: '',
     current_turn_seq: 0,
     token_details_used_tokens: 0,
-    token_details_max_tokens: Number.MAX_SAFE_INTEGER,
+    token_details_max_tokens: 200000,
     latest_request_prefix: null,
     last_provider_call: null,
     created_at: nowIso(),
@@ -85,6 +85,30 @@ function saveConversation(conversation) {
   conversation.state.context_version = Number(conversation.context.version) || 0;
   writeJson(conversation.contextPath, conversation.context);
   writeJson(conversation.statePath, conversation.state);
+}
+
+function updateConversationState(conversation, patch = {}) {
+  if (!conversation || !patch || typeof patch !== 'object') return;
+  conversation.state = conversation.state && typeof conversation.state === 'object'
+    ? conversation.state
+    : {};
+  Object.assign(conversation.state, patch);
+  saveConversation(conversation);
+}
+
+function mergeConversationMetadata(conversation, patch = {}) {
+  if (!conversation || !patch || typeof patch !== 'object') return;
+  conversation.state = conversation.state && typeof conversation.state === 'object'
+    ? conversation.state
+    : {};
+  const current = conversation.state.metadata && typeof conversation.state.metadata === 'object'
+    ? conversation.state.metadata
+    : {};
+  conversation.state.metadata = {
+    ...current,
+    ...patch,
+  };
+  saveConversation(conversation);
 }
 
 function beginTurn(config = {}, requestId = '', workspaceRoot = '', capture = null) {
@@ -130,7 +154,11 @@ function appendHistoryItem(conversation, item = {}) {
 
 function completeTurn(conversation, options = {}) {
   if (!conversation) return;
-  conversation.state.current_loop_status = options.status || 'completed';
+  const preserveWaiting = Boolean(options.preserveWaitingForInteraction)
+    && String(conversation.state?.current_loop_status || '').trim() === 'waiting_for_interaction';
+  conversation.state.current_loop_status = preserveWaiting
+    ? 'waiting_for_interaction'
+    : (options.status || 'completed');
   conversation.state.last_provider_call = options.lastProviderCall || conversation.state.last_provider_call || null;
   appendHistoryItem(conversation, {
     role: 'system',
@@ -169,5 +197,7 @@ module.exports = {
   completeTurn,
   getConversationId,
   getHistoryRoot,
+  mergeConversationMetadata,
+  updateConversationState,
   updateUsage,
 };

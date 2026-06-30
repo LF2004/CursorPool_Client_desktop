@@ -36,7 +36,8 @@ export const PROVIDER_ICONS = {
   custom: './assets/icons/providers/custom.svg',
 };
 
-export const DEFAULT_CONTEXT_WINDOW = 250000;
+export const MAX_CONTEXT_WINDOW = 200000;
+export const DEFAULT_CONTEXT_WINDOW = MAX_CONTEXT_WINDOW;
 export const DEFAULT_REASONING_EFFORT = 'medium';
 export const REASONING_EFFORT_OPTIONS = [
   { value: 'low', label: '低' },
@@ -49,6 +50,7 @@ export const VALID_REASONING_EFFORTS = REASONING_EFFORT_OPTIONS.map((item) => it
 export const RELAY_FIELD_HINTS = {
   name: '配置列表中显示的名称，便于区分多个上游模型。',
   modelName: '请求上游 API 时使用的 model 参数，需与服务商文档一致。',
+  completionModel: 'Tab 代码补全使用的 model 参数。留空时复用聊天模型。',
   apiKey: '上游服务商或中转网关的 API Key，仅保存在本机，不会上传服务器。',
   baseUrl: 'OpenAI 兼容接口的根地址，通常填写到 /v1；不要在地址末尾附加 /chat/completions 或 /responses。',
   contextWindow: 'Relay 压缩较早对话时参考的上下文 token 预算，越大保留历史越多，但也更占额度。',
@@ -132,6 +134,7 @@ export function createEmptyProfile(providerId = 'openai') {
     baseUrl: PROVIDER_BASE_URLS[pid] || '',
     apiKey: '',
     modelName: '',
+    completionModel: '',
     endpointMode: pid === 'gemini' || pid === 'mimo' ? 'chat' : DEFAULT_ENDPOINT_MODE,
     reasoningEffort: DEFAULT_REASONING_EFFORT,
     thinkingMode: pid === 'deepseek' || pid === 'mimo' ? DEFAULT_DEEPSEEK_THINKING_MODE : '',
@@ -154,12 +157,13 @@ function normalizeProfile(raw) {
     baseUrl: String(raw.baseUrl || '').trim(),
     apiKey: String(raw.apiKey || '').trim(),
     modelName: String(raw.modelName || '').trim(),
+    completionModel: String(raw.completionModel || '').trim(),
     endpointMode: raw.endpointMode === 'chat' ? 'chat' : DEFAULT_ENDPOINT_MODE,
     reasoningEffort: VALID_REASONING_EFFORTS.includes(raw.reasoningEffort) ? raw.reasoningEffort : DEFAULT_REASONING_EFFORT,
     thinkingMode: providerId === 'deepseek' || providerId === 'mimo'
       ? (['enabled', 'disabled'].includes(raw.thinkingMode) ? raw.thinkingMode : DEFAULT_DEEPSEEK_THINKING_MODE)
       : '',
-    contextWindow: Number(raw.contextWindow) > 0 ? Number(raw.contextWindow) : DEFAULT_CONTEXT_WINDOW,
+    contextWindow: Math.max(1, Math.min(MAX_CONTEXT_WINDOW, Number(raw.contextWindow) > 0 ? Number(raw.contextWindow) : DEFAULT_CONTEXT_WINDOW)),
     notes: String(raw.notes || '').trim(),
     testStatus: normalizeTestStatus(raw.testStatus),
     createdAt: Number(raw.createdAt) || now,
@@ -252,6 +256,7 @@ function saveProfilesStoreToLocalStorage(store) {
           baseUrl: p.baseUrl,
           apiKey: p.apiKey,
           modelName: p.modelName,
+          completionModel: p.completionModel,
           endpointMode: p.endpointMode,
           reasoningEffort: p.reasoningEffort,
           thinkingMode: p.thinkingMode,
@@ -278,6 +283,7 @@ function syncLegacyActiveConfig(store) {
       providerId: active.providerId,
       baseUrl: active.baseUrl,
       modelName: active.modelName,
+      completionModel: active.completionModel,
       apiKey: active.apiKey,
       endpointMode: active.endpointMode,
       reasoningEffort: active.reasoningEffort,
@@ -351,14 +357,34 @@ export async function loadProfilesStore() {
     const dbStore = await bridge.cursorRelayProfilesLoad();
     const hasDbConfigs = Array.isArray(dbStore?.configs) && dbStore.configs.length > 0;
     if (hasDbConfigs) {
-      const normalized = {
+      const dbNormalized = {
         version: Number(dbStore.version) || 2,
         activeId: String(dbStore.activeId || ''),
         filterProvider: normalizeProviderId(dbStore.filterProvider || 'openai'),
         configs: dbStore.configs.map(normalizeProfile).filter(Boolean),
       };
-      saveProfilesStoreToLocalStorage(normalized);
-      return normalized;
+
+      // 比较 DB 和 localStorage 的最新 updatedAt，防止 DB 保存失败后用旧数据覆盖新数据
+      const localStore = loadProfilesStoreFromLocalStorage();
+      const dbMaxUpdated = dbNormalized.configs.reduce(
+        (max, c) => Math.max(max, Number(c.updatedAt) || 0), 0,
+      );
+      const localMaxUpdated = (localStore.configs || []).reduce(
+        (max, c) => Math.max(max, Number(c.updatedAt) || 0), 0,
+      );
+
+      if (localMaxUpdated > dbMaxUpdated) {
+        // localStorage 比 DB 新 —— DB 保存可能失败了，优先使用 localStorage 并重新同步 DB
+        try {
+          await bridge.cursorRelayProfilesSave(localStore);
+        } catch {
+          /* ignore re-sync failure */
+        }
+        return localStore;
+      }
+
+      saveProfilesStoreToLocalStorage(dbNormalized);
+      return dbNormalized;
     }
 
     const localStore = loadProfilesStoreFromLocalStorage();
@@ -385,6 +411,7 @@ export async function saveProfilesStore(store) {
         baseUrl: p.baseUrl,
         apiKey: p.apiKey,
         modelName: p.modelName,
+        completionModel: p.completionModel,
         endpointMode: p.endpointMode,
         reasoningEffort: p.reasoningEffort,
         thinkingMode: p.thinkingMode,
@@ -402,8 +429,10 @@ export async function saveProfilesStore(store) {
   try {
     await bridge.cursorRelayProfilesSave(payload);
     await bridge.refreshTrayMenu?.();
-  } catch {
-    /* ignore */
+  } catch (error) {
+    // DB 保存失败时记录警告，localStorage 已更新故不会丢失数据
+    // loadProfilesStore 会通过 updatedAt 对比检测到 DB 数据过期并自动恢复
+    console.warn('[relay-profiles] DB save failed, localStorage is up-to-date:', error?.message || error);
   }
   return payload;
 }
@@ -415,6 +444,7 @@ export function profileToUpstreamPayload(profile) {
     baseUrl: p.baseUrl,
     apiKey: p.apiKey,
     modelName: p.modelName,
+    completionModel: p.completionModel,
     endpointMode: p.endpointMode,
     reasoningEffort: p.reasoningEffort,
     thinkingMode: p.thinkingMode,

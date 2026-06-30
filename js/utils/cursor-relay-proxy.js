@@ -1,6 +1,8 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
+const http = require('http');
+const { fork } = require('child_process');
 const { getCursorAppDataDir } = require('./cursor-local-state');
 const { resolveMainJsPath } = require('../../paths');
 const {
@@ -9,6 +11,7 @@ const {
   forceQuitCursorForRestart,
   quitCursorAndWait,
   launchCursorApp,
+  startNewCursorAgentConversation,
   waitForCursorWindowReady,
   reloadRunningCursorWindow,
   focusCursorAndSendChatMessage,
@@ -17,6 +20,7 @@ const {
   readModelProxyConfig,
   clearModelProxyConfigOnly,
   syncCursorRelayModelCatalog,
+  syncCursorRelayProviderConfig,
 } = require('./cursor-model-proxy');
 const {
   loadRelayProfileStore,
@@ -31,8 +35,10 @@ const {
   getRunnerLogPaths,
   readRunnerLogTail,
 } = require('./cursor-relay-runner-manager');
-const { writeUtf8FileWithBom } = require('./cursor-relay-log');
+const { writeUtf8FileWithBom, appendRunnerLog } = require('./cursor-relay-log');
 const { ensureCursorAuthIfNeeded } = require('../../update_cursor_auth');
+// 新的账号缓存统一入口：defult_user.json ←→ state.vscdb
+const { ensureCursorAccount, readDefaultUserTemplate, parseTemplateToAccount } = require('./cursor-relay-account-store');
 const {
   applyRelaySystemProxy,
   clearRelaySystemProxy,
@@ -46,11 +52,13 @@ const {
   clearTransparentHosts,
   readTransparentHostsStatus,
   snapshotCursorTcpConnections,
+  snapshotCursorTcpConnectionsAsync,
 } = require('./cursor-relay-transparent');
 const {
   patchRelayReviewBridgeInWorkbench,
   restoreRelayReviewBridgeInWorkbench,
   readRelayReviewBridgePatchStatus,
+  resolveWorkbenchDesktopMainJsPath,
 } = require('./cursor-relay-review-bridge');
 const { runRelayAgentConnectionTest } = require('./cursor-relay-agent-test');
 
@@ -94,6 +102,20 @@ const PROXY_ALLOWLIST_KEYS = [
 const DEFAULT_ENABLE_REVIEW_BRIDGE = false;
 const REVIEW_BRIDGE_LAUNCH_TIMEOUT_MS = 30000;
 const RELAY_RUNTIME_STATE_PATH = path.join(getCursorAppDataDir(), 'relay-runtime-state.json');
+const PLAN_UI_MOCK_PORT = Number(process.env.CURSOR_RELAY_PLAN_UI_MOCK_PORT || 17888);
+const PLAN_UI_MOCK_SCENARIO = 'plan-full';
+const PLAN_UI_MOCK_SCRIPT = path.join(__dirname, '..', '..', 'scripts', 'mock-cursor-agent-protocol-server.cjs');
+
+let planUiMockChild = null;
+
+function getPlanUiMockLogPath() {
+  try {
+    const paths = getRunnerLogPaths();
+    return path.join(path.dirname(paths.primary), 'mock-plan-ui.log');
+  } catch {
+    return path.join(process.cwd(), 'mock-plan-ui.log');
+  }
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -194,6 +216,48 @@ function clearRelayRuntimeState() {
   }
 }
 
+function getPlanUiMockState() {
+  const state = readRelayRuntimeState();
+  const active = state.mockProxyActive === true;
+  const port = Number(state.mockProxyPort) || 0;
+  return {
+    active,
+    port,
+    scenario: String(state.mockProxyScenario || '').trim(),
+    pid: Number(state.mockProxyPid) || 0,
+    startedAt: Number(state.mockProxyStartedAt) || 0,
+    proxyServer: active && port > 0 ? `http://127.0.0.1:${port}` : '',
+  };
+}
+
+async function stopPlanUiMockProxy() {
+  const current = getPlanUiMockState();
+  const pid = Number(planUiMockChild?.pid || current.pid) || 0;
+  if (planUiMockChild && !planUiMockChild.killed) {
+    try {
+      planUiMockChild.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
+  planUiMockChild = null;
+  if (pid) {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
+  writeRelayRuntimeState({
+    mockProxyActive: false,
+    mockProxyPid: 0,
+    mockProxyPort: 0,
+    mockProxyScenario: '',
+    mockProxyStartedAt: 0,
+  });
+  return { ok: true, stopped: Boolean(pid || current.active) };
+}
+
 function readLastRelayRunnerConfig() {
   try {
     const paths = getRunnerLogPaths();
@@ -214,9 +278,11 @@ function sanitizeRelayUpstream(upstream = null) {
   if (!baseUrl || !apiKey || !modelName) return null;
   return {
     providerId: String(upstream.providerId || 'custom').trim() || 'custom',
+    displayName: String(upstream.displayName || upstream.name || modelName).trim() || modelName,
     baseUrl,
     apiKey,
     modelName,
+    completionModel: String(upstream.completionModel || '').trim(),
     availableModels: Array.isArray(upstream.availableModels)
       ? upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
       : [],
@@ -225,7 +291,7 @@ function sanitizeRelayUpstream(upstream = null) {
     thinkingMode: ['enabled', 'disabled'].includes(String(upstream.thinkingMode || '').trim())
       ? String(upstream.thinkingMode || '').trim()
       : '',
-    contextWindow: Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 250000,
+    contextWindow: Number(upstream.contextWindow) > 0 ? Number(upstream.contextWindow) : 200000,
   };
 }
 
@@ -252,13 +318,15 @@ function relayProfileToUpstream(profile = null) {
   if (!modelName || !baseUrl || !apiKey) return null;
   return {
     providerId: String(profile.providerId || 'custom').trim() || 'custom',
+    displayName: String(profile.name || profile.modelName || '').trim() || modelName,
     baseUrl,
     apiKey,
     modelName,
+    completionModel: String(profile.completionModel || '').trim(),
     endpointMode: String(profile.endpointMode || 'responses').trim() || 'responses',
     reasoningEffort: String(profile.reasoningEffort || 'medium').trim() || 'medium',
     thinkingMode: String(profile.thinkingMode || '').trim(),
-    contextWindow: Number(profile.contextWindow) > 0 ? Number(profile.contextWindow) : 250000,
+    contextWindow: Number(profile.contextWindow) > 0 ? Number(profile.contextWindow) : 200000,
   };
 }
 
@@ -278,26 +346,63 @@ function buildRelayModelRoutesFromStore(store = {}) {
 
 function buildRelayStartOptionsFromConfig(config = null, overrides = {}) {
   const existing = config && typeof config === 'object' ? config : {};
-  const hasReviewBridgeOverride = Object.prototype.hasOwnProperty.call(overrides, 'enableReviewBridge');
+  const nextMode = String(overrides.mode || existing.mode || 'local_relay');
+  const isLocalRelay = nextMode === 'local_relay';
   const maxLocalToolCallsPerRound = Math.max(1, Math.min(32, Math.floor(Number(
     overrides.maxLocalToolCallsPerRound
       || existing.maxLocalToolCallsPerRound
       || 12,
   ) || 12)));
   return {
-    mode: String(overrides.mode || existing.mode || 'local_relay'),
+    mode: nextMode,
+    completionModel: String(overrides.completionModel ?? existing.completionModel ?? '').trim(),
     directMitmPort: Number(overrides.directMitmPort ?? existing.directMitmPort) || 0,
-    localNativeAgentTools: overrides.localNativeAgentTools !== false && existing.localNativeAgentTools !== false,
-    structuredAgentToolCalls: overrides.structuredAgentToolCalls !== false && existing.structuredAgentToolCalls !== false,
-    emitLocalToolInteractionFrames: overrides.emitLocalToolInteractionFrames !== false,
+    localNativeAgentTools: isLocalRelay ? overrides.localNativeAgentTools !== false : overrides.localNativeAgentTools !== false,
+    structuredAgentToolCalls: isLocalRelay ? overrides.structuredAgentToolCalls !== false : overrides.structuredAgentToolCalls !== false,
+    emitLocalToolInteractionFrames: isLocalRelay ? overrides.emitLocalToolInteractionFrames !== false : overrides.emitLocalToolInteractionFrames !== false,
+    emitLocalStepFrames: isLocalRelay
+      ? overrides.emitLocalStepFrames !== false
+      : (overrides.emitLocalStepFrames === true || existing.emitLocalStepFrames === true),
     emitSyntheticLocalNativeToolFrames: false,
     maxLocalToolCallsPerRound,
-    enableReviewBridge: hasReviewBridgeOverride
+    enableReviewBridge: Object.prototype.hasOwnProperty.call(overrides, 'enableReviewBridge')
       ? overrides.enableReviewBridge === true
-      : Object.prototype.hasOwnProperty.call(existing, 'enableReviewBridge')
-        ? existing.enableReviewBridge === true
-        : DEFAULT_ENABLE_REVIEW_BRIDGE,
+      : DEFAULT_ENABLE_REVIEW_BRIDGE,
   };
+}
+
+function normalizeRelayEndpointMode(value) {
+  const mode = String(value || '').trim().toLowerCase();
+  return mode === 'chat' ? 'chat' : 'responses';
+}
+
+function normalizeRelayReasoningEffort(value) {
+  const effort = String(value || '').trim().toLowerCase();
+  if (!effort) return 'medium';
+  if (effort === 'xhigh') return 'extra-high';
+  return effort;
+}
+
+function normalizeRelayBaseUrlForCompare(value) {
+  return String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function normalizeRelayThinkingMode(value) {
+  const thinking = String(value || '').trim().toLowerCase();
+  return thinking === 'enabled' ? 'enabled' : thinking === 'disabled' ? 'disabled' : '';
+}
+
+function isSameRelayUpstreamConfig(current = null, next = null) {
+  if (!current || !next) return false;
+  return (
+    normalizeRelayBaseUrlForCompare(current.baseUrl) === normalizeRelayBaseUrlForCompare(next.baseUrl)
+    && String(current.modelName || '').trim() === String(next.modelName || '').trim()
+    && normalizeRelayEndpointMode(current.endpointMode) === normalizeRelayEndpointMode(next.endpointMode)
+    && normalizeRelayReasoningEffort(current.reasoningEffort) === normalizeRelayReasoningEffort(next.reasoningEffort)
+    && normalizeRelayThinkingMode(current.thinkingMode) === normalizeRelayThinkingMode(next.thinkingMode)
+    && Math.max(1, Number(current.contextWindow) || 0) === Math.max(1, Number(next.contextWindow) || 0)
+    && String(current.apiKey || '').trim() === String(next.apiKey || '').trim()
+  );
 }
 
 function getCursorUserDir() {
@@ -405,6 +510,88 @@ function parseLocalProxyPort(proxyValue) {
   if (!text) return 0;
   const match = text.match(/^https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)$/i);
   return match ? Number(match[1]) || 0 : 0;
+}
+
+function normalizeRelayPort(value) {
+  const port = Number(value);
+  if (!Number.isFinite(port)) return 0;
+  if (port <= 0 || port > 65535) return 0;
+  return Math.floor(port);
+}
+
+function parseExplicitRelayPort(payload = {}) {
+  return normalizeRelayPort(
+    payload.frontProxyPort
+      || payload.proxyPort
+      || payload.runnerPort
+      || payload.port,
+  );
+}
+
+async function probeRelayRunnerByCandidates(ports = []) {
+  const seen = new Set();
+  const candidates = ports
+    .map((value) => normalizeRelayPort(value))
+    .filter((port) => {
+      if (!port || seen.has(port)) return false;
+      seen.add(port);
+      return true;
+    });
+
+  let fallbackStatus = null;
+  for (const port of candidates) {
+    // eslint-disable-next-line no-await-in-loop
+    const status = await getLocalRelayRunnerStatus({ port });
+    if (!fallbackStatus) fallbackStatus = status;
+    if (status?.running || status?.healthOk) {
+      return { status, port };
+    }
+  }
+
+  return {
+    status: fallbackStatus || await getLocalRelayRunnerStatus({ port: DEFAULT_PORT }),
+    port: candidates[0] || DEFAULT_PORT,
+  };
+}
+
+function resolveCanonicalRelayPort(options = {}) {
+  const payload = options.payload && typeof options.payload === 'object' ? options.payload : {};
+  const status = options.status && typeof options.status === 'object' ? options.status : {};
+  const lastConfig = options.lastConfig && typeof options.lastConfig === 'object' ? options.lastConfig : {};
+  const preferExplicit = options.preferExplicit === true;
+  const ignoreExplicit = options.ignoreExplicit === true;
+
+  const explicitPort = ignoreExplicit ? 0 : parseExplicitRelayPort(payload);
+  const runnerPort = normalizeRelayPort(status?.runner?.port);
+  const lastConfigPort = normalizeRelayPort(lastConfig?.port);
+  const configuredProxyPort = normalizeRelayPort(
+    status?.configuredProxyPort || status?.frontProxyPort,
+  );
+
+  if (preferExplicit && explicitPort) return explicitPort;
+  if (runnerPort && (!explicitPort || explicitPort === runnerPort || explicitPort === lastConfigPort)) {
+    return runnerPort;
+  }
+  if (lastConfigPort && (!explicitPort || explicitPort === lastConfigPort)) {
+    return lastConfigPort;
+  }
+  if (explicitPort) return explicitPort;
+  if (configuredProxyPort) return configuredProxyPort;
+  return DEFAULT_PORT;
+}
+
+function isRelayAlignedConfig(status = {}) {
+  const argvProxy = String(status?.argv?.proxyServer || status?.proxyServer || '').trim();
+  const settingsProxy = String(status?.systemProxy?.cursorSettings?.httpProxy || '').trim();
+  const providerBaseUrl = String(status?.cursorSettings?.openAIBaseUrl || '').trim();
+  const runnerPort = Number(status?.runner?.port || status?.frontProxyPort || DEFAULT_PORT) || DEFAULT_PORT;
+  const expectedProxy = `http://127.0.0.1:${runnerPort}`;
+  const providerExpected = `${expectedProxy}/v1`;
+  return Boolean(
+    argvProxy === expectedProxy
+    || settingsProxy === expectedProxy
+    || providerBaseUrl === providerExpected
+  );
 }
 
 function hasProxyWhitelist(mainText) {
@@ -557,17 +744,64 @@ async function readCursorRelayProxyConfig(options = {}) {
   const lightweight = options.lightweight === true;
   const argv = readArgvJson();
   const systemProxy = readRelayProxyState({ skipWindows: lightweight });
+  const lastRunnerConfig = readLastRelayRunnerConfig();
   const mainJsPath = resolveMainJsPath();
-  const mainJsAllowsProxy = Boolean(
-    mainJsPath &&
-    fs.existsSync(mainJsPath) &&
-    hasProxyWhitelist(fs.readFileSync(mainJsPath, 'utf8')),
-  );
-  const cert = getRelayCertStatusReadonly();
+  // lightweight 模式跳过 readFileSync(main.js) — 文件可能数 MB，includes 搜索会阻塞事件循环
+  const mainJsAllowsProxy = lightweight
+    ? null // 轻量模式不读取 main.js 内容，补丁状态未知
+    : Boolean(
+      mainJsPath &&
+      fs.existsSync(mainJsPath) &&
+      hasProxyWhitelist(fs.readFileSync(mainJsPath, 'utf8')),
+    );
+  // lightweight 模式跳过 getRelayCertStatusReadonly — 内部 listInstalledRelayCas 用 spawnSync 调 PowerShell 无 timeout
+  const cert = lightweight
+    ? (() => {
+      try {
+        const { getRelayCertPaths, ensureRelayCertificates } = require('./cursor-relay-cert');
+        ensureRelayCertificates();
+        const paths = getRelayCertPaths();
+        const fileExists = (p) => { try { return fs.existsSync(p) && fs.statSync(p).size > 0; } catch { return false; } };
+        return {
+          dataDir: paths.dataDir,
+          caCertPath: paths.caCertPath,
+          caKeyPath: paths.caKeyPath,
+          leafCertPath: paths.leafCertPath,
+          leafKeyPath: paths.leafKeyPath,
+          fullChainCertPath: paths.fullChainCertPath,
+          caReady: fileExists(paths.caCertPath) && fileExists(paths.caKeyPath),
+          leafReady: fileExists(paths.leafCertPath) && fileExists(paths.leafKeyPath),
+          caInstalled: null,
+          caTrustMatching: null,
+          caTrustStale: null,
+          caTrustExtraStale: null,
+          caTrustNeedsCleanup: null,
+          caFileThumbprint: null,
+          installHint: '(lightweight 模式跳过证书库检查)',
+          lightweight: true,
+        };
+      } catch {
+        return { caInstalled: null, lightweight: true };
+      }
+    })()
+    : getRelayCertStatusReadonly();
+  const mockProxy = getPlanUiMockState();
   const inferredPort = parseLocalProxyPort(argv.data['proxy-server'])
     || parseLocalProxyPort(systemProxy?.cursorSettings?.httpProxy)
-    || DEFAULT_PORT;
-  const runner = await getLocalRelayRunnerStatus({ port: inferredPort });
+    || 0;
+  const runnerProbe = await probeRelayRunnerByCandidates([
+    lastRunnerConfig?.port,
+    inferredPort,
+    DEFAULT_PORT,
+  ]);
+  const runner = runnerProbe.status;
+  const relayPort = resolveCanonicalRelayPort({
+    status: {
+      runner,
+      configuredProxyPort: inferredPort,
+    },
+    lastConfig: lastRunnerConfig,
+  });
   const logPaths = getRunnerLogPaths();
   const log = lightweight
     ? {
@@ -586,7 +820,22 @@ async function readCursorRelayProxyConfig(options = {}) {
     ? null
     : await readModelProxyConfig({ quick: true }).catch(() => null);
   const transparent = readTransparentHostsStatus({ skipElevation: lightweight });
-  const reviewBridgePatch = readRelayReviewBridgePatchStatus(mainJsPath);
+  // lightweight 模式跳过 readRelayReviewBridgePatchStatus — 内部 readFileSync(workbench.desktop.main.js) 44MB
+  const reviewBridgePatch = lightweight
+    ? (() => {
+      try {
+        const workbenchPath = resolveWorkbenchDesktopMainJsPath(mainJsPath);
+        return {
+          exists: Boolean(workbenchPath),
+          workbenchPath: String(workbenchPath || ''),
+          reviewBridgePatched: null,
+          lightweight: true,
+        };
+      } catch {
+        return { exists: false, workbenchPath: '', reviewBridgePatched: null, lightweight: true };
+      }
+    })()
+    : readRelayReviewBridgePatchStatus(mainJsPath);
   const reviewBridgeRuntime = lightweight
     ? {
       exists: Boolean(reviewBridgePatch.exists),
@@ -603,12 +852,18 @@ async function readCursorRelayProxyConfig(options = {}) {
     argvExists: argv.exists,
     mainJsPath: mainJsPath || '',
     mainJsAllowsProxy,
-    enabled: Boolean(argv.data['proxy-server'] || argv.data['proxy-pac-url']),
+    enabled: Boolean(
+      argv.data['proxy-server']
+      || argv.data['proxy-pac-url']
+      || systemProxy?.cursorSettings?.httpProxy
+      || modelProxy?.config?.baseUrl,
+    ),
     proxyServer: String(argv.data['proxy-server'] || '').trim(),
     proxyPacUrl: String(argv.data['proxy-pac-url'] || '').trim(),
     proxyBypassList: String(argv.data['proxy-bypass-list'] || '').trim(),
     noProxyServer: Boolean(argv.data['no-proxy-server']),
-    frontProxyPort: inferredPort,
+    frontProxyPort: relayPort,
+    configuredProxyPort: inferredPort || relayPort,
     cursorRunning: lightweight ? Boolean(runner.running) : isCursorRunningHeuristic(),
     argv: {
       path: argv.argvPath,
@@ -619,6 +874,7 @@ async function readCursorRelayProxyConfig(options = {}) {
       noProxyServer: Boolean(argv.data['no-proxy-server']),
     },
     cert,
+    mockProxy,
     runner: {
       ...runner,
       logPath: runner.logPath || logPaths.primary,
@@ -651,6 +907,7 @@ async function readCursorRelayProxyConfig(options = {}) {
 }
 
 async function applyCursorRelayProxyConfig(payload = {}) {
+  await stopPlanUiMockProxy().catch(() => null);
   const requestedRestartCursor = payload.restartCursor === true;
   const reloadCursor = payload.reloadCursor === true && payload.allowWindowFocusSwitch === true;
   const bypassList = String(payload.proxyBypassList || DEFAULT_PROXY_BYPASS_LIST).trim() || DEFAULT_PROXY_BYPASS_LIST;
@@ -661,6 +918,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   const frontProxyPort = Number(payload.frontProxyPort || payload.proxyPort || payload.runnerPort || DEFAULT_PORT);
   const disableHttp2 = payload.disableHttp2 !== false;
   const proxyStrictSSL = payload.proxyStrictSSL === true;
+  const skipCursorAuthEnsure = payload.skipCursorAuthEnsure === true;
   const enableReviewBridge = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge')
     ? payload.enableReviewBridge === true
     : DEFAULT_ENABLE_REVIEW_BRIDGE;
@@ -711,23 +969,15 @@ async function applyCursorRelayProxyConfig(payload = {}) {
 
   let runner = null;
   let cursorAuthEnsure = null;
-  if (upstream && runnerMode !== 'official_passthrough' && payload.ensureCursorAuth !== false && payload.skipCursorAuthEnsure !== true) {
-    cursorAuthEnsure = await ensureCursorAuthIfNeeded(
-      payload.cursorAuth && typeof payload.cursorAuth === 'object' ? payload.cursorAuth : undefined,
-    );
-    if (cursorAuthEnsure?.reason === 'missing_local_guest') {
-      throw new Error('Cursor 未登录且未找到本地免登账号，请配置 desktop/js/utils/users.json（email + token）');
-    }
-    if (cursorAuthEnsure?.reason === 'state_vscdb_missing') {
-      throw new Error('state.vscdb 不存在，请先启动一次 Cursor');
-    }
-  }
   if (upstream || runnerMode === 'official_passthrough') {
     const officialPassthrough = runnerMode === 'official_passthrough';
     const localNativeAgentTools = officialPassthrough ? false : true;
     const structuredAgentToolCalls = officialPassthrough ? false : payload.structuredAgentToolCalls !== false;
     if (installCert) {
-      certInstallResult = installRelayCaCertificate();
+      certInstallResult = installRelayCaCertificate(undefined, {
+        installMachineStore: payload.installMachineCert !== false,
+        requireMachineStore: payload.requireMachineCert !== false,
+      });
       if (!certInstallResult?.installed) {
         throw new Error(certInstallResult?.message || 'Relay CA certificate install failed.');
       }
@@ -736,6 +986,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
       mode: runnerMode,
       ...(upstream ? { upstream } : {}),
       modelRoutes: sanitizeRelayModelRoutes(payload.modelRoutes),
+      completionModel: String(payload.completionModel || upstream?.completionModel || '').trim(),
       port: frontProxyPort,
       forceRestartRunner: payload.forceRestartRunner === true,
       directMitmPort,
@@ -751,11 +1002,26 @@ async function applyCursorRelayProxyConfig(payload = {}) {
       modelCatalogSyncResult = await syncCursorRelayModelCatalog({
         modelName: upstream.modelName,
         availableModels: upstream.availableModels,
+        contextWindow: upstream.contextWindow,
+        reasoningEffort: upstream.reasoningEffort,
       }).catch((error) => ({
         ok: false,
         skipped: false,
         error: error?.message || String(error || 'sync model catalog failed'),
       }));
+      const providerBaseUrl = `http://127.0.0.1:${frontProxyPort}/v1`;
+      const providerApiKey = String(payload.localProviderApiKey || payload.openAIApiKey || 'cursor-relay-local').trim() || 'cursor-relay-local';
+      await syncCursorRelayProviderConfig({
+        enabled: true,
+        baseUrl: providerBaseUrl,
+        apiKey: providerApiKey,
+      }).catch((error) => {
+        modelCatalogSyncResult = {
+          ...(modelCatalogSyncResult && typeof modelCatalogSyncResult === 'object' ? modelCatalogSyncResult : {}),
+          providerSyncError: error?.message || String(error || 'sync provider config failed'),
+        };
+        return null;
+      });
     }
   } else {
     runner = await getLocalRelayRunnerStatus({ port: frontProxyPort });
@@ -786,6 +1052,27 @@ async function applyCursorRelayProxyConfig(payload = {}) {
     }
   }
 
+  if (!skipCursorAuthEnsure && runnerMode !== 'official_passthrough') {
+    const explicitCredentials =
+      payload.credentials && typeof payload.credentials === 'object'
+        ? payload.credentials
+        : (payload.cursorAuthCredentials && typeof payload.cursorAuthCredentials === 'object'
+          ? payload.cursorAuthCredentials
+          : null);
+    cursorAuthEnsure = await ensureCursorAccount({
+      allowRunningCursor: true,
+      ...(explicitCredentials ? { credentials: explicitCredentials } : {}),
+    });
+    if (!cursorAuthEnsure?.ok) {
+      cursorAuthEnsure = await ensureCursorAuthIfNeeded(explicitCredentials || undefined).catch((error) => ({
+        ok: false,
+        skipped: false,
+        reason: 'fallback_failed',
+        error: error?.message || String(error || 'ensure cursor auth failed'),
+      }));
+    }
+  }
+
   proxyServer = String(payload.proxyServer || runner.proxyServer || '').trim();
   proxyPacUrl = String(payload.proxyPacUrl || '').trim();
   if (!proxyServer && !proxyPacUrl) {
@@ -795,11 +1082,11 @@ async function applyCursorRelayProxyConfig(payload = {}) {
 
   if (restartCursor && isCursorRunningHeuristic()) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
     if (isCursorRunningHeuristic()) {
       const { killCursorForce } = require('./cursor-process');
       killCursorForce();
-      await sleep(1500);
+      await sleep(500);
     }
   }
 
@@ -817,19 +1104,14 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   }
 
   patchResult = patchProxySupportInMainJs();
-  try {
-    reviewBridgePatchResult = enableReviewBridge
-      ? patchRelayReviewBridgeInWorkbench(patchResult.mainJsPath)
-      : restoreRelayReviewBridgeInWorkbench(patchResult.mainJsPath);
-  } catch (error) {
-    reviewBridgePatchResult = {
-      ok: false,
-      changed: false,
-      alreadyPatched: false,
-      workbenchPath: '',
-      error: error?.message || String(error || 'review bridge patch failed'),
-    };
-  }
+  reviewBridgePatchResult = {
+    ok: true,
+    changed: false,
+    skipped: true,
+    alreadyPatched: false,
+    requested: enableReviewBridge,
+    ...readRelayReviewBridgePatchStatus(patchResult.mainJsPath),
+  };
   const argv = readArgvJson();
   const next = { ...argv.data };
 
@@ -863,7 +1145,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   let restarted = false;
   let cursorWindowReady = null;
   let reloaded = false;
-  const runtimePatchChanged = Boolean(patchResult?.changed || reviewBridgePatchResult?.changed);
+  const runtimePatchChanged = Boolean(patchResult?.changed);
   const certNeedsCursorRestart = Boolean(
     !restartCursor
     && certInstallResult?.installed
@@ -893,24 +1175,15 @@ async function applyCursorRelayProxyConfig(payload = {}) {
     });
     restarted = Boolean(launch?.ok);
     cursorWindowReady = null;
-  } else if (runtimePatchChanged && enableReviewBridge && isCursorRunningHeuristic()) {
+  } else if (runtimePatchChanged && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
     if (reloaded) {
-      const patchedWorkbenchPath = String(reviewBridgePatchResult?.workbenchPath || '').trim();
-      let workbenchMtimeMs = 0;
-      if (patchedWorkbenchPath && fs.existsSync(patchedWorkbenchPath)) {
-        try {
-          workbenchMtimeMs = Number(fs.statSync(patchedWorkbenchPath).mtimeMs) || 0;
-        } catch {
-          workbenchMtimeMs = 0;
-        }
-      }
       writeRelayRuntimeState({
         reviewBridgeReloadedAt: Date.now(),
-        reviewBridgeWorkbenchPath: patchedWorkbenchPath,
-        reviewBridgeWorkbenchMtimeMs: workbenchMtimeMs,
+        reviewBridgeWorkbenchPath: '',
+        reviewBridgeWorkbenchMtimeMs: 0,
       });
-      await sleep(1500);
+      await sleep(800);
     }
   } else if (!runtimePatchChanged && reloadCursor && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
@@ -962,8 +1235,8 @@ async function applyCursorRelayProxyConfig(payload = {}) {
 
 async function restartRelayRunnerAfterCertRepair(payload = {}) {
   const status = await readCursorRelayProxyConfig({ lightweight: true });
-  const port = Number(payload.frontProxyPort || payload.proxyPort || status.frontProxyPort || DEFAULT_PORT);
   const lastConfig = readLastRelayRunnerConfig();
+  const port = resolveCanonicalRelayPort({ payload, status, lastConfig, ignoreExplicit: true });
   const upstream = sanitizeRelayUpstream(payload.upstream) || sanitizeRelayUpstream(lastConfig?.upstream);
   const mode = String(payload.mode || lastConfig?.mode || status.runner?.mode || 'local_relay').trim() || 'local_relay';
   const shouldRestart = status.enabled || status.runner?.running || Boolean(upstream) || mode === 'official_passthrough';
@@ -991,7 +1264,7 @@ async function restartRelayRunnerAfterCertRepair(payload = {}) {
       mode,
       enableReviewBridge: Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge')
         ? payload.enableReviewBridge === true
-        : status.runner?.enableReviewBridge ?? lastConfig?.enableReviewBridge,
+        : DEFAULT_ENABLE_REVIEW_BRIDGE,
     });
     const runner = await startLocalRelayRunner({
       mode,
@@ -1046,7 +1319,10 @@ async function repairRelayCertificatesFull(payload = {}) {
 }
 
 async function installRelayCaCertificateFull(payload = {}) {
-  const install = installRelayCaCertificate(payload.customRoot);
+  const install = installRelayCaCertificate(payload.customRoot, {
+    installMachineStore: payload.installMachineCert !== false,
+    requireMachineStore: payload.requireMachineCert !== false,
+  });
   const changedTrust = Boolean(
     install.installed
     && (!install.alreadyInstalled || install.removedStale?.removed || payload.forceRestartCursor === true)
@@ -1071,14 +1347,18 @@ async function installRelayCaCertificateFull(payload = {}) {
 
 async function ensureCursorRelayRunner(payload = {}) {
   const status = await readCursorRelayProxyConfig({ lightweight: true });
-  const port = Number(payload.frontProxyPort || payload.proxyPort || payload.runnerPort || status.frontProxyPort || DEFAULT_PORT);
-  const hasReviewBridgePreference = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge');
   const lastConfig = readLastRelayRunnerConfig();
+  const port = resolveCanonicalRelayPort({ payload, status, lastConfig, ignoreExplicit: true });
+  const hasReviewBridgePreference = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge');
+  const restoreMode = String(
+    payload.mode
+    || lastConfig?.mode
+    || status.runner?.mode
+    || 'local_relay',
+  ).trim() || 'local_relay';
   const desiredReviewBridge = hasReviewBridgePreference
     ? payload.enableReviewBridge === true
-    : status.runner?.running
-      ? Boolean(status.runner?.enableReviewBridge)
-      : lastConfig?.enableReviewBridge === true;
+    : DEFAULT_ENABLE_REVIEW_BRIDGE;
   if (
     status.runner?.running
     && Number(status.runner?.port || port) === port
@@ -1100,7 +1380,7 @@ async function ensureCursorRelayRunner(payload = {}) {
   }
 
   const startOptions = buildRelayStartOptionsFromConfig(lastConfig, {
-    mode: payload.mode || 'local_relay',
+    mode: restoreMode,
     directMitmPort: payload.directMitmPort,
     localNativeAgentTools: payload.localNativeAgentTools,
     structuredAgentToolCalls: payload.structuredAgentToolCalls,
@@ -1125,6 +1405,56 @@ async function ensureCursorRelayRunner(payload = {}) {
   };
 }
 
+async function realignCursorRelayProxyTargets(payload = {}) {
+  const status = await readCursorRelayProxyConfig({ lightweight: false });
+  const runner = status?.runner || {};
+  const lastConfig = readLastRelayRunnerConfig();
+  const relayPort = resolveCanonicalRelayPort({
+    payload,
+    status: {
+      ...status,
+      runner,
+    },
+    lastConfig,
+    preferExplicit: true,
+  });
+  const proxyServer = `http://127.0.0.1:${relayPort}`;
+  const bypassList = String(payload.proxyBypassList || status.proxyBypassList || DEFAULT_PROXY_BYPASS_LIST).trim() || DEFAULT_PROXY_BYPASS_LIST;
+  const shouldRepair = payload.force === true || !isRelayAlignedConfig(status);
+  if (!shouldRepair) {
+    return {
+      ok: true,
+      changed: false,
+      proxyServer,
+      status,
+      message: 'Relay 代理入口已对齐，无需修复。',
+    };
+  }
+
+  const argv = readArgvJson();
+  const next = { ...argv.data };
+  next['proxy-server'] = proxyServer;
+  next['proxy-bypass-list'] = bypassList;
+  delete next['proxy-pac-url'];
+  delete next['no-proxy-server'];
+  const argvPath = writeArgvJson(next);
+  const cursorSettings = applyCursorHttpProxySettings(proxyServer, {
+    disableHttp2: true,
+    proxyStrictSSL: false,
+  });
+  const refreshed = await readCursorRelayProxyConfig({ lightweight: true });
+  return {
+    ok: true,
+    changed: true,
+    proxyServer,
+    argvPath,
+    cursorSettings,
+    windows: { ok: true, skipped: true, message: '未修改 Windows 系统代理。' },
+    status: refreshed,
+    message: '已强制把 Cursor argv/settings 重新对齐到本地 Relay，未修改 Windows 系统代理。',
+  };
+}
+
 async function quickSwitchRelayModel(payload = {}) {
   const profileId = String(payload.profileId || '').trim();
   if (!profileId) throw new Error('缺少 profileId');
@@ -1134,6 +1464,7 @@ async function quickSwitchRelayModel(payload = {}) {
     ? store.configs.find((item) => String(item?.id || '') === profileId)
     : null;
   if (!profile) throw new Error('未找到要切换的本地模型配置');
+  appendRunnerLog(`[info] quickSwitch request profileId=${profileId} model=${String(profile?.modelName || '')}`, '');
 
   const upstream = relayProfileToUpstream(profile);
   if (!upstream) throw new Error('目标模型配置不完整，请检查 Base URL、API Key 和模型名');
@@ -1141,25 +1472,78 @@ async function quickSwitchRelayModel(payload = {}) {
   store.activeId = profileId;
   saveRelayProfileStore(store, '');
 
+  await syncCursorRelayModelCatalog({
+    modelName: profile.modelName,
+    availableModels: Array.isArray(store.configs)
+      ? store.configs.map((item) => String(item?.modelName || '').trim()).filter(Boolean)
+      : [profile.modelName],
+    contextWindow: profile.contextWindow,
+    reasoningEffort: profile.reasoningEffort,
+  }).catch(() => null);
+  await syncCursorRelayProviderConfig({
+    enabled: true,
+    baseUrl: 'http://127.0.0.1:17789/v1',
+    apiKey: 'cursor-relay-local',
+  }).catch(() => null);
+
   const modelRoutes = buildRelayModelRoutesFromStore(store);
   const status = await readCursorRelayProxyConfig({ lightweight: true });
   const relayEnabled = Boolean(status?.enabled);
+  const currentMode = String(status?.runner?.mode || '').trim();
+  const switchingFromOfficialPassthrough = currentMode === 'official_passthrough';
+  const currentRunnerModelNames = new Set([
+    ...(
+      Array.isArray(status?.runner?.modelRoutes)
+        ? status.runner.modelRoutes.map((item) => String(item?.modelName || '').trim()).filter(Boolean)
+        : []
+    ),
+    String(status?.runner?.upstream?.modelName || '').trim(),
+    String(status?.runner?.upstreamModelName || '').trim(),
+  ].filter(Boolean));
+  const activeRunnerUpstream = status?.runner?.upstream && typeof status.runner.upstream === 'object'
+    ? status.runner.upstream
+    : null;
+  const sameRunnerUpstream = isSameRelayUpstreamConfig(activeRunnerUpstream, upstream);
+  const sameCompletionModel = String(status?.runner?.completionModel || '') === String(profile.completionModel || '');
+
+  if (
+    relayEnabled
+    && status?.runner?.running
+    && !switchingFromOfficialPassthrough
+    && (currentMode === 'local_relay' || !currentMode)
+    && currentRunnerModelNames.has(String(profile.modelName || '').trim())
+    && sameRunnerUpstream
+    && sameCompletionModel
+  ) {
+    appendRunnerLog(`[info] quickSwitch hot-switch profileId=${profileId} model=${String(profile.modelName || '')} runnerRestart=0`, '');
+    return {
+      ok: true,
+      hotSwitched: true,
+      enabledFromOff: false,
+      skippedRunnerRestart: true,
+      profile,
+      relay: status,
+    };
+  }
+
   if (!relayEnabled) {
+    appendRunnerLog(`[info] quickSwitch cold-start profileId=${profileId} model=${String(profile.modelName || '')}`, '');
     const applied = await applyCursorRelayProxyConfig({
       upstream,
       modelRoutes,
+      completionModel: profile.completionModel || upstream.completionModel || '',
       forceRestartRunner: false,
       restartCursor: false,
       reloadCursor: false,
       installCert: false,
-      useSystemProxy: false,
       disableByok: true,
       mode: 'local_relay',
       localNativeAgentTools: true,
       structuredAgentToolCalls: true,
       emitLocalToolInteractionFrames: true,
-      enableReviewBridge: status?.runner?.enableReviewBridge === true,
-      skipCursorAuthEnsure: true,
+      emitLocalStepFrames: true,
+      enableReviewBridge: DEFAULT_ENABLE_REVIEW_BRIDGE,
+      useSystemProxy: false,
     });
     return {
       ok: true,
@@ -1170,22 +1554,38 @@ async function quickSwitchRelayModel(payload = {}) {
     };
   }
 
+  appendRunnerLog(
+    `[info] quickSwitch fallback-apply profileId=${profileId} model=${String(profile.modelName || '')} mode=${switchingFromOfficialPassthrough ? 'official_to_local' : (currentMode || 'local_relay')}`,
+    '',
+  );
   const applied = await applyCursorRelayProxyConfig({
     upstream,
     modelRoutes,
-    forceRestartRunner: relayEnabled,
+    completionModel: profile.completionModel || upstream.completionModel || '',
+    forceRestartRunner: false,
     restartCursor: false,
     reloadCursor: false,
     installCert: false,
-    useSystemProxy: false,
     disableByok: true,
-    mode: status?.runner?.mode || 'local_relay',
-    localNativeAgentTools: status?.runner?.localNativeAgentTools !== false,
-    structuredAgentToolCalls: status?.runner?.structuredAgentToolCalls !== false,
-    emitLocalToolInteractionFrames: status?.runner?.emitLocalToolInteractionFrames !== false,
+    mode: switchingFromOfficialPassthrough ? 'local_relay' : (currentMode || 'local_relay'),
+    localNativeAgentTools: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.localNativeAgentTools !== false,
+    structuredAgentToolCalls: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.structuredAgentToolCalls !== false,
+    nativeMutationTools: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.nativeMutationTools !== false,
+    emitLocalToolInteractionFrames: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.emitLocalToolInteractionFrames !== false,
+    emitLocalStepFrames: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.emitLocalStepFrames === true,
     maxLocalToolCallsPerRound: status?.runner?.maxLocalToolCallsPerRound || 12,
-    enableReviewBridge: status?.runner?.enableReviewBridge === true,
-    skipCursorAuthEnsure: true,
+    enableReviewBridge: DEFAULT_ENABLE_REVIEW_BRIDGE,
+    useSystemProxy: false,
   });
   return {
     ok: true,
@@ -1201,12 +1601,15 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   const reloadCursor = payload.reloadCursor === true && payload.allowWindowFocusSwitch === true;
   const transparentHosts = clearTransparentHosts();
   const clearSystemProxy = payload.clearSystemProxy === true;
+  await stopPlanUiMockProxy().catch(() => null);
   clearRelayRuntimeState();
   const cursorWasRunning = isCursorRunningHeuristic();
+  const resetActiveAgentConversation = payload.resetActiveAgentConversation !== false && cursorWasRunning && !restartCursor;
+  const stopRunnerFast = payload.fast === true && !resetActiveAgentConversation;
 
   if (restartCursor && cursorWasRunning) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
   }
 
   const argv = readArgvJson();
@@ -1223,12 +1626,20 @@ async function disableCursorRelayProxyConfig(payload = {}) {
       skipped: true,
     };
   const mainJsRestoreResult = restoreProxySupportInMainJs();
-  const reviewBridgeRestoreResult = restoreRelayReviewBridgeInWorkbench();
+  const reviewBridgeRestoreResult = {
+    ok: true,
+    changed: false,
+    skipped: true,
+    alreadyRestored: false,
+    requested: false,
+    ...readRelayReviewBridgePatchStatus(mainJsRestoreResult?.mainJsPath),
+  };
 
   let restarted = false;
   let reloaded = false;
   let runnerStopped = false;
-  const runtimePatchChanged = Boolean(mainJsRestoreResult?.changed || reviewBridgeRestoreResult?.changed);
+  let agentConversationReset = { ok: false, skipped: true, message: '未请求切换 Agent 对话' };
+  const runtimePatchChanged = Boolean(mainJsRestoreResult?.changed);
   if (restartCursor) {
     const launch = launchCursorApp({
       extraCaCertPath: getRelayCertStatusReadonly().caCertPath,
@@ -1237,7 +1648,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
     await stopLocalRelayRunner();
     runnerStopped = true;
   } else if (payload.fast === true || payload.stopRunner === true || payload.stopRunner !== false) {
-    await stopLocalRelayRunner({ fast: payload.fast === true });
+    await stopLocalRelayRunner({ fast: stopRunnerFast });
     runnerStopped = true;
   } else if (!runtimePatchChanged && reloadCursor && isCursorRunningHeuristic()) {
     reloaded = reloadRunningCursorWindow();
@@ -1246,6 +1657,11 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   if (!restartCursor && !isCursorRunningHeuristic()) {
     await stopLocalRelayRunner();
     runnerStopped = true;
+  }
+
+  if (resetActiveAgentConversation) {
+    await sleep(80);
+    agentConversationReset = startNewCursorAgentConversation();
   }
 
   const status = await readCursorRelayProxyConfig({ lightweight: true });
@@ -1257,6 +1673,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
     runnerStopped,
     hotSwitched: !restartCursor && !runtimePatchChanged,
     requiresCursorRestart: runtimePatchChanged,
+    agentConversationReset,
     mainJsRestoreResult,
     reviewBridgeRestoreResult,
     systemProxy: systemProxyResult,
@@ -1270,8 +1687,47 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   };
 }
 
+/**
+ * [DIAG] 代为请求 runner 进程的内部诊断状态
+ * runner 是 fork 的子进程，它的 proto root / auth 拦截 / 模型注入 / state guard /
+ * profile store / mode registry 状态只有 runner 自己知道。
+ * main 进程通过 HTTP fetch runner 的 /__cursorpool__/diagnostics 端点代为获取，
+ * 这样 renderer 只需调 cursorRelay:diagnose IPC 即可拿到全部状态，无需自己探测端口。
+ */
+function fetchRunnerInternals(port, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (val) => {
+      if (!settled) { settled = true; resolve(val); }
+    };
+    const req = http.get({
+      hostname: '127.0.0.1',
+      port,
+      path: '/__cursorpool__/diagnostics',
+      timeout: timeoutMs,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        try {
+          const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          done({ ok: res.statusCode === 200, statusCode: res.statusCode, payload });
+        } catch (e) {
+          done({ ok: false, statusCode: res.statusCode, error: `JSON parse: ${e.message}` });
+        }
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      done({ ok: false, error: `timeout (${timeoutMs}ms)` });
+    });
+    req.on('error', (e) => done({ ok: false, error: e.message }));
+  });
+}
+
 async function buildRelayDiagnostics() {
-  const status = await readCursorRelayProxyConfig();
+  // 用 lightweight 模式避免 getCursorProcessSnapshot(spawnSync 10s) 和 readModelProxyConfig 阻塞 main 事件循环
+  const status = await readCursorRelayProxyConfig({ lightweight: true });
   const log = await readRunnerLogTail('', 60);
   const stats = status.runner?.stats || log.stats || {};
   const connectMitm = Number(stats.connectMitm || 0);
@@ -1281,8 +1737,9 @@ async function buildRelayDiagnostics() {
   const seenBidi = Number(stats.seenBidiAppend || 0);
   const seenUser = Number(stats.seenBidiUserMessage || 0);
   const chatTotal = Number(stats.chatTotal || 0);
-  const transparent = status.transparent || readTransparentHostsStatus();
-  const tcpSnapshot = snapshotCursorTcpConnections();
+  const transparent = status.transparent || {};
+  // 异步 TCP 快照（3s 超时），避免 execFileSync 15s 同步阻塞导致 IPC 8s 超时
+  const tcpSnapshot = await snapshotCursorTcpConnectionsAsync(3000);
 
   const recentPaths = Array.isArray(stats.recentPaths) ? stats.recentPaths : [];
   const connectHosts = stats.connectHosts && typeof stats.connectHosts === 'object'
@@ -1296,8 +1753,10 @@ async function buildRelayDiagnostics() {
 
   if (!status.runner?.running) issues.push('本地 runner 未运行');
   if (!status.enabled) issues.push('argv.json 未配置 proxy-server');
-  if (!status.mainJsAllowsProxy) issues.push('Cursor main.js 未打代理白名单补丁');
-  if (!status.cert?.caInstalled) issues.push('MITM 根证书未安装到系统信任库');
+  // lightweight 模式下 mainJsAllowsProxy=null，不检查补丁状态
+  if (status.mainJsAllowsProxy === false) issues.push('Cursor main.js 未打代理白名单补丁');
+  // lightweight 模式下 caInstalled=null，不检查证书信任
+  if (status.cert?.caInstalled === false) issues.push('MITM 根证书未安装到系统信任库');
   if (status.cursorRunning && !status.argv?.proxyServer) {
     issues.push('Cursor 正在运行但 argv 里没有 proxy-server（需完全重启 Cursor）');
   }
@@ -1414,11 +1873,11 @@ async function buildRelayDiagnostics() {
     `settings cursor.general.disableHttp2: ${String(status.systemProxy?.cursorSettings?.disableHttp2)}`,
     `settings http.proxyStrictSSL: ${String(status.systemProxy?.cursorSettings?.proxyStrictSSL)}`,
     `Windows 系统代理: ${status.systemProxy?.windows?.enabled ? status.systemProxy.windows.server : '未启用'}`,
-    `main.js 补丁: ${status.mainJsAllowsProxy ? '已打' : '未打'}`,
-    `workbench review bridge: ${status.reviewBridgePatch?.reviewBridgePatched ? '已打' : '未打'}`,
-    `workbench 已加载到当前 Cursor: ${status.reviewBridgeRuntime?.loadedInRunningCursor === true ? '是' : status.reviewBridgeRuntime?.requiresCursorRestart ? '否（需重启）' : '-'}`,
-    `MITM 证书: ${status.cert?.caInstalled ? '已信任' : '未信任'}`,
+    `MITM 证书: ${status.cert?.lightweight === true && status.cert?.caInstalled === null ? '已生成（轻量模式）' : status.cert?.caInstalled ? '已信任' : '未信任'}`,
     `Cursor 进程: ${status.cursorRunning ? '运行中' : '未运行'}`,
+    `main.js 补丁: ${status.mainJsAllowsProxy === null ? '（轻量模式跳过）' : status.mainJsAllowsProxy ? '已打' : '未打'}`,
+    `workbench review bridge: ${status.reviewBridgePatch?.reviewBridgePatched === null ? '（轻量模式跳过）' : status.reviewBridgePatch?.reviewBridgePatched ? '已打' : '未打'}`,
+    `workbench 已加载到当前 Cursor: ${status.reviewBridgeRuntime?.loadedInRunningCursor === true ? '是' : status.reviewBridgeRuntime?.requiresCursorRestart ? '否（需重启）' : '-'}`,
     '',
     '[MITM 域名统计]',
     ...Object.entries(connectHosts).sort((a, b) => b[1] - a[1]).map(([host, count]) => `  ${host}: ${count}`),
@@ -1461,6 +1920,21 @@ async function buildRelayDiagnostics() {
     diagnosePath = '';
   }
 
+  // [DIAG] 代为请求 runner 进程的内部诊断状态（proto root / auth 拦截 / 模型注入 /
+  // state guard / profile store / mode registry）— 只有 runner 自己知道这些信息
+  let runnerInternals = null;
+  try {
+    const runnerPort = status.runner?.port;
+    if (runnerPort && status.runner?.running) {
+      const ri = await fetchRunnerInternals(runnerPort, 2000);
+      runnerInternals = ri.ok ? ri.payload : { error: ri.error || `HTTP ${ri.statusCode}` };
+    } else {
+      runnerInternals = { error: status.runner?.running ? 'no port' : 'runner not running' };
+    }
+  } catch (e) {
+    runnerInternals = { error: e.message };
+  }
+
   return {
     ok: true,
     text,
@@ -1474,6 +1948,9 @@ async function buildRelayDiagnostics() {
     connectHosts,
     chatLikelyBypassing: connectMitm > 5 && seenRunSse === 0 && seenBidi === 0,
     hasChatIntercept: chatTotal > 0 || log.hasChatIntercept,
+    runnerInternals,
+    runnerPort: status.runner?.port || 0,
+    runnerRunning: Boolean(status.runner?.running),
   };
 }
 
@@ -1481,7 +1958,7 @@ async function disableByokForRelay(payload = {}) {
   const restartCursor = payload.restartCursor !== false;
   if (restartCursor && isCursorRunningHeuristic()) {
     await quitCursorAndWait({ throwOnTimeout: false });
-    await sleep(800);
+    await sleep(300);
   }
   const cleared = await clearModelProxyConfigOnly();
   let restarted = false;
@@ -1575,6 +2052,7 @@ async function runRelayAgentDialogTest(payload = {}) {
   }
 
   const customPrompt = String(payload?.prompt || payload?.userPrompt || payload?.message || '').trim();
+  const requestedMode = String(payload?.mode || payload?.agentMode || 'AGENT_MODE_AGENT').trim() || 'AGENT_MODE_AGENT';
   const token = customPrompt ? '' : createRelayAgentTestToken();
   const prompt = customPrompt || buildRelayAgentTestPrompt(token);
   const port = Number(runner.port || DEFAULT_PORT);
@@ -1590,6 +2068,7 @@ async function runRelayAgentDialogTest(payload = {}) {
   const probe = await runRelayAgentConnectionTest({
     port,
     prompt,
+    mode: requestedMode,
     targetHosts,
     timeoutMs: customPrompt ? directTimeoutMs : Math.min(30000, directTimeoutMs),
   });
@@ -1664,12 +2143,136 @@ async function runRelayAgentDialogTest(payload = {}) {
   };
 }
 
+async function startRelayPlanUiMock(payload = {}) {
+  const scenario = String(payload.scenario || PLAN_UI_MOCK_SCENARIO).trim() || PLAN_UI_MOCK_SCENARIO;
+  const port = Number(payload.port || PLAN_UI_MOCK_PORT) || PLAN_UI_MOCK_PORT;
+  const bypassList = String(payload.proxyBypassList || DEFAULT_PROXY_BYPASS_LIST).trim() || DEFAULT_PROXY_BYPASS_LIST;
+  const restartCursor = payload.restartCursor === true;
+  const reloadCursor = payload.reloadCursor === true && payload.allowWindowFocusSwitch === true;
+
+  await stopPlanUiMockProxy().catch(() => null);
+  await stopLocalRelayRunner({ fast: true }).catch(() => null);
+
+  const certInstallResult = installRelayCaCertificate(undefined, {
+    installMachineStore: true,
+    requireMachineStore: true,
+  });
+  if (!certInstallResult?.installed) {
+    throw new Error(certInstallResult?.message || 'Plan UI Mock 证书安装失败。');
+  }
+
+  patchProxySupportInMainJs();
+  try {
+    restoreRelayReviewBridgeInWorkbench();
+  } catch {
+    /* ignore */
+  }
+
+  const mockLogPath = getPlanUiMockLogPath();
+  fs.mkdirSync(path.dirname(mockLogPath), { recursive: true });
+  const mockLogHeader = [
+    `# Mock Plan UI Log`,
+    `# Started: ${new Date().toISOString()}`,
+    `# Scenario: ${scenario}`,
+    '',
+  ].join('\n');
+  fs.writeFileSync(mockLogPath, mockLogHeader, 'utf8');
+  const mockStdout = fs.openSync(mockLogPath, 'a');
+  const mockStderr = fs.openSync(mockLogPath, 'a');
+
+  const child = fork(PLAN_UI_MOCK_SCRIPT, ['--port', String(port), '--scenario', scenario], {
+    stdio: ['ignore', mockStdout, mockStderr, 'ipc'],
+    detached: true,
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+    },
+  });
+  child.on('exit', () => {
+    if (planUiMockChild && planUiMockChild.pid === child.pid) {
+      planUiMockChild = null;
+      writeRelayRuntimeState({
+        mockProxyActive: false,
+        mockProxyPid: 0,
+        mockProxyPort: 0,
+        mockProxyScenario: '',
+        mockProxyStartedAt: 0,
+      });
+    }
+  });
+  try {
+    child.unref?.();
+    child.channel?.unref?.();
+  } catch {
+    /* ignore */
+  }
+  planUiMockChild = child;
+
+  writeRelayRuntimeState({
+    mockProxyActive: true,
+    mockProxyPid: child.pid || 0,
+    mockProxyPort: port,
+    mockProxyScenario: scenario,
+    mockProxyStartedAt: Date.now(),
+  });
+
+  await sleep(1200);
+
+  const argv = readArgvJson();
+  const next = { ...argv.data };
+  next['proxy-server'] = `http://127.0.0.1:${port}`;
+  next['proxy-bypass-list'] = bypassList;
+  delete next['proxy-pac-url'];
+  delete next['no-proxy-server'];
+  const argvPath = writeArgvJson(next);
+  const cursorSettingsResult = applyCursorHttpProxySettings(`http://127.0.0.1:${port}`, {
+    disableHttp2: true,
+    proxyStrictSSL: false,
+  });
+
+  let restarted = false;
+  let reloaded = false;
+  let cursorWindowReady = null;
+  if (restartCursor && isCursorRunningHeuristic()) {
+    await quitCursorAndWait({ throwOnTimeout: false });
+    await sleep(300);
+    const relayCert = getRelayCertStatusReadonly();
+    const launch = launchCursorApp({
+      proxyServer: `http://127.0.0.1:${port}`,
+      proxyBypassList: bypassList,
+      extraCaCertPath: relayCert.caCertPath,
+    });
+    restarted = Boolean(launch?.ok);
+    cursorWindowReady = restarted ? await waitForCursorWindowReady(45000) : null;
+  } else if (reloadCursor && isCursorRunningHeuristic()) {
+    reloaded = reloadRunningCursorWindow();
+  }
+
+  const status = await readCursorRelayProxyConfig({ lightweight: true });
+  return {
+    ok: true,
+    mode: 'plan_ui_mock',
+    scenario,
+    port,
+    proxyServer: `http://127.0.0.1:${port}`,
+    argvPath,
+    restarted,
+    reloaded,
+    cursorWindowReady,
+    certInstallResult,
+    cursorSettings: cursorSettingsResult,
+    mockProxy: status.mockProxy,
+    summary: `Plan UI Mock 已启动，当前代理切到 http://127.0.0.1:${port}，场景为 ${scenario}。`,
+  };
+}
+
 module.exports = {
   DEFAULT_PROXY_BYPASS_LIST,
   getCursorArgvJsonPath,
   readCursorRelayProxyConfig,
   applyCursorRelayProxyConfig,
   ensureCursorRelayRunner,
+  realignCursorRelayProxyTargets,
   quickSwitchRelayModel,
   disableCursorRelayProxyConfig,
   disableByokForRelay,
@@ -1689,4 +2292,5 @@ module.exports = {
   buildRelayDiagnostics,
   clearModelProxyConfigOnly,
   runRelayAgentDialogTest,
+  startRelayPlanUiMock,
 };

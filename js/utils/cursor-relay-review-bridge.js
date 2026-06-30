@@ -6,6 +6,8 @@ const REVIEW_BRIDGE_MARKER = '__cursorPoolRelayReviewBridge_v5';
 const REVIEW_BRIDGE_MARKER_FAMILY_REGEX = /__cursorPoolRelayReviewBridge(?:_v\d+)?/;
 const REVIEW_BRIDGE_EFFECT_ANCHOR = '},[a,V,t,i]);const Be=di(()=>{';
 const INLINE_DIFF_SERVICE_ANCHOR = 'this._userPlansDir=fV(this.pathService.userHome({preferLocal:!0})),this.experimentService.checkFeatureGate("inline_diffs_v2_adapter")';
+const INLINE_DIFF_SERVICE_ANCHOR_VARIANT = 'this._userPlansDir=UV(this.pathService.userHome({preferLocal:!0}));for(const D of edn.registeredActions)D(this.reactiveStorageService);';
+const INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316 = 'this._userPlansDir=qV(this.pathService.userHome({preferLocal:!0}));for(const D of ndn.registeredActions)D(this.reactiveStorageService);';
 const INLINE_DIFF_SERVICE_DELAYED_REGISTRATION = 'Yi(xF,i8a,1)';
 const INLINE_DIFF_SERVICE_EAGER_REGISTRATION = 'Yi(xF,i8a,0)';
 const REVIEW_EVENTS_PATH = '/__cursorpool__/review-events';
@@ -80,6 +82,24 @@ function restoreRelayReviewBridgePatchedText(text) {
     /this\._userPlansDir=fV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\),\(\(Ye,Xe\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,Xe\),this\.experimentService\.checkFeatureGate\("inline_diffs_v2_adapter"\)/,
     INLINE_DIFF_SERVICE_ANCHOR,
   );
+  restored = restored.replace(
+    /this\._userPlansDir=UV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\(Ye,Xe\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,De\),for\(const D of edn\.registeredActions\)D\(this\.reactiveStorageService\);/,
+    INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
+  );
+  restored = restored.replace(
+    /this\._userPlansDir=qV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\(Ye,Xe\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,Ye\),for\(const D of ndn\.registeredActions\)D\(this\.reactiveStorageService\);/,
+    INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
+  );
+  if (hasAnyRelayReviewBridgePatch(restored)) {
+    restored = restored.replace(
+      /this\._userPlansDir=qV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\([A-Za-z0-9_$]+,[A-Za-z0-9_$]+\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,[A-Za-z0-9_$]+\),for\(const D of ndn\.registeredActions\)D\(this\.reactiveStorageService\);/,
+      INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
+    );
+    restored = restored.replace(
+      /this\._userPlansDir=UV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\([A-Za-z0-9_$]+,[A-Za-z0-9_$]+\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,[A-Za-z0-9_$]+\),for\(const D of edn\.registeredActions\)D\(this\.reactiveStorageService\);/,
+      INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
+    );
+  }
   return restored;
 }
 
@@ -306,7 +326,7 @@ function buildRelayReviewBridgeEffect() {
   ].join('');
 }
 
-function buildInlineDiffServiceReviewBridgeBootstrap() {
+function buildInlineDiffServiceReviewBridgeBootstrap(uriHelperSymbol = 'Xe') {
   return [
     '((Ye,Xe)=>{',
     'try{',
@@ -421,7 +441,7 @@ function buildInlineDiffServiceReviewBridgeBootstrap() {
     'if(!Ze.pollStarted){Ze.pollStarted=!0;Nt("poll_boot","inlineDiffService review bridge polling started",{pollIntervalMs:1500,hasInlineDiffService:Boolean(ht),hasCmdKStateService:Boolean(vt)});ct();Ze.pollTimer=setInterval(ct,1500)}',
     'Nt("bridge_ready","inlineDiffService constructor",{hasInlineDiffService:Boolean(ht),hasCmdKStateService:Boolean(vt)});',
     '}catch(Ye2){try{console.warn("CursorPool relay review bridge failed",Ye2)}catch{}}',
-    '})(this,Xe)',
+    `})(this,${uriHelperSymbol})`,
   ].join('');
 }
 
@@ -450,16 +470,25 @@ function patchRelayReviewBridgeInWorkbench(explicitMainJsPath) {
   } else if (baseText.includes(INLINE_DIFF_SERVICE_ANCHOR)) {
     injected = baseText.replace(
       INLINE_DIFF_SERVICE_ANCHOR,
-      `this._userPlansDir=fV(this.pathService.userHome({preferLocal:!0})),${buildInlineDiffServiceReviewBridgeBootstrap()},this.experimentService.checkFeatureGate("inline_diffs_v2_adapter")`,
+      `this._userPlansDir=fV(this.pathService.userHome({preferLocal:!0})),${buildInlineDiffServiceReviewBridgeBootstrap('Xe')},this.experimentService.checkFeatureGate("inline_diffs_v2_adapter")`,
     );
     if (injected.includes(INLINE_DIFF_SERVICE_DELAYED_REGISTRATION)) {
       injected = injected.replace(INLINE_DIFF_SERVICE_DELAYED_REGISTRATION, INLINE_DIFF_SERVICE_EAGER_REGISTRATION);
     }
-  } else {
-    throw new Error('Unable to find relay review bridge injection point in workbench.desktop.main.js');
+  } else if (baseText.includes(INLINE_DIFF_SERVICE_ANCHOR_VARIANT)) {
+    injected = baseText.replace(
+      INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
+      `this._userPlansDir=UV(this.pathService.userHome({preferLocal:!0}));${buildInlineDiffServiceReviewBridgeBootstrap('De')}for(const D of edn.registeredActions)D(this.reactiveStorageService);`,
+    );
+  } else if (baseText.includes(INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316)) {
+    injected = baseText.replace(
+      INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
+      `this._userPlansDir=qV(this.pathService.userHome({preferLocal:!0}));${buildInlineDiffServiceReviewBridgeBootstrap('Ye')}for(const D of ndn.registeredActions)D(this.reactiveStorageService);`,
+    );
   }
+
   if (injected === baseText) {
-    throw new Error('Relay review bridge effect patch did not change workbench.desktop.main.js');
+    throw new Error('Unable to find relay review bridge injection point in workbench.desktop.main.js');
   }
 
   fs.writeFileSync(workbenchPath, injected, 'utf8');
@@ -527,6 +556,10 @@ function readRelayReviewBridgePatchStatus(explicitMainJsPath) {
 
 module.exports = {
   REVIEW_BRIDGE_MARKER,
+  REVIEW_BRIDGE_EFFECT_ANCHOR,
+  INLINE_DIFF_SERVICE_ANCHOR,
+  INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
+  INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
   resolveWorkbenchDesktopMainJsPath,
   hasRelayReviewBridgePatch,
   patchRelayReviewBridgeInWorkbench,

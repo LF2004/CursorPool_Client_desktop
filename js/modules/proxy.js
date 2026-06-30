@@ -7,6 +7,7 @@ import {
   PROVIDER_HINTS,
   PROVIDER_BASE_URLS,
   DEFAULT_CONTEXT_WINDOW,
+  MAX_CONTEXT_WINDOW,
   DEFAULT_REASONING_EFFORT,
   REASONING_EFFORT_OPTIONS,
   VALID_REASONING_EFFORTS,
@@ -41,6 +42,8 @@ const RELAY_BUTTON_IDS = [
   'relayOpenLogDirBtn',
   'relayViewLogBtn',
   'relayDiagnoseBtn',
+  'relayPlanUiMockBtn',
+  'relayExploreUiMockBtn',
   'relayOfficialCaptureBtn',
   'relayDisableByokBtn',
   'relayTestAllBtn',
@@ -52,6 +55,7 @@ const RELAY_BUTTON_IDS = [
 let relayBusyDepth = 0;
 let relayEnabled = false;
 let relayDisableInFlight = false;
+let relayAutoEnsurePromise = null;
 let upstreamProbePromise = null;
 let upstreamProbeCache = null;
 const UPSTREAM_PROBE_CACHE_MS = 45_000;
@@ -67,53 +71,12 @@ let relayFieldHintEl = null;
 let relayFieldHintTimer = null;
 const CONFIG_PAGE_SIZE = 6;
 const configPageByProvider = { openai: 1, anthropic: 1, deepseek: 1, gemini: 1, mimo: 1, custom: 1 };
-const RELAY_REVIEW_BRIDGE_STORAGE_KEY = 'cursor_relay_review_bridge_enabled_v1';
-
-function loadRelayReviewBridgePreference() {
-  try {
-    const raw = localStorage.getItem(RELAY_REVIEW_BRIDGE_STORAGE_KEY);
-    return raw == null ? false : raw === '1';
-  } catch {
-    return false;
-  }
-}
-
-function saveRelayReviewBridgePreference(enabled) {
-  try {
-    localStorage.setItem(RELAY_REVIEW_BRIDGE_STORAGE_KEY, enabled ? '1' : '0');
-  } catch {
-    /* ignore */
-  }
-}
-
-function isReviewBridgeRequested() {
-  return loadRelayReviewBridgePreference();
-}
-
 function syncReviewBridgeToggleFromStorage() {
-  const toggle = $('relayReviewBridgeToggle');
-  const badge = $('relayReviewBridgeBadge');
-  const hint = $('relayReviewBridgeHint');
-  const enabled = loadRelayReviewBridgePreference();
-  if (toggle) {
-    toggle.checked = enabled;
-    toggle.onchange = () => {
-      saveRelayReviewBridgePreference(toggle.checked);
-      paintReviewBridgeStatus();
-    };
-  }
-  toggle?.closest('.adv-inject-row')?.classList.remove('hidden');
-  badge?.classList.toggle('hidden', !enabled);
-  hint?.classList.remove('hidden');
+  // Review bridge injection is now managed manually in Preferences.
 }
 
 function paintReviewBridgeStatus() {
-  const badgeEl = $('relayReviewBridgeBadge');
-  const hintEl = $('relayReviewBridgeHint');
-  const enabled = loadRelayReviewBridgePreference();
-  badgeEl?.classList.toggle('hidden', !enabled);
-  hintEl?.classList.remove('hidden');
-  badgeEl?.closest('.adv-inject-row')?.classList.remove('hidden');
+  // Review bridge injection is now managed manually in Preferences.
 }
 
 function isRelayAdmin() {
@@ -191,8 +154,10 @@ function updateProfileTestStatus(id, patch) {
   const profile = getProfileById(profilesStore, id);
   if (!profile) return;
   profile.testStatus = { ...profile.testStatus, ...patch };
+  // 仅更新内存和 localStorage（upsertProfile 内部会写 localStorage）
+  // 不在此处触发 DB 写入，避免测试（尤其"测试全部"）时大量 IPC DB 写入阻塞主进程导致 UI 卡死
+  // localStorage 的 updatedAt 比 DB 新，loadProfilesStore 会自动检测并优先使用
   upsertProfile(profilesStore, profile);
-  void saveProfilesStore(profilesStore);
 }
 
 function formatProbeSeconds(ms) {
@@ -251,13 +216,16 @@ function renderConfigCard(profile) {
   const endpointText = profile.providerId === 'anthropic'
     ? ''
     : ` · ${escapeHtml(endpointLabel(profile.endpointMode))}`;
+  const completionText = profile.completionModel
+    ? ` · Tab ${escapeHtml(profile.completionModel)}`
+    : '';
 
   return `
     <article class="relay-config-card${isActive ? ' active' : ''}" data-config-id="${escapeHtml(profile.id)}">
       <div class="relay-card-head">
         <div class="relay-card-title-wrap">
           <h4 class="relay-card-name">${escapeHtml(profile.name)}</h4>
-          <p class="relay-card-model mono">${escapeHtml(profile.modelName || '未填模型')}${endpointText}${escapeHtml(thinkingText)}</p>
+          <p class="relay-card-model mono">${escapeHtml(profile.modelName || '未填模型')}${endpointText}${escapeHtml(thinkingText)}${completionText}</p>
         </div>
         <span class="relay-card-provider">
           ${providerIconHtml(profile.providerId)}
@@ -382,13 +350,22 @@ async function activateProfile(id) {
   if (!(await selectActiveProfile(id))) return;
 
   const bridge = window.electronBridge;
-  if (relayEnabled && bridge?.cursorRelayQuickSwitchModel) {
+  let relayRunning = relayEnabled;
+  if (bridge?.cursorRelayGetConfig) {
+    try {
+      const current = await bridge.cursorRelayGetConfig({ lightweight: true });
+      relayRunning = Boolean(current?.runner?.running || current?.enabled);
+      relayEnabled = relayRunning;
+    } catch {
+      /* ignore runtime state refresh failure */
+    }
+  }
+  if (relayRunning && bridge?.cursorRelayQuickSwitchModel) {
     try {
       await withRelayBusy('正在切换本地代理模型…', async () => {
         await bridge.cursorRelayQuickSwitchModel({ profileId: id });
       });
       void refreshRelayStatus().catch(() => null);
-      void getUpstreamProbeForEnable().catch(() => null);
       const active = getActiveProfile(profilesStore);
       await showAlert(
         `已切换为 ${describeProfile(active)}，Relay 已应用到新模型配置。`,
@@ -400,7 +377,7 @@ async function activateProfile(id) {
     return;
   }
 
-  if (relayEnabled) {
+  if (relayRunning) {
     const active = getActiveProfile(profilesStore);
     await showAlert(
       `已切换为 ${describeProfile(active)}。若 Relay 正在运行，请重新启用后才会应用到正在运行的代理。`,
@@ -525,6 +502,7 @@ function fillModalForm(profile) {
   setModalProviderTab(modalProviderId);
   if ($('relayModalName')) $('relayModalName').value = p.name || '';
   if ($('relayModalModel')) $('relayModalModel').value = p.modelName || '';
+  if ($('relayModalCompletionModel')) $('relayModalCompletionModel').value = p.completionModel || '';
   if ($('relayModalApiKey')) $('relayModalApiKey').value = p.apiKey || '';
   if ($('relayModalBaseUrl')) $('relayModalBaseUrl').value = p.baseUrl || PROVIDER_BASE_URLS[modalProviderId] || '';
   if ($('relayModalContext')) $('relayModalContext').value = String(p.contextWindow || DEFAULT_CONTEXT_WINDOW);
@@ -568,6 +546,9 @@ function collectModalFormProfile() {
   const inferredEndpointMode = modalProviderId === 'anthropic' || modalProviderId === 'gemini' || modalProviderId === 'mimo'
     ? 'chat'
     : inferEndpointModeFromBaseUrl(rawBaseUrl, selectedEndpointMode);
+  const rawContextWindow = Number(($('relayModalContext')?.value || '').trim() || DEFAULT_CONTEXT_WINDOW);
+  const contextWindow = Math.max(1, Math.min(MAX_CONTEXT_WINDOW, Number.isFinite(rawContextWindow) ? rawContextWindow : DEFAULT_CONTEXT_WINDOW));
+  if ($('relayModalContext')) $('relayModalContext').value = String(contextWindow);
   return {
     ...base,
     id: existing?.id || base.id,
@@ -576,12 +557,13 @@ function collectModalFormProfile() {
     baseUrl: normalizeBaseUrlInput(rawBaseUrl),
     apiKey: ($('relayModalApiKey')?.value || '').trim() || existing?.apiKey || '',
     modelName: ($('relayModalModel')?.value || '').trim(),
+    completionModel: ($('relayModalCompletionModel')?.value || '').trim(),
     endpointMode: inferredEndpointMode,
     reasoningEffort: ($('relayModalReasoning')?.value || DEFAULT_REASONING_EFFORT).trim(),
     thinkingMode: modalProviderId === 'deepseek' || modalProviderId === 'mimo'
       ? (($('relayModalThinking')?.value || DEFAULT_DEEPSEEK_THINKING_MODE).trim())
       : '',
-    contextWindow: Number(($('relayModalContext')?.value || '').trim() || DEFAULT_CONTEXT_WINDOW),
+    contextWindow,
     notes: ($('relayModalNotes')?.value || '').trim(),
   };
 }
@@ -600,8 +582,24 @@ async function saveModalProfile({ testAfter = false } = {}) {
     setActiveProfile(profilesStore, saved.id);
   }
   await saveProfilesStore(profilesStore);
+  await reloadProfilesStore();
   renderConfigGrid();
   closeConfigModal();
+  const bridge = window.electronBridge;
+  const isActiveProfile = String(profilesStore.activeId || '') === String(saved.id || '');
+  if (isActiveProfile && bridge?.cursorRelayGetConfig && bridge?.cursorRelayQuickSwitchModel) {
+    try {
+      const current = await bridge.cursorRelayGetConfig({ lightweight: true });
+      const relayRunning = Boolean(current?.runner?.running || current?.enabled);
+      relayEnabled = relayRunning;
+      if (relayRunning) {
+        await bridge.cursorRelayQuickSwitchModel({ profileId: saved.id });
+        void refreshRelayStatus().catch(() => null);
+      }
+    } catch {
+      /* ignore hot apply failure after save; manual enable path can recover */
+    }
+  }
   if (testAfter) {
     await testProfileById(saved.id, { silent: false });
   }
@@ -865,8 +863,24 @@ function collectRelayRuntimeOptions() {
     localNativeAgentTools: true,
     structuredAgentToolCalls: true,
     emitSyntheticLocalNativeToolFrames: false,
-    enableReviewBridge: isReviewBridgeRequested(),
   };
+}
+
+async function maybeEnsureRelayRunner(local) {
+  const bridge = window.electronBridge;
+  if (!bridge?.cursorRelayEnsureRunner || !bridge?.cursorRelayGetConfig) return local;
+  if (!local?.enabled || local?.mockProxy?.active || local?.runner?.running) return local;
+
+  if (!relayAutoEnsurePromise) {
+    relayAutoEnsurePromise = bridge.cursorRelayEnsureRunner({
+      mode: String(local?.runner?.mode || 'local_relay').trim() || 'local_relay',
+    }).catch(() => null).finally(() => {
+      relayAutoEnsurePromise = null;
+    });
+  }
+
+  await relayAutoEnsurePromise;
+  return bridge.cursorRelayGetConfig({ lightweight: true }).catch(() => local);
 }
 
 function collectUpstreamSessionMeta(upstream) {
@@ -897,6 +911,9 @@ function validateUpstreamPayload(payload) {
   if (!(Number(payload.contextWindow) > 0)) {
     throw new Error('上下文窗口必须大于 0');
   }
+  if (Number(payload.contextWindow) > MAX_CONTEXT_WINDOW) {
+    throw new Error(`上下文窗口不能超过 ${MAX_CONTEXT_WINDOW}，否则无法触发 Cursor 原生上下文压缩`);
+  }
 }
 
 async function testLocalUpstream(upstream) {
@@ -925,6 +942,11 @@ function describeRunner(runner) {
 
 function describeCert(cert) {
   if (!cert?.caReady || !cert?.leafReady) return '缺失';
+  // lightweight 模式跳过了证书库检查（caInstalled=null），不显示"未信任"误导用户
+  // 实际信任状态以"证书检查"按钮的结果为准
+  if (cert?.lightweight === true && cert?.caInstalled === null) {
+    return '已生成（轻量模式）';
+  }
   if (cert?.caTrustStale) return '信任不一致';
   if (cert?.caInstalled) return '本地已信任';
   return '已生成，未信任';
@@ -989,6 +1011,10 @@ function describeRelayProxyLayers(local) {
 }
 
 function describeInterceptBadge(stats, local) {
+  if (local?.mockProxy?.active) {
+    const scenario = String(local?.mockProxy?.scenario || 'plan-full').trim() || 'plan-full';
+    return { text: `Mock:${scenario}`, tone: 'ok' };
+  }
   if (local?.runner?.mode === 'official_passthrough') {
     const seenRunSse = Number(stats?.seenAgentRunSse || 0);
     const seenBidi = Number(stats?.seenBidiAppend || 0);
@@ -1139,7 +1165,7 @@ async function getUpstreamProbeForEnable() {
 
 async function enableRelayForProfile(profileId) {
   const bridge = window.electronBridge;
-  if (!bridge?.cursorRelayApply) {
+  if (!bridge?.cursorRelayApply && !bridge?.cursorRelayQuickSwitchModel) {
     await showAlert('桌面客户端未提供 Relay 桥接能力。', {
       title: 'Relay 不可用',
       tone: 'danger',
@@ -1171,16 +1197,29 @@ async function enableRelayForProfile(profileId) {
     return;
   }
 
-  const wasRunning = relayEnabled;
+  let wasRunning = relayEnabled;
+  if (bridge?.cursorRelayGetConfig) {
+    try {
+      const current = await bridge.cursorRelayGetConfig({ lightweight: true });
+      wasRunning = Boolean(current?.runner?.running || current?.enabled);
+      relayEnabled = wasRunning;
+    } catch {
+      /* ignore runtime state refresh failure */
+    }
+  }
   const busyTitle = wasRunning ? '正在切换 Relay 模型…' : '正在启用 Relay...';
 
   await withRelayBusy(busyTitle, async () => {
     try {
-      const local = wasRunning && bridge.cursorRelayQuickSwitchModel
-        ? (await bridge.cursorRelayQuickSwitchModel({ profileId })).relay
-        : await bridge.cursorRelayApply({
+      let local;
+      if (wasRunning && bridge.cursorRelayQuickSwitchModel) {
+        await bridge.cursorRelayQuickSwitchModel({ profileId });
+        local = await bridge.cursorRelayGetConfig?.({ lightweight: true });
+      } else {
+        local = await bridge.cursorRelayApply({
           upstream,
           modelRoutes: collectRelayModelRoutes(),
+          completionModel: active.completionModel || upstream.completionModel || '',
           forceRestartRunner: true,
           restartCursor: false,
           reloadCursor: false,
@@ -1188,6 +1227,7 @@ async function enableRelayForProfile(profileId) {
           useSystemProxy: false,
           ...collectRelayRuntimeOptions(),
         });
+      }
       updateRelayToggleButton(true, true);
       {
         const stats = local?.runner?.stats || local?.log?.stats || {};
@@ -1200,7 +1240,6 @@ async function enableRelayForProfile(profileId) {
 
       relayEnabled = true;
       void refreshRelayStatus().catch(() => null);
-      void getUpstreamProbeForEnable().catch(() => null);
       paintReviewBridgeStatus(local);
       const authApplied = local?.cursorAuthEnsure?.applied;
       const restartRequired = Boolean(local?.requiresCursorRestart) || authApplied;
@@ -1211,7 +1250,7 @@ async function enableRelayForProfile(profileId) {
         `${describeProfile(active)}${authHint}\n\n${local?.restarted
           ? 'Relay 已启用，Cursor 已重启。在 Cursor 里用 Auto 发消息即可。'
           : restartRequired
-            ? 'Relay 已启用，并已恢复实验 workbench 补丁。请完全退出并重新打开 Cursor 后继续测试。'
+            ? 'Relay 已启用；如需实验性前端注入，请前往偏好设置手动执行并自行验证兼容性。'
             : 'Relay 已启用，并已切到当前选中的模型配置。'}`,
         { title: restartRequired ? 'Relay 已启用，需重启 Cursor' : wasRunning ? '模型已切换' : 'Relay 已启用', tone: restartRequired ? 'warn' : 'success' },
       );
@@ -1221,6 +1260,8 @@ async function enableRelayForProfile(profileId) {
           restartCursor: false,
           reloadCursor: false,
           clearSystemProxy: false,
+          fast: true,
+          resetActiveAgentConversation: false,
         });
       } catch {
         /* ignore */
@@ -1282,7 +1323,103 @@ async function enableOfficialAgentCapture() {
   }, { fullscreen: true });
 }
 
+async function enablePlanUiMock() {
+  const bridge = window.electronBridge;
+  if (!bridge?.cursorRelayStartPlanUiMock) {
+    await showAlert('当前客户端不支持 Plan UI Mock 调试。', {
+      title: 'Plan UI Mock',
+      tone: 'danger',
+    });
+    return;
+  }
+
+  const ok = await showConfirm(
+    '将启动固定 `plan-full` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是验证稳定的 Plan UI 链路：Ask -> 只读探索 -> Plan -> Build。像 Explore 子对话这类不确定 UI，请放到单独实验场景验证，不混入默认 Mock。\n\n继续？',
+    { title: 'Plan UI Mock', tone: 'info', confirmText: '启动 Mock' },
+  );
+  if (!ok) return;
+
+  await withRelayBusy('正在启动 Plan UI Mock…', async () => {
+    try {
+      const result = await bridge.cursorRelayStartPlanUiMock({
+        scenario: 'plan-full',
+        restartCursor: false,
+        reloadCursor: true,
+        allowWindowFocusSwitch: true,
+      });
+      relayEnabled = true;
+      updateRelayToggleButton(true, true);
+      await refreshRelayStatus();
+      await showAlert(
+        [
+          result?.summary || 'Plan UI Mock 已启动。',
+          '',
+          '下一步请在 Cursor Agent 中发送任意一条消息。',
+          '如果前端仍然没有出现只读探索汇总卡片或 Build 卡片，就基本可以确定是默认 Plan UI 渲染链路问题。',
+        ].filter(Boolean).join('\n'),
+        { title: 'Plan UI Mock 已就绪', tone: 'success' },
+      );
+    } catch (error) {
+      await refreshRelayStatus().catch(() => null);
+      await showAlert(error.message || String(error), {
+        title: 'Plan UI Mock 启动失败',
+        tone: 'danger',
+      });
+    }
+  }, { fullscreen: true });
+}
+
+async function enableExploreUiMock() {
+  const bridge = window.electronBridge;
+  if (!bridge?.cursorRelayStartPlanUiMock) {
+    await showAlert('当前客户端不支持 Explore UI Mock 调试。', {
+      title: 'Explore UI Mock',
+      tone: 'danger',
+    });
+    return;
+  }
+
+  const ok = await showConfirm(
+    '将启动固定 `explore-only` 协议帧的本地 Mock 代理，并把 Cursor 切到该代理。\n\n用途是只验证 Explore 相关 UI，本场景不再复现 Ask / Plan / Build，只观察前端是否会生成独立的探索卡片或子对话入口。\n\n继续？',
+    { title: 'Explore UI Mock', tone: 'info', confirmText: '启动 Mock' },
+  );
+  if (!ok) return;
+
+  await withRelayBusy('正在启动 Explore UI Mock…', async () => {
+    try {
+      const result = await bridge.cursorRelayStartPlanUiMock({
+        scenario: 'multitask',
+        restartCursor: false,
+        reloadCursor: true,
+        allowWindowFocusSwitch: true,
+      });
+      relayEnabled = true;
+      updateRelayToggleButton(true, true);
+      await refreshRelayStatus();
+      await showAlert(
+        [
+          result?.summary || 'Explore UI Mock 已启动。',
+          '',
+          '下一步请在 Cursor Agent 中发送任意一条消息。',
+          '重点观察前端是否会为探索阶段生成独立卡片、可点击入口或新的总结子对话。',
+        ].filter(Boolean).join('\n'),
+        { title: 'Explore UI Mock 已就绪', tone: 'success' },
+      );
+    } catch (error) {
+      await refreshRelayStatus().catch(() => null);
+      await showAlert(error.message || String(error), {
+        title: 'Explore UI Mock 启动失败',
+        tone: 'danger',
+      });
+    }
+  }, { fullscreen: true });
+}
+
 function describeUserStatusHint(local, localState = null) {
+  if (local?.mockProxy?.active) {
+    const proxyServer = String(local?.mockProxy?.proxyServer || '').trim();
+    return `Plan UI Mock 已接管当前 Cursor 代理${proxyServer ? `（${proxyServer}）` : ''}。现在请直接在 Cursor Agent 里发送一条消息，观察默认的 Ask -> 只读探索汇总 -> Plan -> Build UI 是否完整出现。`;
+  }
   if (localState && !localState.cursorLoggedIn) {
     return 'Cursor 尚未登录。启用 Relay 时会自动检测，并从 desktop/js/utils/users.json 写入本地免登账号。';
   }
@@ -1373,11 +1510,12 @@ async function refreshRelayStatus() {
     const localState = await window.electronBridge?.getLocalCursorState?.().catch(() => null);
     paintCursorLoginBadge(localState);
 
-    const local = await bridge.cursorRelayGetConfig({ lightweight: true });
+    let local = await bridge.cursorRelayGetConfig({ lightweight: true });
+    local = await maybeEnsureRelayRunner(local);
     const stats = local?.runner?.stats || local?.log?.stats || {};
     const intercept = describeInterceptBadge(stats, local);
 
-    updateRelayToggleButton(local?.enabled, local?.runner?.running);
+    updateRelayToggleButton(local?.enabled, local?.mockProxy?.active || local?.runner?.running);
     if (local?.enabled) {
       const addr = String(local?.proxyServer || local?.runner?.proxyServer || '').trim();
       setBadge($('relayLocalBadge'), addr || '已启用', 'ok');
@@ -1396,8 +1534,8 @@ async function refreshRelayStatus() {
     if (isRelayAdmin()) {
       setBadge(
         $('relayRunnerBadge'),
-        describeRunner(local?.runner),
-        local?.runner?.healthOk ? 'ok' : local?.runner?.running ? 'warn' : 'muted',
+        local?.mockProxy?.active ? 'Plan UI Mock' : describeRunner(local?.runner),
+        local?.mockProxy?.active ? 'ok' : local?.runner?.healthOk ? 'ok' : local?.runner?.running ? 'warn' : 'muted',
       );
       setBadge(
         $('relayPatchBadge'),
@@ -1413,7 +1551,9 @@ async function refreshRelayStatus() {
       setText($('relayCursorSettingsHint'), describeRelayProxyLayers(local));
       setText(
         $('relayServerHint'),
-        local?.runner?.running
+        local?.mockProxy?.active
+          ? `Plan UI Mock：${local.mockProxy.proxyServer || 'http://127.0.0.1:17888'}`
+          : local?.runner?.running
           ? `本地 runner：${local.runner.proxyServer || '127.0.0.1:17789'}`
           : '本地 runner 未运行。',
       );
@@ -1558,13 +1698,21 @@ function bindRelayLogButtons() {
   if (officialCaptureBtn) {
     officialCaptureBtn.onclick = () => enableOfficialAgentCapture().catch(() => {});
   }
+
+  const relayPlanUiMockBtn = $('relayPlanUiMockBtn');
+  if (relayPlanUiMockBtn) {
+    relayPlanUiMockBtn.onclick = () => enablePlanUiMock().catch(() => {});
+  }
+  const relayExploreUiMockBtn = $('relayExploreUiMockBtn');
+  if (relayExploreUiMockBtn) {
+    relayExploreUiMockBtn.onclick = () => enableExploreUiMock().catch(() => {});
+  }
 }
 
 export async function refreshProxyStatus() {
   await reloadProfilesStore();
   renderConfigGrid();
   await refreshRelayStatus();
-  await runUpstreamProbe({ silent: true });
 }
 
 export async function bindProxyEvents() {
@@ -1655,26 +1803,26 @@ export async function bindProxyEvents() {
         if (relayDisableInFlight) return;
         relayDisableInFlight = true;
         updateRelayToggleButton(false, false);
-        void Promise.resolve()
-          .then(async () => {
+        await withRelayBusy('正在暂停 Relay 并还原本地代理配置...', async () => {
+          try {
             await bridge?.cursorRelayDisable?.({
               restartCursor: false,
               reloadCursor: false,
               clearSystemProxy: false,
               stopRunner: true,
               fast: true,
+              resetActiveAgentConversation: false,
             });
-          })
-          .catch(async (error) => {
+          } catch (error) {
             await showAlert(error.message || String(error), {
               title: '停用 Relay 失败',
               tone: 'danger',
             });
-          })
-          .finally(async () => {
+          } finally {
             relayDisableInFlight = false;
             await refreshRelayStatus().catch(() => null);
-          });
+          }
+        });
         return;
       }
 

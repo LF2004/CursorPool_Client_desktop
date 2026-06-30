@@ -9,6 +9,10 @@
     <input type="text" id="usageModelFilter" class="input no-drag usage-filter-input" placeholder="模型" />
     <input type="text" id="usageRequestFilter" class="input no-drag usage-filter-input" placeholder="Request ID" />
     <div class="usage-filter-actions">
+      <div class="usage-view-toggle" role="tablist" aria-label="调用记录视图">
+        <button type="button" id="usageViewCompactBtn" class="ghost-btn active" data-usage-view="compact" aria-pressed="true">精简</button>
+        <button type="button" id="usageViewDetailBtn" class="ghost-btn" data-usage-view="detail" aria-pressed="false">详情</button>
+      </div>
       <button type="button" id="usageRefreshBtn" class="ghost-btn">刷新</button>
       <button type="button" id="usageClearBtn" class="record-btn-danger">清空记录</button>
     </div>
@@ -29,13 +33,14 @@
             <path id="usageCacheGaugeFill" class="usage-cache-gauge-fill" d="M 10 58 A 50 50 0 0 1 110 58" pathLength="157.08" stroke-dasharray="157.08" stroke-dashoffset="157.08" />
           </svg>
           <strong id="usageCacheHitRate" class="usage-cache-rate">-</strong>
+          <span id="usageCacheUpstreamRate" class="usage-cache-rate-sub">Prompt Cache</span>
         </div>
         <div class="usage-cache-stats">
-          <div class="usage-cache-stat">
+          <div class="usage-cache-stat usage-cache-stat-sub">
             <span class="usage-cache-stat-label">Token 消耗</span>
             <span id="usageCacheTokenTotal" class="usage-cache-stat-value mono">0</span>
           </div>
-          <div class="usage-cache-stat">
+          <div class="usage-cache-stat usage-cache-stat-sub">
             <span class="usage-cache-stat-label">Prompt 消耗</span>
             <span id="usageCachePromptTotal" class="usage-cache-stat-value mono">0</span>
           </div>
@@ -83,17 +88,6 @@
     </div>
   </div>
 
-  <div class="usage-source-row">
-    <div class="usage-source-meta">
-      <span id="usageCurrentAccount" class="usage-account-chip" title="当前 Cursor Agent 账户">
-        <i class="fa fa-user-circle-o" aria-hidden="true"></i>
-        <span id="usageCurrentAccountText">-</span>
-      </span>
-      <span id="usageDbPath" class="usage-muted mono usage-db-path" title="本地记录库路径">-</span>
-    </div>
-    <span id="usagePriceSource" class="usage-muted usage-price-note">价格按官方 API Pricing 估算</span>
-  </div>
-
   <div class="record-list-body usage-list-body">
     <div class="usage-table-shell">
       <div class="record-table-wrap table-wrap usage-table-wrap">
@@ -103,12 +97,14 @@
               <tr>
                 <th>时间</th>
                 <th>模型</th>
+                <th>模式</th>
                 <th>推理强度</th>
-                <th>阶段</th>
+                <th data-usage-col="phase">阶段</th>
                 <th>Token <button type="button" class="usage-th-help usage-info-btn" aria-label="Token 说明" data-popover="token-help"><i class="fa fa-question-circle" aria-hidden="true"></i></button></th>
                 <th>费用</th>
                 <th>状态</th>
-                <th>Request</th>
+                <th data-usage-col="cache">缓存</th>
+                <th data-usage-col="request">Request</th>
               </tr>
             </thead>
             <tbody id="usageTableBody"></tbody>

@@ -5,6 +5,36 @@ const https = require('https');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function mapAgentModeNameToNumber(modeName = '') {
+  const normalized = String(modeName || '').trim().toUpperCase();
+  switch (normalized) {
+    case 'AGENT_MODE_AGENT':
+    case 'AGENT':
+      return 1;
+    case 'AGENT_MODE_ASK':
+    case 'ASK':
+      return 2;
+    case 'AGENT_MODE_PLAN':
+    case 'PLAN':
+      return 3;
+    case 'AGENT_MODE_DEBUG':
+    case 'DEBUG':
+      return 4;
+    case 'AGENT_MODE_TRIAGE':
+    case 'TRIAGE':
+      return 5;
+    case 'AGENT_MODE_PROJECT':
+    case 'PROJECT':
+      return 6;
+    case 'AGENT_MODE_MULTITASK':
+    case 'MULTITASK':
+    case 'TASK':
+      return 7;
+    default:
+      return 1;
+  }
+}
+
 function encodeVarint(value) {
   const out = [];
   let n = Number(value) >>> 0;
@@ -183,11 +213,18 @@ function extractAgentFrameInfo(frame) {
   return { kind: 'unknown' };
 }
 
-function buildAgentBidiAppendPayload(requestId, userText) {
-  const userMessage = encodeMessage([{ field: 1, value: userText }]);
+function buildAgentBidiAppendPayload(requestId, userText, options = {}) {
+  const modeNumber = mapAgentModeNameToNumber(options.mode || 'AGENT_MODE_AGENT');
+  const userMessage = concatBytes([
+    encodeBytesField(1, userText),
+    encodeInt32Field(4, modeNumber),
+  ]);
   const userAction = encodeMessage([{ field: 1, value: userMessage }]);
   const conversationAction = encodeMessage([{ field: 1, value: userAction }]);
-  const runRequest = encodeMessage([{ field: 2, value: conversationAction }]);
+  const runRequest = concatBytes([
+    encodeBytesField(2, conversationAction),
+    encodeInt32Field(10, modeNumber),
+  ]);
   const agentPayload = encodeMessage([{ field: 1, value: runRequest }]);
   const requestIdMessage = encodeMessage([{ field: 1, value: requestId }]);
   return encodeMessage([
@@ -469,6 +506,7 @@ const DEFAULT_TARGET_HOSTS = [
 async function runRelayAgentConnectionTest({
   port = 17789,
   prompt,
+  mode = 'AGENT_MODE_AGENT',
   targetHosts = DEFAULT_TARGET_HOSTS,
   timeoutMs = 20000,
   simulateExecClient = true,
@@ -494,7 +532,7 @@ async function runRelayAgentConnectionTest({
       const bidiResponse = await postBinary({
         port,
         path: '/aiserver.v1.BidiService/BidiAppend',
-        body: buildAgentBidiAppendPayload(requestId, userPrompt),
+        body: buildAgentBidiAppendPayload(requestId, userPrompt, { mode }),
         targetHost,
         headers: {
           'Content-Type': 'application/proto',
@@ -522,6 +560,7 @@ async function runRelayAgentConnectionTest({
           ok: true,
           text,
           requestId,
+          mode,
           targetHost,
           bidiStatus: bidiResponse.statusCode,
           sseStatus: sseResult.statusCode,
@@ -549,6 +588,7 @@ async function runRelayAgentConnectionTest({
     errors,
     attempts,
     requestId: attempts[0]?.requestId || '',
+    mode,
     targetHost: attempts[0]?.targetHost || '',
     message: errors.join('\n') || 'Relay Agent 通路测试失败',
   };
@@ -559,5 +599,6 @@ module.exports = {
   buildAgentBidiAppendPayload,
   buildAgentExecClientPayload,
   buildAgentExecClientControlPayload,
+  mapAgentModeNameToNumber,
   runRelayAgentConnectionTest,
 };

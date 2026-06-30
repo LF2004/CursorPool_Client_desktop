@@ -4,16 +4,57 @@ import { DEFAULT_PAGE_SIZE, mountPagination, parsePagedResponse } from '../core/
 import { reasoningEffortLabel } from './relay-profiles.js';
 
 const usagePageState = { page: 1, pageSize: 20, total: 0 };
-const USAGE_POLL_INTERVAL_MS = 1000;
+const USAGE_POLL_INTERVAL_MS = 3000;
+const USAGE_HISTORY_SYNC_INTERVAL_MS = 30000;
+const USAGE_VIEW_MODES = {
+  compact: 'compact',
+  detail: 'detail',
+};
+const usageViewState = {
+  mode: USAGE_VIEW_MODES.compact,
+};
 
 let usagePollTimer = null;
 let usagePollActive = false;
 let usageRefreshInFlight = false;
 let usagePollPaused = false;
 let usageScrollEndTimer = null;
+let usageLastHistorySyncAt = 0;
 let lastUsageFingerprint = '';
+let lastUsageRows = [];
 let pendingUsageRows = null;
 let pendingUsageApply = null;
+
+function getUsageVisibleColumnCount() {
+  return usageViewState.mode === USAGE_VIEW_MODES.detail ? 10 : 7;
+}
+
+function formatUsageModeLabel(value) {
+  const text = String(value || '').trim().toUpperCase();
+  if (text === 'AGENT_MODE_PLAN' || text === 'PLAN') return 'Plan';
+  if (text === 'AGENT_MODE_ASK' || text === 'ASK') return 'Ask';
+  if (text === 'AGENT_MODE_DEBUG' || text === 'DEBUG') return 'Debug';
+  if (text === 'AGENT_MODE_MULTITASK' || text === 'MULTITASK' || text === 'TASK') return 'Multitask';
+  return 'Agent';
+}
+
+function applyUsageViewMode(mode = USAGE_VIEW_MODES.compact) {
+  usageViewState.mode = mode === USAGE_VIEW_MODES.detail ? USAGE_VIEW_MODES.detail : USAGE_VIEW_MODES.compact;
+  const root = $('usage');
+  if (root) root.dataset.usageView = usageViewState.mode;
+  const compactBtn = $('usageViewCompactBtn');
+  const detailBtn = $('usageViewDetailBtn');
+  if (compactBtn) {
+    const active = usageViewState.mode === USAGE_VIEW_MODES.compact;
+    compactBtn.classList.toggle('active', active);
+    compactBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+  if (detailBtn) {
+    const active = usageViewState.mode === USAGE_VIEW_MODES.detail;
+    detailBtn.classList.toggle('active', active);
+    detailBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
 
 function formatDate(value) {
   if (!value) return '-';
@@ -55,7 +96,7 @@ function setUsageLoading(loading) {
   const body = $('usageTableBody');
   if (!body) return;
   if (loading) {
-    body.innerHTML = '<tr><td colspan="8" class="record-table-loading"><i class="fa fa-spinner fa-spin" aria-hidden="true"></i> 加载中…</td></tr>';
+    body.innerHTML = `<tr><td colspan="${getUsageVisibleColumnCount()}" class="record-table-loading"><i class="fa fa-spinner fa-spin" aria-hidden="true"></i> 加载中…</td></tr>`;
   }
   const root = $('usagePagination');
   if (root) root.classList.toggle('record-pagination-busy', Boolean(loading));
@@ -67,7 +108,7 @@ function getBillingScopeFilter() {
   return 'all';
 }
 
-function getFilters(page = usagePageState.page) {
+function getFilters(page = usagePageState.page, { syncHistory = false } = {}) {
   const billingScope = getBillingScopeFilter();
   return {
     page,
@@ -79,30 +120,12 @@ function getFilters(page = usagePageState.page) {
     model: $('usageModelFilter')?.value?.trim() || '',
     cursorAgentAccount: $('usageAccountFilter')?.value?.trim() || '',
     requestId: $('usageRequestFilter')?.value?.trim() || '',
+    syncHistory,
   };
 }
 
 function setTextIfChanged(el, text) {
   if (el && el.textContent !== text) el.textContent = text;
-}
-
-function renderPriceSources(data = {}) {
-  const sources = Array.isArray(data.priceSources) && data.priceSources.length
-    ? data.priceSources
-    : [
-      { label: 'OpenAI', url: 'https://openai.com/api/pricing/' },
-      { label: 'Anthropic', url: 'https://www.anthropic.com/pricing' },
-      { label: 'DeepSeek', url: 'https://api-docs.deepseek.com/quick_start/pricing' },
-      { label: 'Gemini', url: 'https://ai.google.dev/gemini-api/docs/pricing' },
-      { label: 'MiMo', url: 'https://mimo.mi.com/docs/zh-CN/price/pay-as-you-go' },
-    ];
-  const links = sources.map((item) => (
-    `<a href="#" class="usage-link" data-external-url="${escapeHtml(item.url)}">${escapeHtml(item.label)}</a>`
-  )).join(' / ');
-  const el = $('usagePriceSource');
-  if (!el) return;
-  const html = `价格按 ${links} 官方 API Pricing 估算 · 线上调用计入卡密额度，本地代理仅记录 Token 与费用估算`;
-  if (el.innerHTML !== html) el.innerHTML = html;
 }
 
 const CACHE_GAUGE_ARC_LENGTH = 157.08;
@@ -114,6 +137,7 @@ function computeCacheStats(summary = {}) {
   const totalTokens = Number(summary.total_tokens) || (inputTokens + outputTokens);
   const billablePrompt = Math.max(0, inputTokens - cachedTokens);
   const cacheHitRate = inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : null;
+  // 本地 Relay Response Cache 统计（从 runner health 端点获取）
   return {
     inputTokens,
     cachedTokens,
@@ -126,15 +150,20 @@ function computeCacheStats(summary = {}) {
 
 function renderCacheSummary(summary = {}) {
   const stats = computeCacheStats(summary);
-  const rateText = stats.cacheHitRate == null ? '-' : `${formatNumber(stats.cacheHitRate, 2)}%`;
+  // 仪表盘显示本地 Relay 缓存命中率（更有意义，上游 prompt cache 多为 0）
+  const gaugeRate = stats.cacheHitRate;
+  const rateText = gaugeRate == null ? '-' : `${formatNumber(gaugeRate, 2)}%`;
   setTextIfChanged($('usageCacheHitRate'), rateText);
+  // 上游 Prompt 缓存率（次要显示）
+  const upstreamRateText = stats.cacheHitRate == null ? '-' : `${formatNumber(stats.cacheHitRate, 2)}%`;
+  setTextIfChanged($('usageCacheUpstreamRate'), 'Prompt Cache');
   setTextIfChanged($('usageCacheTokenTotal'), formatCompactToken(stats.totalTokens));
   setTextIfChanged($('usageCachePromptTotal'), formatCompactToken(stats.inputTokens));
   setTextIfChanged($('usageCachePromptCached'), formatCompactToken(stats.cachedTokens));
   setTextIfChanged($('usageCachePromptBillable'), formatCompactToken(stats.billablePrompt));
   const fill = $('usageCacheGaugeFill');
   if (fill) {
-    const rate = stats.cacheHitRate == null ? 0 : Math.min(100, Math.max(0, stats.cacheHitRate));
+    const rate = gaugeRate == null ? 0 : Math.min(100, Math.max(0, gaugeRate));
     const offset = CACHE_GAUGE_ARC_LENGTH * (1 - rate / 100);
     const nextOffset = String(offset);
     if (fill.getAttribute('stroke-dashoffset') !== nextOffset) {
@@ -154,24 +183,6 @@ function renderSummary(data = {}) {
   setTextIfChanged($('usageSummaryCost'), formatUsd(summary.total_cost_usd || 0));
   renderCacheSummary(summary);
   setTextIfChanged($('usageSummaryStatus'), `${success} / ${pending} / ${errors}`);
-  const dbPath = data.dbPath || '-';
-  const dbPathEl = $('usageDbPath');
-  if (dbPathEl) {
-    setTextIfChanged(dbPathEl, dbPath);
-    if (dbPathEl.title !== dbPath) dbPathEl.title = dbPath;
-  }
-  const currentAccount = String(data.currentCursorAgentAccount || '').trim();
-  const accountEl = $('usageCurrentAccountText');
-  const accountChip = $('usageCurrentAccount');
-  setTextIfChanged(accountEl, currentAccount || '未检测到 Cursor 账户');
-  if (accountChip) {
-    accountChip.classList.toggle('usage-account-chip-empty', !currentAccount);
-    const nextTitle = currentAccount
-      ? `当前 Cursor Agent 账户：${currentAccount}`
-      : '未能从 state.vscdb 读取当前 Cursor 账户';
-    if (accountChip.title !== nextTitle) accountChip.title = nextTitle;
-  }
-  renderPriceSources(data);
 }
 
 let usagePopoverEl = null;
@@ -245,6 +256,8 @@ function buildUsageFingerprint(data = {}, rows = []) {
   const summary = data.summary || {};
   const rowSig = rows.map((row) => [
     row.id,
+    row.mode,
+    row.phase,
     row.status,
     row.billed_points,
     row.total_tokens,
@@ -352,12 +365,45 @@ function buildCacheHelpPopoverHtml() {
   return `
     <div class="usage-popover-title">缓存命中率说明</div>
     <div class="usage-popover-rows">
-      <div class="usage-popover-row"><span>命中率</span><span class="mono">缓存读取 ÷ Prompt 消耗</span></div>
+      <div class="usage-popover-row"><span>本地缓存命中率</span><span>本地 Relay 命中 ÷ 总查询</span></div>
+      <div class="usage-popover-row"><span>上游 Prompt 缓存率</span><span>缓存读取 ÷ Prompt 消耗</span></div>
+      <div class="usage-popover-row"><span>本地命中</span><span>本地 Relay 响应缓存命中次数</span></div>
+      <div class="usage-popover-row"><span>本地请求</span><span>本地 Relay 缓存查询总次数</span></div>
       <div class="usage-popover-row"><span>Token 消耗</span><span>输入 + 输出 Token 总量</span></div>
       <div class="usage-popover-row"><span>Prompt 消耗</span><span>全部 Prompt Token</span></div>
+      <div class="usage-popover-row"><span>缓存读取</span><span>上游 API Prompt 缓存命中 Token</span></div>
       <div class="usage-popover-row"><span>非缓存 Prompt</span><span>按官方定价计费的输入 Token</span></div>
     </div>
   `;
+}
+
+function computeRowCacheStatus(row) {
+  const inputTokens = Number(row.input_tokens) || 0;
+  const cachedInputTokens = Number(row.cached_input_tokens) || 0;
+  const hasUpstreamCache = cachedInputTokens > 0 && inputTokens > 0;
+  const upstreamCacheRate = hasUpstreamCache ? (cachedInputTokens / inputTokens) * 100 : null;
+  return { inputTokens, cachedInputTokens, hasUpstreamCache, upstreamCacheRate };
+}
+
+function buildCacheCellHtml(row, { compact = false } = {}) {
+  const { cachedInputTokens, hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row);
+  const parts = [];
+  if (hasUpstreamCache) {
+    const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
+    parts.push(`<span class="usage-cache-detail usage-cache-prompt" title="上游 Prompt 缓存读取 ${formatNumber(cachedInputTokens)} tokens"><i class="fa fa-minus-square" aria-hidden="true"></i>${compact ? rateText : `Prompt ${rateText}`}</span>`);
+  }
+  if (!parts.length) return '<span class="usage-muted">-</span>';
+  return `<span class="usage-cache-stack${compact ? ' usage-cache-stack-compact' : ''}">${parts.join('')}</span>`;
+}
+
+function buildCompactCacheTags(row) {
+  const { hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row);
+  const tags = [];
+  if (hasUpstreamCache) {
+    const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
+    tags.push(`<button type="button" class="usage-cache-tag usage-cache-tag-prompt usage-info-btn" data-popover="cache-prompt" aria-label="上游 Prompt 缓存说明">PROMPT ${rateText}</button>`);
+  }
+  return tags.join('');
 }
 
 function attachUsagePopoverHandlers() {
@@ -373,6 +419,14 @@ function attachUsagePopoverHandlers() {
       else if (type === 'cost') html = buildCostPopoverHtml(btn.dataset);
       else if (type === 'token-help') html = buildTokenHelpPopoverHtml();
       else if (type === 'cache-help') html = buildCacheHelpPopoverHtml();
+      else if (type === 'cache-prompt') html = `
+        <div class="usage-popover-title">上游 Prompt 缓存说明</div>
+        <div class="usage-popover-rows">
+          <div class="usage-popover-row"><span>含义</span><span>上游 API 复用了前缀 Prompt token</span></div>
+          <div class="usage-popover-row"><span>效果</span><span>请求仍然发出，但输入 token 更省</span></div>
+          <div class="usage-popover-row"><span>标记</span><span class="mono">PROMPT xx%</span></div>
+        </div>
+      `;
       if (!html) return;
       showUsagePopover(btn, html);
     };
@@ -387,36 +441,48 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
   if (!body) return;
   const scroller = preserveScroll ? document.querySelector('#usage .usage-table-scroll') : null;
   const scrollTop = scroller?.scrollTop ?? 0;
+  lastUsageRows = Array.isArray(rows) ? rows : [];
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="8" class="record-table-loading">暂无调用记录</td></tr>';
+    body.innerHTML = `<tr><td colspan="${getUsageVisibleColumnCount()}" class="record-table-loading">暂无调用记录</td></tr>`;
     return;
   }
+  const isDetail = usageViewState.mode === USAGE_VIEW_MODES.detail;
   body.innerHTML = rows.map((row) => {
     const status = String(row.status || 'unknown');
-    const statusClass = status === 'success'
+    const normalizedStatus = status === 'cache_hit' ? 'success' : status;
+    const statusClass = normalizedStatus === 'success'
       ? 'usage-status-ok'
-      : ['paid', 'pending'].includes(status)
+      : ['paid', 'pending'].includes(normalizedStatus)
         ? 'usage-status-paid'
-        : ['stop', 'stopped', 'aborted', 'cancelled', 'canceled'].includes(status)
+        : ['stop', 'stopped', 'aborted', 'cancelled', 'canceled'].includes(normalizedStatus)
           ? 'usage-status-stop'
           : 'usage-status-warn';
-    const statusLabel = status.toUpperCase();
+    const statusLabel = normalizedStatus.toUpperCase();
     const reasoningEffort = String(row.reasoning_effort || '').trim();
     const phase = String(row.phase || '-');
     const endpointMode = String(row.endpoint_mode || '').trim();
+    const modeLabel = formatUsageModeLabel(row.mode);
+    const compactCacheTags = buildCompactCacheTags(row);
+    const modelId = String(row.model || '').trim();
+    const displayName = String(row.display_name || '').trim();
+    const primaryModelText = displayName || modelId || '-';
+    const showModelIdMeta = Boolean(modelId) && modelId !== primaryModelText;
+    const statusCellHtml = `<span class="usage-status ${statusClass}" title="${escapeHtml(row.error || '')}">${escapeHtml(statusLabel)}</span>`;
     return `
       <tr>
         <td class="mono usage-time">${escapeHtml(formatDate(row.created_at))}</td>
         <td class="usage-model-cell">
-          <div class="usage-model mono" title="${escapeHtml(row.model || '')}">${escapeHtml(row.model || '-')}</div>
+          <div class="usage-model${displayName ? '' : ' mono'}" title="${escapeHtml(primaryModelText)}">${escapeHtml(primaryModelText)}</div>
           <div class="usage-model-meta">
-            ${row.model_label ? `<span class="usage-muted">${escapeHtml(row.model_label)}</span>` : ''}
+            ${showModelIdMeta ? `<span class="usage-muted mono">${escapeHtml(modelId)}</span>` : ''}
+            ${compactCacheTags}
           </div>
         </td>
+        <td class="usage-mode-cell"><span class="usage-mode-badge">${escapeHtml(modeLabel)}</span></td>
         <td class="usage-reasoning-cell" title="${escapeHtml(reasoningEffort || '未记录')}">${escapeHtml(reasoningEffort ? reasoningEffortLabel(reasoningEffort) : '-')}</td>
-        <td class="usage-phase-cell">
+        ${isDetail ? `<td class="usage-phase-cell">
           <span class="mono">${escapeHtml(phase)}</span>${endpointMode ? `<span class="usage-muted"> · ${escapeHtml(endpointMode)}</span>` : ''}
-        </td>
+        </td>` : ''}
         <td class="usage-token-cell">
           <div class="usage-token-content">
             <div class="usage-token-row">
@@ -451,8 +517,9 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
             </button>
           </div>
         </td>
-        <td><span class="usage-status ${statusClass}" title="${escapeHtml(row.error || '')}">${escapeHtml(statusLabel)}</span></td>
-        <td class="mono usage-request" title="${escapeHtml(row.request_id || '')}">${escapeHtml(row.request_id || '-')}</td>
+        <td>${statusCellHtml}</td>
+        ${isDetail ? `<td class="usage-cache-cell">${buildCacheCellHtml(row)}</td>` : ''}
+        ${isDetail ? `<td class="mono usage-request" title="${escapeHtml(row.request_id || '')}">${escapeHtml(row.request_id || '-')}</td>` : ''}
       </tr>
     `;
   }).join('');
@@ -501,13 +568,18 @@ export async function refreshUsage(page = usagePageState.page, { silent = false 
     lastUsageFingerprint = '';
     pendingUsageRows = null;
     pendingUsageApply = null;
+    usageLastHistorySyncAt = 0;
   }
 
   if (silent) usageRefreshInFlight = true;
   else setUsageLoading(true);
 
+  const now = Date.now();
+  const syncHistory = !silent || now - usageLastHistorySyncAt >= USAGE_HISTORY_SYNC_INTERVAL_MS;
+  if (syncHistory) usageLastHistorySyncAt = now;
+
   try {
-    const data = await window.electronBridge.cursorRelayUsageList(getFilters(page));
+    const data = await window.electronBridge.cursorRelayUsageList(getFilters(page, { syncHistory }));
     const paged = parsePagedResponse(data, page, usagePageState.pageSize);
     applyUsageData(data, paged, { silent });
   } catch (error) {
@@ -545,8 +617,19 @@ export function stopUsagePolling() {
 
 export function bindUsageEvents() {
   attachUsagePopoverHandlers();
+  applyUsageViewMode(usageViewState.mode);
   const refreshBtn = $('usageRefreshBtn');
   if (refreshBtn) refreshBtn.onclick = () => refreshUsage(1);
+  const compactBtn = $('usageViewCompactBtn');
+  if (compactBtn) compactBtn.onclick = () => {
+    applyUsageViewMode(USAGE_VIEW_MODES.compact);
+    renderRows(lastUsageRows, { preserveScroll: true });
+  };
+  const detailBtn = $('usageViewDetailBtn');
+  if (detailBtn) detailBtn.onclick = () => {
+    applyUsageViewMode(USAGE_VIEW_MODES.detail);
+    renderRows(lastUsageRows, { preserveScroll: true });
+  };
   const clearBtn = $('usageClearBtn');
   if (clearBtn) {
     clearBtn.onclick = async () => {
@@ -572,20 +655,6 @@ export function bindUsageEvents() {
       if (event.key === 'Enter') refreshUsage(1);
     };
   });
-  const priceSource = $('usagePriceSource');
-  if (priceSource) {
-    priceSource.onclick = async (event) => {
-      const link = event.target.closest?.('.usage-link[data-external-url]');
-      if (!link) return;
-      event.preventDefault();
-      try {
-        await window.electronBridge?.openExternal?.(link.dataset.externalUrl);
-      } catch (error) {
-        await showAlert(error?.message || String(error), { title: '打开链接失败', tone: 'danger' });
-      }
-    };
-  }
-
   window.addEventListener('scroll', (event) => {
     if (event.target?.closest?.('.usage-table-scroll')) return;
     hideUsagePopover();

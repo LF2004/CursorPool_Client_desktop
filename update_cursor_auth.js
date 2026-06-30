@@ -158,7 +158,7 @@ function loadLocalGuestCursorAuth() {
       email,
       accessToken,
       refreshToken,
-      stripeMembershipType: 'pro',
+      stripeMembershipType: 'ultra', // 默认 ultra（小写，匹配 Cursor cs 枚举）
     };
   } catch {
     return null;
@@ -218,12 +218,20 @@ async function applyCursorAuth(payload) {
     if (payload?.clearServerConfig === true) {
       cleanupServerConfig(db, tableName);
     }
+    // 默认 PRO 订阅态（用小写，与 Cursor cs 枚举一致：pro/ultra/free）
+    const membershipType = String(payload?.stripeMembershipType || 'ultra').toLowerCase();
+    const subscriptionStatus = String(payload?.stripeSubscriptionStatus || 'ACTIVE').toUpperCase();
+    const signUpType = String(payload?.cachedSignUpType || 'Google');
     const updates = [
       ['cursor.email', email],
       ['cursor.accessToken', accessToken],
       ['cursorAuth/refreshToken', refreshToken],
       ['cursorAuth/accessToken', accessToken],
       ['cursorAuth/cachedEmail', email],
+      // ── 关键：写入订阅态字段，否则 Cursor 启动时读到空值 → FREE → "Log in ⚡" ──
+      ['cursorAuth/stripeMembershipType', membershipType],
+      ['cursorAuth/stripeSubscriptionStatus', subscriptionStatus],
+      ['cursorAuth/cachedSignUpType', signUpType],
     ];
     const tx = db.transaction(() => {
       for (const [key, value] of updates) {
@@ -281,7 +289,7 @@ async function ensureCursorAuthIfNeeded(credentials) {
       email: String(credentials.email).trim(),
       accessToken: processToken(credentials.accessToken),
       refreshToken: processToken(credentials.refreshToken || credentials.accessToken),
-      stripeMembershipType: credentials.stripeMembershipType || 'pro',
+      stripeMembershipType: (credentials.stripeMembershipType || 'ultra').toLowerCase(),
     }
     : loadLocalGuestCursorAuth();
 
@@ -305,7 +313,7 @@ async function ensureCursorAuthIfNeeded(credentials) {
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken || creds.accessToken,
     clearServerConfig: false,
-    stripeMembershipType: creds.stripeMembershipType || 'pro',
+    stripeMembershipType: (creds.stripeMembershipType || 'ultra').toLowerCase(),
   });
   return {
     ok: true,

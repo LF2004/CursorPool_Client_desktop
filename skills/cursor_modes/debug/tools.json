@@ -1,0 +1,385 @@
+[
+  {
+    "function": {
+      "description": "Reads a file from the local filesystem. You can access any file directly by using this tool.\nIf the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\nUsage:\n- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n- Lines in the output are numbered starting at 1, using following format: LINE_NUMBER|LINE_CONTENT\n- You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.\n- If you read a file that exists but has empty contents you will receive 'File is empty.'\n\nImage Support:\n- This tool can also read image files when called with the appropriate path.\n- Supported image formats: jpeg/jpg, png, gif, webp.\n\nPDF Support:\n- PDF files are converted into text content automatically (subject to the same character limits as other files).",
+      "name": "Read",
+      "parameters": {
+        "properties": {
+          "limit": {
+            "description": "The number of lines to read. Only provide if the file is too large to read at once.",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "The line number to start reading from. Positive values are 1-indexed from the start of the file. Negative values count backwards from the end (e.g. -1 is the last line). Only provide if the file is too large to read at once.",
+            "type": "integer"
+          },
+          "path": {
+            "description": "The absolute path of the file to read.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "A powerful search tool built on ripgrep\nUsage:\n- Prefer using Grep for search tasks when you know the exact symbols or strings to search for. Whenever possible, use this tool instead of invoking grep or rg as a terminal command. The Grep tool has been optimized for speed and file restrictions inside Cursor.\n- Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n- Filter files with glob parameter (e.g., \".js\", \"**/.tsx\") or type parameter (e.g., \"js\", \"py\", \"rust\")\n- Output modes: \"content\" shows matching lines (default), \"files_with_matches\" shows only file paths, \"count\" shows match counts\n- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use interface\\{\\} to find interface{} in Go code)\n- Multiline matching: By default patterns match within single lines only. For cross-line patterns like struct \\{[\\s\\S]*?field, use multiline: true\n- Results are capped to several thousand output lines for responsiveness; when truncation occurs, the results report \"at least\" counts, but are otherwise accurate.\n- Content output formatting closely follows ripgrep output format: '-' for context lines, ':' for match lines, and all context/match lines below each file group.",
+      "name": "Grep",
+      "parameters": {
+        "properties": {
+          "-A": {
+            "description": "Number of lines to show after each match (rg -A). Requires output_mode: \"content\", ignored otherwise.",
+            "type": "number"
+          },
+          "-B": {
+            "description": "Number of lines to show before each match (rg -B). Requires output_mode: \"content\", ignored otherwise.",
+            "type": "number"
+          },
+          "-C": {
+            "description": "Number of lines to show before and after each match (rg -C). Requires output_mode: \"content\", ignored otherwise.",
+            "type": "number"
+          },
+          "-i": {
+            "description": "Case insensitive search (rg -i) Defaults to false",
+            "type": "boolean"
+          },
+          "glob": {
+            "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob",
+            "type": "string"
+          },
+          "head_limit": {
+            "description": "Limit output size. For \"content\" mode: limits total matches shown. For \"files_with_matches\" and \"count\" modes: limits number of files.",
+            "minimum": 0,
+            "type": "number"
+          },
+          "multiline": {
+            "description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false.",
+            "type": "boolean"
+          },
+          "offset": {
+            "description": "Skip first N entries. For \"content\" mode: skips first N matches. For \"files_with_matches\" and \"count\" modes: skips first N files. Use with head_limit for pagination.",
+            "minimum": 0,
+            "type": "number"
+          },
+          "output_mode": {
+            "description": "Output mode: \"content\" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), \"files_with_matches\" shows file paths (supports head_limit), \"count\" shows match counts (supports head_limit). Defaults to \"content\".",
+            "enum": [
+              "content",
+              "files_with_matches",
+              "count"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "description": "File or directory to search in (rg pattern -- PATH). Defaults to Cursor workspace root.",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "The regular expression pattern to search for in file contents",
+            "type": "string"
+          },
+          "type": {
+            "description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "\nTool to search for files matching a glob pattern\n\n- Works fast with codebases of any size\n- Returns matching file paths sorted by modification time\n- Use this tool when you need to find files by name patterns\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches that are potentially useful as a batch.\n",
+      "name": "Glob",
+      "parameters": {
+        "properties": {
+          "glob_pattern": {
+            "description": "The glob pattern to match files against.\nPatterns not starting with \"**/\" are automatically prepended with \"**/\" to enable recursive searching.\n\nExamples:\n\t- \"*.js\" (becomes \"**/*.js\") - find all .js files\n\t- \"**/node_modules/**\" - find all node_modules directories\n\t- \"**/test/**/test_*.ts\" - find all test_*.ts files in any test directory",
+            "type": "string"
+          },
+          "target_directory": {
+            "description": "Absolute path to directory to search for files in. If not provided, defaults to Cursor workspace root.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "glob_pattern"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Writes a file to the local filesystem.\n\nUsage:\n- This tool will overwrite the existing file if there is one at the provided path.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.",
+      "name": "Write",
+      "parameters": {
+        "properties": {
+          "contents": {
+            "description": "The contents to write to the file",
+            "type": "string"
+          },
+          "path": {
+            "description": "The absolute path to the file to modify",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "contents"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Performs exact string replacements in files.\n\nUsage:\n- When editing text, ensure you preserve the exact indentation (tabs/spaces) as it appears before.\n- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n- The edit will FAIL if old_string is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use replace_all to change every instance of old_string.\n- Use replace_all for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.\n- Optional parameter: replace_all (boolean, default false) — if true, replaces all occurrences of old_string in the file.\n\nIf you want to create a new file, use the Write tool instead.",
+      "name": "StrReplace",
+      "parameters": {
+        "properties": {
+          "new_string": {
+            "description": "The text to replace it with (must be different from old_string)",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "The text to replace",
+            "type": "string"
+          },
+          "path": {
+            "description": "The absolute path to the file to modify",
+            "type": "string"
+          },
+          "replace_all": {
+            "description": "Replace all occurrences of old_string (default false)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "old_string",
+          "new_string"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Deletes a file at the specified path. The operation will fail gracefully if:\n    - The file doesn't exist\n    - The operation is rejected for security reasons\n    - The file cannot be deleted",
+      "name": "Delete",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "The absolute path of the file to delete",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Read and display linter errors from the current workspace. You can provide paths to specific files or directories, or omit the argument to get diagnostics for all files.\n\n- If a file path is provided, returns diagnostics for that file only\n- If a directory path is provided, returns diagnostics for all files within that directory\n- If no path is provided, returns diagnostics for all files in the workspace\n- This tool can return linter errors that were already present before your edits, so avoid calling it with a very wide scope of files\n- NEVER call this tool on a file unless you've edited it or are about to edit it",
+      "name": "ReadLints",
+      "parameters": {
+        "properties": {
+          "paths": {
+            "description": "Optional. An array of paths to files or directories to read linter errors for. You can use either relative paths in the workspace or absolute paths. If provided, returns diagnostics for the specified files/directories only. If not provided, returns diagnostics for all files in the workspace.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Executes a given command in a shell session with optional foreground timeout.\n\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.\n\nBefore executing the command, please follow these steps:\n\n1. Check for Running Processes:\n   - Before starting dev servers or long-running processes that should not be duplicated, list the terminals folder to check if they are already running in existing terminals.\n   - You can use this information to determine which terminal, if any, matches the command you want to run, contains the output from the command you want to inspect, or has changed since you last read them.\n   - Since these are text files, you can read any terminal's contents simply by reading the file, search using Grep, etc.\n2. Directory Verification:\n   - If the command will create new directories or files, first run ls to verify the parent directory exists and is the correct location\n   - For example, before running \"mkdir foo/bar\", first run 'ls' to check that \"foo\" exists and is the intended parent directory\n3. Command Execution:\n   - Always quote file paths that contain spaces with double quotes (e.g., cd \"path with spaces/file.txt\")\n   - Examples of proper quoting:\n     - cd \"/Users/name/My Documents\" (correct)\n     - cd /Users/name/My Documents (incorrect - will fail)\n     - python \"/path/with spaces/script.py\" (correct)\n     - python /path/with spaces/script.py (incorrect - will fail)\n   - After ensuring proper quoting, execute the command.\n   - Capture the output of the command.\n\nUsage notes:\n\n- The command argument is required.\n- The shell starts in the workspace root and is stateful across sequential calls. Current working directory and environment variables persist between calls. Use the `working_directory` parameter to run commands in different directories. Example: to run `npm install` in the `frontend` folder, set `working_directory: \"frontend\"` rather than using `cd frontend && npm install`.\n- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.\n- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`.Instead use Grep, Glob to search.You MUST avoid read tools like `cat`, `head`, and `tail`, and use Read to read files.Avoid editing files with tools like `sed` and `awk`, use StrReplace instead.\n- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all users have pre-installed.\n- When issuing multiple commands:\n  - If the commands are independent and can run in parallel, make multiple Shell tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two Shell tool calls in parallel.\n  - If the commands depend on each other and must run sequentially, use a single Shell call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like mkdir before cp,Write before Shell for git operations, or git add before git commit), run these operations sequentially instead.\n  - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail\n  - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n\nDependencies:\n\nWhen adding new dependencies, prefer using the package manager (e.g. npm, pip) to add the latest version. Do not make up dependency versions.\n\n<managing-long-running-commands>\n- Commands that don't complete within `block_until_ms` (default 30s) are moved to background. The command keeps running and output streams to a terminal file. Set `block_until_ms: 0` to immediately background (use for dev servers, watchers, or any long-running process).\n- You do not need to use '&' at the end of commands.\n- Make sure to set `block_until_ms` to higher than the command's expected runtime. Add some buffer since block_until_ms includes shell startup time; increase buffer next time based on `elapsed_ms` if you chose too low. E.g. if you sleep for 40s, recommended `block_until_ms` is 45s.\n- Monitoring backgrounded commands:\n  - When command moves to background, check status immediately by reading the terminal file.\n  - Header has `pid` and `running_for_ms` (updated every 5000ms)\n  - When finished, footer with `exit_code` and `elapsed_ms` appears.\n  - Poll repeatedly to monitor by sleeping between checks. If the file gets large, read from the end of the file to capture the latest content.\n  - Pick your sleep intervals using best guess/judgment based on any knowledge you have about the command and its expected runtime, and any output from monitoring the command. When no new output, exponential backoff is a good strategy (e.g. sleep 2000ms, 4000ms, 8000ms, 16000ms...), using educated guess for min and max wait.\n  - If it's longer than expected and the command seems like it is hung, kill the process if safe to do so using the pid that appears in the header. If possible, try to fix the hang and proceed.\n  - Don't stop polling until: (a) `exit_code` footer appears (terminating command), (b) the command reaches a healthy steady state (only for non-terminating command, e.g. dev server/watcher), or (c) command is hung - follow guidance above.\n</managing-long-running-commands>\n\n<committing-changes-with-git>\nOnly create commits when requested by the user. If unclear, ask first. When the user asks you to create a new git commit, follow these steps carefully:\n\nGit Safety Protocol:\n\n- NEVER update the git config\n- NEVER run destructive/irreversible git commands (like push --force, hard reset, etc) unless the user explicitly requests them\n- NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it\n- NEVER run force push to main/master, warn the user if they request it\n- Avoid git commit --amend. ONLY use --amend when ALL conditions are met:\n  1. User explicitly requested amend, OR commit SUCCEEDED but pre-commit hook auto-modified files that need including\n  2. HEAD commit was created by you in this conversation (verify: git log -1 --format='%an %ae')\n  3. Commit has NOT been pushed to remote (verify: git status shows \"Your branch is ahead\")\n- CRITICAL: If commit FAILED or was REJECTED by hook, NEVER amend - fix the issue and create a NEW commit\n- CRITICAL: If you already pushed to remote, NEVER amend unless user explicitly requests it (requires force push)\n- NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive.\n\n1. You can call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. ALWAYS run the following shell commands in parallel, each using the Shell tool:\n   - Run a git status command to see all untracked files.\n   - Run a git diff command to see both staged and unstaged changes that will be committed.\n   - Run a git log command to see recent commit messages, so that you can follow this repository's commit message style.\n2. Analyze all staged changes (both previously staged and newly added) and draft a commit message:\n   - Summarize the nature of the changes (eg. new feature, enhancement to an existing feature, bug fix, refactoring, test, docs, etc.). Ensure the message accurately reflects the changes and their purpose (i.e. \"add\" means a wholly new feature, \"update\" means an enhancement to an existing feature, \"fix\" means a bug fix, etc.).\n   - Do not commit files that likely contain secrets (.env, credentials.json, etc). Warn the user if they specifically request to commit those files\n   - Draft a concise (1-2 sentences) commit message that focuses on the \"why\" rather than the \"what\"\n   - Ensure it accurately reflects the changes and their purpose\n3. Run the following commands sequentially:\n   - Add relevant untracked files to the staging area.\n   - Commit the changes with the message.\n   - Run git status after the commit completes to verify success.\n4. If the commit fails due to pre-commit hook, fix the issue and create a NEW commit (see amend rules above)\n\nImportant notes:\n\n- NEVER update the git config\n- NEVER run additional commands to read or explore code, besides git shell commands\n- DO NOT push to the remote repository unless the user explicitly asks you to do so\n- IMPORTANT: Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported.\n- If there are no changes to commit (i.e., no untracked files and no modifications), do not create an empty commit\n- In order to ensure good formatting, ALWAYS pass the commit message via a HEREDOC, a la this example:\n\n<example>git commit -m \"$(cat <<'EOF'\nCommit message here.\n\nEOF\n)\"</example>\n</committing-changes-with-git>\n\n<creating-pull-requests>\nUse the gh command via the Shell tool for ALL GitHub-related tasks including working with issues, pull requests, checks, and releases. If given a Github URL use the gh command to get the information needed.\n\nIMPORTANT: When the user asks you to create a pull request, follow these steps carefully:\n\n1. You have the capability to call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. ALWAYS run the following shell commands in parallel using the Shell tool, in order to understand the current state of the branch since it diverged from the main branch:\n   - Run a git status command to see all untracked files\n   - Run a git diff command to see both staged and unstaged changes that will be committed\n   - Check if the current branch tracks a remote branch and is up to date with the remote, so you know if you need to push to the remote\n   - Run a git log command and `git diff [base-branch]...HEAD` to understand the full commit history for the current branch (from the time it diverged from the base branch)\n2. Analyze all changes that will be included in the pull request, making sure to look at all relevant commits (NOT just the latest commit, but ALL commits that will be included in the pull request!!!), and draft a pull request summary\n3. Run the following commands sequentially:\n   - Create new branch if needed\n   - Push to remote with -u flag if needed\n   - Create PR using gh pr create with the format below. Use a HEREDOC to pass the body to ensure correct formatting.\n\n<example># First, push the branch (with required_permissions: [\"all\"])\ngit push -u origin HEAD\n\n# Then create the PR (with required_permissions: [\"all\"])\ngh pr create --title \"the pr title\" --body \"$(cat <<'EOF'\n## Summary\n<1-3 bullet points>\n\n## Test plan\n[Checklist of TODOs for testing the pull request...]\n\nEOF\n)\"</example>\n\nImportant:\n\n- NEVER update the git config\n- DO NOT use the TodoWrite or Task tools\n- Return the PR URL when you're done, so the user can see it\n</creating-pull-requests>\n\n<other-common-operations>\n- View comments on a Github PR: gh api repos/foo/bar/pulls/123/comments\n</other-common-operations>",
+      "name": "Shell",
+      "parameters": {
+        "properties": {
+          "block_until_ms": {
+            "description": "How long to block and wait for the command to complete before moving it to background (in milliseconds). Defaults to 30000ms (30 seconds). Set to 0 to immediately run the command in the background. The timer includes the shell startup time.",
+            "type": "number"
+          },
+          "command": {
+            "description": "The command to execute",
+            "type": "string"
+          },
+          "description": {
+            "description": "Clear, concise description of what this command does in 5-10 words",
+            "type": "string"
+          },
+          "working_directory": {
+            "description": "The absolute path to the working directory to execute the command in (defaults to current directory)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Fetch content from a specified URL and return its contents in a readable markdown format. Use this tool when you need to retrieve and analyze webpage content.\n\n- The URL must be a fully-formed, valid URL.\n- This tool is read-only and will not work for requests intended to have side effects.\n- This fetch tries to return live results but may return previously cached content.\n- Authentication is not supported, and an error will be returned if the URL requires authentication.\n- If the URL is returning a non-200 status code, e.g. 404, the tool will not return the content and will instead return an error message.\n- This fetch runs from an isolated server. Hosts like localhost or private IPs will not work.\n- This tool does not support fetching binary content, e.g. media or PDFs.\n- For static assets and non-webpage URLs, use the `Shell` tool instead.\n",
+      "name": "WebFetch",
+      "parameters": {
+        "properties": {
+          "url": {
+            "description": "The URL to fetch. The content will be converted to a readable markdown format.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Search the web for real-time information about any topic. Returns summarized information from search results and relevant URLs.\n\nUse this tool when you need up-to-date information that might not be available or correct in your training data, or when you need to verify current facts.\nThis includes queries about:\n- Libraries, frameworks, and tools whose APIs, best practices, or usage instructions are frequently updated. (\"How do I run Postgres in a container?\")\n- Current events or technology news. (\"Which AI model is best for coding?\")\n- Informational queries similar to what you might Google (\"kubernetes operator for mysql\")\n\nIMPORTANT - Use the correct year in search queries:\n- Today's date is 2026-03-14. You MUST use this year when searching for recent information, documentation, or current events.\n- Example: If today is 2026-07-15 and the user asks for \"latest React docs\", search for \"React documentation 2026\", NOT \"React documentation 2025\"",
+      "name": "WebSearch",
+      "parameters": {
+        "properties": {
+          "explanation": {
+            "description": "One sentence explanation as to why this tool is being used, and how it contributes to the goal.",
+            "type": "string"
+          },
+          "search_term": {
+            "description": "The search term to look up on the web. Be specific and include relevant keywords for better results. For technical queries, include version numbers or dates if relevant.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "search_term"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "`SemanticSearch`: semantic search that finds code by meaning, not exact text\n\n### When to Use This Tool\n\nUse `SemanticSearch` when you need to:\n- Explore unfamiliar codebases\n- Ask \"how / where / what\" questions to understand behavior\n- Find code by meaning rather than exact text\n\n### When NOT to Use\n\nSkip `SemanticSearch` for:\n1. Exact text matches (use `Grep`)\n2. Reading known files (use `Read`)\n3. Simple symbol lookups (use `Grep`)\n4. Find file by name (use `Glob`)\n\n### Examples\n\n<example>\n  Query: \"Where is interface MyInterface implemented in the frontend?\"\n<reasoning>\n  Good: Complete question asking about implementation location with specific context (frontend).\n</reasoning>\n</example>\n\n<example>\n  Query: \"Where do we encrypt user passwords before saving?\"\n<reasoning>\n  Good: Clear question about a specific process with context about when it happens.\n</reasoning>\n</example>\n\n<example>\n  Query: \"MyInterface frontend\"\n<reasoning>\n  BAD: Too vague; use a specific question instead. This would be better as \"Where is MyInterface used in the frontend?\"\n</reasoning>\n</example>\n\n<example>\n  Query: \"AuthService\"\n<reasoning>\n  BAD: Single word searches should use `Grep` for exact text matching instead.\n</reasoning>\n</example>\n\n<example>\n  Query: \"What is AuthService? How does AuthService work?\"\n<reasoning>\n  BAD: Combines two separate queries. A single semantic search is not good at looking for multiple things in parallel. Split into separate parallel searches: like \"What is AuthService?\" and \"How does AuthService work?\"\n</reasoning>\n</example>\n\n### Target Directories\n\n- Provide ONE directory or file path; [] searches the whole repo. No globs or wildcards.\n  Good:\n  - [\"backend/api/\"]   - focus directory\n  - [\"src/components/Button.tsx\"] - single file\n  - [] - search everywhere when unsure\n  BAD:\n  - [\"frontend/\", \"backend/\"] - multiple paths\n  - [\"src/**/utils/**\"] - globs\n  - [\"*.ts\"] or [\"**/*\"] - wildcard paths\n\n### Search Strategy\n\n1. Start with exploratory queries - semantic search is powerful and often finds relevant context in one go. Begin broad with [] if you're not sure where relevant code is.\n2. Review results; if a directory or file stands out, rerun with that as the target.\n3. Break large questions into smaller ones (e.g. auth roles vs session storage).\n4. For big files (>1K lines) run `SemanticSearch`, or `Grep` if you know the exact symbols you're looking for, scoped to that file instead of reading the entire file.\n\n<example>\n  Step 1: { \"query\": \"How does user authentication work?\", \"target_directories\": [], \"explanation\": \"Find auth flow\" }\n  Step 2: Suppose results point to backend/auth/ → rerun:\n          { \"query\": \"Where are user roles checked?\", \"target_directories\": [\"backend/auth/\"], \"explanation\": \"Find role logic\" }\n<reasoning>\n  Good strategy: Start broad to understand overall system, then narrow down to specific areas based on initial results.\n</reasoning>\n</example>\n\n<example>\n  Query: \"How are websocket connections handled?\"\n  Target: [\"backend/services/realtime.ts\"]\n<reasoning>\n  Good: We know the answer is in this specific file, but the file is too large to read entirely, so we use semantic search to find the relevant parts.\n</reasoning>\n</example>\n\n### Usage\n- When full chunk contents are provided, avoid re-reading the exact same chunk contents using the Read tool.\n- Sometimes, just the chunk signatures and not the full chunks will be shown. Chunk signatures are usually Class or Function signatures that chunks are contained in. Use the Read or Grep tools to explore these chunks or files if you think they might be relevant.\n- When reading chunks that weren't provided as full chunks (e.g. only as line ranges or signatures), you'll sometimes want to expand the chunk ranges to include the start of the file to see imports, expand the range to include lines from the signature, or expand the range to read multiple chunks from a file at once.",
+      "name": "SemanticSearch",
+      "parameters": {
+        "properties": {
+          "query": {
+            "description": "A complete question about what you want to understand. Ask as if talking to a colleague: 'How does X work?', 'What happens when Y?', 'Where is Z handled?'",
+            "type": "string"
+          },
+          "target_directories": {
+            "description": "Prefix directory paths to limit search scope (single directory only, no glob patterns)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "query",
+          "target_directories"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "Collect structured multiple-choice answers from the user.\nProvide one or more questions with options, and set allow_multiple when multi-select is appropriate.\n\nUse this tool when you need to gather specific information from the user through a structured question format.\nEach question should have:\n- A unique id (used to match answers)\n- A clear prompt/question text\n- At least 2 options for the user to choose from\n- An optional allow_multiple flag (defaults to false for single-select)\nBy default, the tool will present the questions to the user and wait for their responses before continuing.",
+      "name": "AskQuestion",
+      "parameters": {
+        "properties": {
+          "questions": {
+            "description": "Array of questions to present to the user (minimum 1 required)",
+            "items": {
+              "properties": {
+                "allow_multiple": {
+                  "description": "If true, user can select multiple options. Defaults to false.",
+                  "type": "boolean"
+                },
+                "id": {
+                  "description": "Unique identifier for this question",
+                  "type": "string"
+                },
+                "options": {
+                  "description": "Array of answer options (minimum 2 required)",
+                  "items": {
+                    "properties": {
+                      "id": {
+                        "description": "Unique identifier for this option",
+                        "type": "string"
+                      },
+                      "label": {
+                        "description": "Display text for this option",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "label"
+                    ],
+                    "type": "object"
+                  },
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "prompt": {
+                  "description": "The question text to display to the user",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "prompt",
+                "options"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "title": {
+            "description": "Optional title for the questions form",
+            "type": "string"
+          }
+        },
+        "required": [
+          "questions"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  }
+]
