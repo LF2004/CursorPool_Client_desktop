@@ -509,6 +509,88 @@ function parseLocalProxyPort(proxyValue) {
   return match ? Number(match[1]) || 0 : 0;
 }
 
+function normalizeRelayPort(value) {
+  const port = Number(value);
+  if (!Number.isFinite(port)) return 0;
+  if (port <= 0 || port > 65535) return 0;
+  return Math.floor(port);
+}
+
+function parseExplicitRelayPort(payload = {}) {
+  return normalizeRelayPort(
+    payload.frontProxyPort
+      || payload.proxyPort
+      || payload.runnerPort
+      || payload.port,
+  );
+}
+
+async function probeRelayRunnerByCandidates(ports = []) {
+  const seen = new Set();
+  const candidates = ports
+    .map((value) => normalizeRelayPort(value))
+    .filter((port) => {
+      if (!port || seen.has(port)) return false;
+      seen.add(port);
+      return true;
+    });
+
+  let fallbackStatus = null;
+  for (const port of candidates) {
+    // eslint-disable-next-line no-await-in-loop
+    const status = await getLocalRelayRunnerStatus({ port });
+    if (!fallbackStatus) fallbackStatus = status;
+    if (status?.running || status?.healthOk) {
+      return { status, port };
+    }
+  }
+
+  return {
+    status: fallbackStatus || await getLocalRelayRunnerStatus({ port: DEFAULT_PORT }),
+    port: candidates[0] || DEFAULT_PORT,
+  };
+}
+
+function resolveCanonicalRelayPort(options = {}) {
+  const payload = options.payload && typeof options.payload === 'object' ? options.payload : {};
+  const status = options.status && typeof options.status === 'object' ? options.status : {};
+  const lastConfig = options.lastConfig && typeof options.lastConfig === 'object' ? options.lastConfig : {};
+  const preferExplicit = options.preferExplicit === true;
+  const ignoreExplicit = options.ignoreExplicit === true;
+
+  const explicitPort = ignoreExplicit ? 0 : parseExplicitRelayPort(payload);
+  const runnerPort = normalizeRelayPort(status?.runner?.port);
+  const lastConfigPort = normalizeRelayPort(lastConfig?.port);
+  const configuredProxyPort = normalizeRelayPort(
+    status?.configuredProxyPort || status?.frontProxyPort,
+  );
+
+  if (preferExplicit && explicitPort) return explicitPort;
+  if (runnerPort && (!explicitPort || explicitPort === runnerPort || explicitPort === lastConfigPort)) {
+    return runnerPort;
+  }
+  if (lastConfigPort && (!explicitPort || explicitPort === lastConfigPort)) {
+    return lastConfigPort;
+  }
+  if (explicitPort) return explicitPort;
+  if (configuredProxyPort) return configuredProxyPort;
+  return DEFAULT_PORT;
+}
+
+function isRelayAlignedConfig(status = {}) {
+  const argvProxy = String(status?.argv?.proxyServer || status?.proxyServer || '').trim();
+  const settingsProxy = String(status?.systemProxy?.cursorSettings?.httpProxy || '').trim();
+  const providerBaseUrl = String(status?.cursorSettings?.openAIBaseUrl || '').trim();
+  const runnerPort = Number(status?.runner?.port || status?.frontProxyPort || DEFAULT_PORT) || DEFAULT_PORT;
+  const expectedProxy = `http://127.0.0.1:${runnerPort}`;
+  const providerExpected = `${expectedProxy}/v1`;
+  return Boolean(
+    argvProxy === expectedProxy
+    || settingsProxy === expectedProxy
+    || providerBaseUrl === providerExpected
+  );
+}
+
 function hasProxyWhitelist(mainText) {
   return ['"proxy-server"', '"proxy-pac-url"', '"no-proxy-server"'].every((needle) => mainText.includes(needle));
 }
@@ -659,6 +741,7 @@ async function readCursorRelayProxyConfig(options = {}) {
   const lightweight = options.lightweight === true;
   const argv = readArgvJson();
   const systemProxy = readRelayProxyState({ skipWindows: lightweight });
+  const lastRunnerConfig = readLastRelayRunnerConfig();
   const mainJsPath = resolveMainJsPath();
   // lightweight 模式跳过 readFileSync(main.js) — 文件可能数 MB，includes 搜索会阻塞事件循环
   const mainJsAllowsProxy = lightweight
@@ -702,8 +785,20 @@ async function readCursorRelayProxyConfig(options = {}) {
   const mockProxy = getPlanUiMockState();
   const inferredPort = parseLocalProxyPort(argv.data['proxy-server'])
     || parseLocalProxyPort(systemProxy?.cursorSettings?.httpProxy)
-    || DEFAULT_PORT;
-  const runner = await getLocalRelayRunnerStatus({ port: inferredPort });
+    || 0;
+  const runnerProbe = await probeRelayRunnerByCandidates([
+    lastRunnerConfig?.port,
+    inferredPort,
+    DEFAULT_PORT,
+  ]);
+  const runner = runnerProbe.status;
+  const relayPort = resolveCanonicalRelayPort({
+    status: {
+      runner,
+      configuredProxyPort: inferredPort,
+    },
+    lastConfig: lastRunnerConfig,
+  });
   const logPaths = getRunnerLogPaths();
   const log = lightweight
     ? {
@@ -754,12 +849,18 @@ async function readCursorRelayProxyConfig(options = {}) {
     argvExists: argv.exists,
     mainJsPath: mainJsPath || '',
     mainJsAllowsProxy,
-    enabled: Boolean(argv.data['proxy-server'] || argv.data['proxy-pac-url']),
+    enabled: Boolean(
+      argv.data['proxy-server']
+      || argv.data['proxy-pac-url']
+      || systemProxy?.cursorSettings?.httpProxy
+      || modelProxy?.config?.baseUrl,
+    ),
     proxyServer: String(argv.data['proxy-server'] || '').trim(),
     proxyPacUrl: String(argv.data['proxy-pac-url'] || '').trim(),
     proxyBypassList: String(argv.data['proxy-bypass-list'] || '').trim(),
     noProxyServer: Boolean(argv.data['no-proxy-server']),
-    frontProxyPort: inferredPort,
+    frontProxyPort: relayPort,
+    configuredProxyPort: inferredPort || relayPort,
     cursorRunning: lightweight ? Boolean(runner.running) : isCursorRunningHeuristic(),
     argv: {
       path: argv.argvPath,
@@ -814,6 +915,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   const frontProxyPort = Number(payload.frontProxyPort || payload.proxyPort || payload.runnerPort || DEFAULT_PORT);
   const disableHttp2 = payload.disableHttp2 !== false;
   const proxyStrictSSL = payload.proxyStrictSSL === true;
+  const skipCursorAuthEnsure = payload.skipCursorAuthEnsure === true;
   const enableReviewBridge = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge')
     ? payload.enableReviewBridge === true
     : DEFAULT_ENABLE_REVIEW_BRIDGE;
@@ -863,7 +965,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   }
 
   let runner = null;
-  const cursorAuthEnsure = null;
+  let cursorAuthEnsure = null;
   if (upstream || runnerMode === 'official_passthrough') {
     const officialPassthrough = runnerMode === 'official_passthrough';
     const localNativeAgentTools = officialPassthrough ? false : true;
@@ -943,6 +1045,27 @@ async function applyCursorRelayProxyConfig(payload = {}) {
     }
   }
 
+  if (!skipCursorAuthEnsure && runnerMode !== 'official_passthrough') {
+    const explicitCredentials =
+      payload.credentials && typeof payload.credentials === 'object'
+        ? payload.credentials
+        : (payload.cursorAuthCredentials && typeof payload.cursorAuthCredentials === 'object'
+          ? payload.cursorAuthCredentials
+          : null);
+    cursorAuthEnsure = await ensureCursorAccount({
+      allowRunningCursor: true,
+      ...(explicitCredentials ? { credentials: explicitCredentials } : {}),
+    });
+    if (!cursorAuthEnsure?.ok) {
+      cursorAuthEnsure = await ensureCursorAuthIfNeeded(explicitCredentials || undefined).catch((error) => ({
+        ok: false,
+        skipped: false,
+        reason: 'fallback_failed',
+        error: error?.message || String(error || 'ensure cursor auth failed'),
+      }));
+    }
+  }
+
   proxyServer = String(payload.proxyServer || runner.proxyServer || '').trim();
   proxyPacUrl = String(payload.proxyPacUrl || '').trim();
   if (!proxyServer && !proxyPacUrl) {
@@ -977,7 +1100,9 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   reviewBridgePatchResult = {
     ok: true,
     changed: false,
-    alreadyPatched: enableReviewBridge,
+    skipped: true,
+    alreadyPatched: false,
+    requested: enableReviewBridge,
     ...readRelayReviewBridgePatchStatus(patchResult.mainJsPath),
   };
   const argv = readArgvJson();
@@ -1103,8 +1228,8 @@ async function applyCursorRelayProxyConfig(payload = {}) {
 
 async function restartRelayRunnerAfterCertRepair(payload = {}) {
   const status = await readCursorRelayProxyConfig({ lightweight: true });
-  const port = Number(payload.frontProxyPort || payload.proxyPort || status.frontProxyPort || DEFAULT_PORT);
   const lastConfig = readLastRelayRunnerConfig();
+  const port = resolveCanonicalRelayPort({ payload, status, lastConfig, ignoreExplicit: true });
   const upstream = sanitizeRelayUpstream(payload.upstream) || sanitizeRelayUpstream(lastConfig?.upstream);
   const mode = String(payload.mode || lastConfig?.mode || status.runner?.mode || 'local_relay').trim() || 'local_relay';
   const shouldRestart = status.enabled || status.runner?.running || Boolean(upstream) || mode === 'official_passthrough';
@@ -1212,9 +1337,15 @@ async function installRelayCaCertificateFull(payload = {}) {
 
 async function ensureCursorRelayRunner(payload = {}) {
   const status = await readCursorRelayProxyConfig({ lightweight: true });
-  const port = Number(payload.frontProxyPort || payload.proxyPort || payload.runnerPort || status.frontProxyPort || DEFAULT_PORT);
-  const hasReviewBridgePreference = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge');
   const lastConfig = readLastRelayRunnerConfig();
+  const port = resolveCanonicalRelayPort({ payload, status, lastConfig, ignoreExplicit: true });
+  const hasReviewBridgePreference = Object.prototype.hasOwnProperty.call(payload, 'enableReviewBridge');
+  const restoreMode = String(
+    payload.mode
+    || lastConfig?.mode
+    || status.runner?.mode
+    || 'local_relay',
+  ).trim() || 'local_relay';
   const desiredReviewBridge = hasReviewBridgePreference
     ? payload.enableReviewBridge === true
     : DEFAULT_ENABLE_REVIEW_BRIDGE;
@@ -1239,7 +1370,7 @@ async function ensureCursorRelayRunner(payload = {}) {
   }
 
   const startOptions = buildRelayStartOptionsFromConfig(lastConfig, {
-    mode: payload.mode || 'local_relay',
+    mode: restoreMode,
     directMitmPort: payload.directMitmPort,
     localNativeAgentTools: payload.localNativeAgentTools,
     structuredAgentToolCalls: payload.structuredAgentToolCalls,
@@ -1261,6 +1392,56 @@ async function ensureCursorRelayRunner(payload = {}) {
     reused: Boolean(runner?.reused),
     runner: refreshed.runner || runner,
     status: refreshed,
+  };
+}
+
+async function realignCursorRelayProxyTargets(payload = {}) {
+  const status = await readCursorRelayProxyConfig({ lightweight: false });
+  const runner = status?.runner || {};
+  const lastConfig = readLastRelayRunnerConfig();
+  const relayPort = resolveCanonicalRelayPort({
+    payload,
+    status: {
+      ...status,
+      runner,
+    },
+    lastConfig,
+    preferExplicit: true,
+  });
+  const proxyServer = `http://127.0.0.1:${relayPort}`;
+  const bypassList = String(payload.proxyBypassList || status.proxyBypassList || DEFAULT_PROXY_BYPASS_LIST).trim() || DEFAULT_PROXY_BYPASS_LIST;
+  const shouldRepair = payload.force === true || !isRelayAlignedConfig(status);
+  if (!shouldRepair) {
+    return {
+      ok: true,
+      changed: false,
+      proxyServer,
+      status,
+      message: 'Relay 代理入口已对齐，无需修复。',
+    };
+  }
+
+  const argv = readArgvJson();
+  const next = { ...argv.data };
+  next['proxy-server'] = proxyServer;
+  next['proxy-bypass-list'] = bypassList;
+  delete next['proxy-pac-url'];
+  delete next['no-proxy-server'];
+  const argvPath = writeArgvJson(next);
+  const cursorSettings = applyCursorHttpProxySettings(proxyServer, {
+    disableHttp2: true,
+    proxyStrictSSL: false,
+  });
+  const refreshed = await readCursorRelayProxyConfig({ lightweight: true });
+  return {
+    ok: true,
+    changed: true,
+    proxyServer,
+    argvPath,
+    cursorSettings,
+    windows: { ok: true, skipped: true, message: '未修改 Windows 系统代理。' },
+    status: refreshed,
+    message: '已强制把 Cursor argv/settings 重新对齐到本地 Relay，未修改 Windows 系统代理。',
   };
 }
 
@@ -1342,7 +1523,6 @@ async function quickSwitchRelayModel(payload = {}) {
       restartCursor: false,
       reloadCursor: false,
       installCert: false,
-      useSystemProxy: false,
       disableByok: true,
       mode: 'local_relay',
       localNativeAgentTools: true,
@@ -1350,7 +1530,7 @@ async function quickSwitchRelayModel(payload = {}) {
       emitLocalToolInteractionFrames: true,
       emitLocalStepFrames: true,
       enableReviewBridge: DEFAULT_ENABLE_REVIEW_BRIDGE,
-      skipCursorAuthEnsure: true,
+      useSystemProxy: false,
     });
     return {
       ok: true,
@@ -1372,7 +1552,6 @@ async function quickSwitchRelayModel(payload = {}) {
     restartCursor: false,
     reloadCursor: false,
     installCert: false,
-    useSystemProxy: false,
     disableByok: true,
     mode: switchingFromOfficialPassthrough ? 'local_relay' : (currentMode || 'local_relay'),
     localNativeAgentTools: switchingFromOfficialPassthrough
@@ -1392,7 +1571,7 @@ async function quickSwitchRelayModel(payload = {}) {
       : status?.runner?.emitLocalStepFrames === true,
     maxLocalToolCallsPerRound: status?.runner?.maxLocalToolCallsPerRound || 12,
     enableReviewBridge: DEFAULT_ENABLE_REVIEW_BRIDGE,
-    skipCursorAuthEnsure: true,
+    useSystemProxy: false,
   });
   return {
     ok: true,
@@ -1436,8 +1615,10 @@ async function disableCursorRelayProxyConfig(payload = {}) {
   const reviewBridgeRestoreResult = {
     ok: true,
     changed: false,
-    alreadyRestored: true,
-    ...readRelayReviewBridgePatchStatus(),
+    skipped: true,
+    alreadyRestored: false,
+    requested: false,
+    ...readRelayReviewBridgePatchStatus(mainJsRestoreResult?.mainJsPath),
   };
 
   let restarted = false;
@@ -2074,6 +2255,7 @@ module.exports = {
   readCursorRelayProxyConfig,
   applyCursorRelayProxyConfig,
   ensureCursorRelayRunner,
+  realignCursorRelayProxyTargets,
   quickSwitchRelayModel,
   disableCursorRelayProxyConfig,
   disableByokForRelay,

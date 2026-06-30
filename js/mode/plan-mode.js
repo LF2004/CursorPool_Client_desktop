@@ -11,6 +11,11 @@ const {
   buildAgentAskQuestionQueryFrame,
   buildAgentCreatePlanQueryFrame,
 } = require('../utils/cursor-relay-protocol');
+const {
+  getAskQuestionResponseStatus,
+  normalizeAskQuestionAnswers,
+  hasAskQuestionResponseResolution,
+} = require('./plan-workflow');
 
 const PLAN_TOOL_NAMES = [
   'Read',
@@ -190,7 +195,7 @@ function buildHistoryInteractionQueryRequest(kind = '', args = {}) {
 }
 
 function formatAskQuestionAnswersForContinuation(answers = []) {
-  const lines = (Array.isArray(answers) ? answers : [])
+  const lines = normalizeAskQuestionAnswers(answers)
     .map((answer) => {
       const questionId = String(answer?.questionId || '').trim() || 'question';
       const selected = Array.isArray(answer?.selectedOptionIds) && answer.selectedOptionIds.length
@@ -210,13 +215,16 @@ function buildInteractionContinuationPrompt(pendingInteraction = {}, interaction
   const responseKind = String(interactionResponse?.kind || '').trim();
   const pendingKind = String(pendingInteraction?.kind || '').trim();
   if (responseKind === 'ask_question_interaction_response' || pendingKind === 'ask_question') {
-    const askQuestion = interactionResponse?.askQuestion || {};
-    const status = String(askQuestion.kind || 'success').trim() || 'success';
-    const answersSummary = formatAskQuestionAnswersForContinuation(askQuestion.answers || []);
+    const status = getAskQuestionResponseStatus(interactionResponse) || 'success';
+    const answersSummary = formatAskQuestionAnswersForContinuation(interactionResponse?.askQuestion?.answers || []);
     return [
       'The pending AskQuestion interaction has completed. Continue the same plan turn from this clarification.',
       `Interaction status: ${status}.`,
-      answersSummary ? `Answers:\n${answersSummary}` : 'Answers: none provided.',
+      answersSummary
+        ? `Answers:\n${answersSummary}`
+        : (status === 'success'
+          ? 'Answers: the user confirmed the clarification prompt without structured option payloads.'
+          : 'Answers: none provided.'),
       'Do not ask the same clarification again. Use these answers to continue the plan immediately.',
       'Before calling CreatePlan, perform one fresh read-only reconnaissance step in the current workspace after these answers so the plan reflects the updated scope.',
     ].join('\n');
@@ -428,6 +436,13 @@ function buildCompletedInteractionStatePatch(session = {}, interactionResponse =
       pendingCount: 1,
       plan: planState,
     });
+  }
+  if (String(interactionResponse?.kind || '').trim() === 'ask_question_interaction_response') {
+    return {
+      current_loop_status: hasAskQuestionResponseResolution(interactionResponse) ? 'running' : 'completed',
+      waiting_for_interaction: null,
+      plan: planState,
+    };
   }
   return {
     current_loop_status: 'completed',

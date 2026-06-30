@@ -105,6 +105,8 @@ const {
   buildPlanWorkflowUpdateForInteractionResponse,
   shouldAllowFreshPlanExploreDespiteDuplicate: shouldAllowFreshPlanExploreDespiteDuplicateState,
   buildPlanWorkflowUpdateForConversationAction,
+  getAskQuestionResponseStatus,
+  hasAskQuestionResponseResolution,
 } = require('../mode/plan-workflow');
 const {
   recordRelayUsage,
@@ -158,6 +160,7 @@ const DEFAULT_RELAY_SCAN_IGNORE = Object.freeze(['node_modules', '.git', 'dist',
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
+const { createRelayTlsContextProvider } = require('./cursor-relay-cert');
 function parseArgs(argv) {
   const out = {};
   for (let i = 2; i < argv.length; i += 1) {
@@ -276,6 +279,12 @@ function describeOutboundProxyForLog(proxyConfig = null) {
   if (!proxyConfig?.enabled || !proxyConfig.url) return 'direct';
   const source = String(proxyConfig.source || 'proxy').trim() || 'proxy';
   return `${source}:${maskProxyUrlForLog(proxyConfig.url)}`;
+}
+
+function buildForwardProxyFetch(config = {}) {
+  return createProxyAwareFetch(config?.outboundProxy || null, {
+    localProxyPorts: [Number(config?.port) || 0],
+  });
 }
 
 function createConfigProxyFetch(config = {}) {
@@ -1721,6 +1730,44 @@ function isPlanExecutionActionKind(actionKind = '') {
   return normalized === 'execute_plan_action' || normalized === 'start_plan_action';
 }
 
+function isAwaitingRunsseRebind(session = {}) {
+  return Boolean(
+    session
+    && !session.aborted
+    && !session.completed
+    && session.awaitingRunsseRebind === true
+  );
+}
+
+function shouldKeepSessionForRunsseRebind(session = {}) {
+  return Boolean(session?.waitingForInteraction) || isAwaitingRunsseRebind(session);
+}
+
+function isDetachedActiveRelaySession(session = {}) {
+  return Boolean(
+    session
+    && !session.aborted
+    && !session.completed
+    && session.streamDetached === true
+    && session.waitingForInteraction !== true
+    && session.awaitingRunsseRebind !== true
+    && session.active === true
+    && session.relaying === true
+  );
+}
+
+function shouldRetainSessionForRunsseRebind(session = {}) {
+  return shouldKeepSessionForRunsseRebind(session) || isDetachedActiveRelaySession(session);
+}
+
+function hasReplayableSessionProgress(session = {}) {
+  return Boolean(
+    session?.lastUserMessageCapture?.userText
+    || (Array.isArray(session?.generatedChunks) && session.generatedChunks.length > 0)
+    || session?.relaying
+  );
+}
+
 function shouldTreatPlanTurnAsFreshRequest(session = {}) {
   if (!isPlanModeSession(session)) return false;
   if (session?.waitingForInteraction) return false;
@@ -1743,7 +1790,7 @@ function shouldReuseWaitingSessionForSameUserText(session = {}) {
 }
 
 function shouldReuseWaitingSessionForPendingCapture(session = {}, pendingCapture = null) {
-  if (!session?.waitingForInteraction) return false;
+  if (!shouldKeepSessionForRunsseRebind(session)) return false;
   const actionKind = String(
     pendingCapture?.debug?.agentClientMessage?.runRequest?.action?.kind
     || ''
@@ -1756,7 +1803,7 @@ function shouldReuseWaitingSessionForPendingCapture(session = {}, pendingCapture
 }
 
 function shouldReuseWaitingSessionForRunRequest(session = {}, decoded = {}) {
-  if (!session?.waitingForInteraction) return false;
+  if (!shouldKeepSessionForRunsseRebind(session)) return false;
   const actionKind = String(
     decoded?.debug?.agentClientMessage?.runRequest?.action?.kind
     || ''
@@ -1769,8 +1816,10 @@ function clearSessionPlanPresentationState(session = {}, options = {}) {
   const clearTodos = options.clearTodos !== false;
   session.latestPlanState = null;
   session.suppressedPlanText = '';
+  session.awaitingRunsseRebind = false;
   session.lastPlanResumeMessages = [];
   session.planTurnHandoff = '';
+  session.modeTurnHandoff = '';
   session.deferredInteractionResponse = null;
   session.planWorkflow = clonePlanWorkflowState();
   if (clearTodos) {
@@ -1960,7 +2009,7 @@ function findWaitingSessionByStableConversationId(agentSessions, stableConversat
   const target = String(stableConversationId || '').trim();
   if (!target || !agentSessions?.size) return null;
   for (const session of agentSessions.values()) {
-    if (!session || session.aborted || !session.waitingForInteraction) continue;
+    if (!session || session.aborted || !shouldRetainSessionForRunsseRebind(session)) continue;
     if (excludeRequestId && String(session.requestId || '').trim() === String(excludeRequestId || '').trim()) continue;
     if (getSessionStableConversationId(session) === target) return session;
   }
@@ -2055,6 +2104,29 @@ function replayWaitingSessionPlanCheckpoint(session = {}, logger = null) {
   return emitPresentedPlanCheckpoint(session, logger, { force: true });
 }
 
+function scheduleExecutePlanSessionResume(session, interactionResponse, config, logger, stats, pendingInteraction = null, source = 'execute_plan_action') {
+  if (!session || session.aborted) return false;
+  session.awaitingRunsseRebind = true;
+  session.modeTurnHandoff = 'execute_plan';
+  session.deferredInteractionResponse = {
+    interactionResponse,
+    pendingInteraction,
+    capturedAt: new Date().toISOString(),
+  };
+  const delayMs = Math.max(0, Number(config?.executePlanResumeDelayMs) || 300);
+  setTimeout(() => {
+    if (!session || session.aborted || session.relaying) return;
+    if (!session.deferredInteractionResponse?.interactionResponse) return;
+    if (session.streamDetached || !session.active || !session.res) return;
+    logger?.info?.(
+      `agent local relay execute_plan fallback resume requestId=${session.requestId || '-'} source=${source} delayMs=${delayMs}`,
+    );
+    session.awaitingRunsseRebind = false;
+    triggerDeferredInteractionResume(session, config, logger, stats, `execute_plan_fallback:${source}`);
+  }, delayMs);
+  return true;
+}
+
 function maybeHandleRunRequestConversationAction(session, decoded, config, logger, stats, pendingAgentInteractions, ack) {
   const action = decoded?.debug?.agentClientMessage?.runRequest?.action || null;
   const actionKind = String(action?.kind || '').trim();
@@ -2116,7 +2188,9 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
   }
   session.relaying = false;
   session.waitingForInteraction = false;
+  session.awaitingRunsseRebind = true;
   session.planTurnHandoff = '';
+  session.modeTurnHandoff = 'execute_plan';
   session.deferredInteractionResponse = null;
   const interactionResponse = buildSyntheticPlanExecutionResponse(session, action);
   const pendingInteraction = clonePendingInteractionSnapshot(
@@ -2188,8 +2262,15 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
   });
   ack();
   if (session.active && !session.aborted) {
-    resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
-      .catch((error) => failAgentRelaySession(session, logger, error, 'run_request_execute_plan'));
+    scheduleExecutePlanSessionResume(
+      session,
+      interactionResponse,
+      config,
+      logger,
+      stats,
+      pendingInteraction,
+      'run_request_execute_plan',
+    );
   }
   return true;
 }
@@ -2248,19 +2329,21 @@ function shouldKeepWaitingForInteractionResponse(pendingInteraction = {}, intera
     return true;
   }
   if (pendingKind !== 'ask_question' || responseKind !== 'ask_question_interaction_response') return false;
-  const askQuestion = interactionResponse?.askQuestion || {};
-  const status = String(askQuestion.kind || '').trim().toLowerCase();
-  const answers = Array.isArray(askQuestion.answers) ? askQuestion.answers : [];
-  const hasAnswers = answers.some((answer) => {
-    const selected = Array.isArray(answer?.selectedOptionIds) ? answer.selectedOptionIds.filter(Boolean) : [];
-    const freeform = String(answer?.freeformText || '').trim();
-    return selected.length > 0 || Boolean(freeform);
-  });
-  if (status === 'success' && hasAnswers) return false;
-  if (status === 'rejected') return true;
-  if (status === 'error') return true;
-  if (!hasAnswers) return true;
+  const status = getAskQuestionResponseStatus(interactionResponse);
+  const hasResolution = hasAskQuestionResponseResolution(interactionResponse);
+  if (status === 'success' || hasResolution) return false;
+  if (status === 'rejected') return false;
+  if (status === 'error') return false;
   return false;
+}
+
+function shouldIgnoreStaleInteractionResponseDuringExecutePlan(session = {}, interactionResponse = {}, pendingInteraction = null) {
+  if (!session || pendingInteraction) return false;
+  const kind = String(interactionResponse?.kind || '').trim();
+  if (!kind) return false;
+  if (String(session.modeTurnHandoff || '').trim() !== 'execute_plan') return false;
+  if (session.awaitingRunsseRebind !== true && session.relaying !== true) return false;
+  return kind === 'ask_question_interaction_response' || kind === 'create_plan_request_response';
 }
 
 function syncPlanWorkflowAfterToolExecution(session = {}, toolCall = {}, execution = {}) {
@@ -2328,6 +2411,7 @@ function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logge
   if (!waitingSession || !placeholderSession || waitingSession === placeholderSession) return null;
   clearInterval(placeholderSession.heartbeat);
   placeholderSession.heartbeat = null;
+  const wasRelaying = Boolean(waitingSession.relaying);
   waitingSession.req = placeholderSession.req;
   waitingSession.res = placeholderSession.res;
   waitingSession.rawBody = placeholderSession.rawBody;
@@ -2343,7 +2427,7 @@ function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logge
   waitingSession.completed = false;
   waitingSession.intercepted = true;
   waitingSession.streamDetached = false;
-  waitingSession.relaying = false;
+  waitingSession.relaying = wasRelaying;
   waitingSession.active = true;
   waitingSession.aborted = false;
   waitingSession.historyCompleted = false;
@@ -2366,8 +2450,12 @@ function adoptPlaceholderRunSseSession(waitingSession, placeholderSession, logge
   logger?.info?.(
     `agent local relay adopted placeholder RunSSE requestId=${placeholderSession.requestId || '-'} into waiting session requestId=${waitingSession.requestId || '-'}`
   );
-  replayWaitingSessionPlanCheckpoint(waitingSession, logger);
-  replayPendingInteractionQueries(waitingSession, logger);
+  if (preservedChunks.length > 0) {
+    replayAgentGeneratedChunks(waitingSession, preservedChunks, logger);
+  } else if (!wasRelaying) {
+    replayWaitingSessionPlanCheckpoint(waitingSession, logger);
+    replayPendingInteractionQueries(waitingSession, logger);
+  }
   return waitingSession;
 }
 
@@ -2377,6 +2465,14 @@ function getAgentTurnScopeKey(requestId, userText, workspaceRoot = '', debug = n
   const turnId = String(requestId || '').trim();
   if (!turnId) return '';
   return `scope:${normalizedWorkspace}:${turnId}:${textHash}`;
+}
+
+function getAgentTurnStableConversationKey(userText, workspaceRoot = '', debug = null) {
+  const textHash = hashRelayText(userText);
+  const normalizedWorkspace = normalizeWorkspaceRoot(workspaceRoot || '') || '';
+  const stableConversationId = extractStableConversationId(debug || null);
+  if (!stableConversationId) return '';
+  return `stable:${normalizedWorkspace}:${stableConversationId}:${textHash}`;
 }
 
 function extractStableConversationId(debug = {}) {
@@ -2470,6 +2566,8 @@ function rememberCompletedAgentTurn(completedAgentTurns, requestId, userText, wo
   completedAgentTurns.set(`${requestId}:${entry.textHash}`, entry);
   const scopeKey = getAgentTurnScopeKey(requestId, userText, workspaceRoot, debug);
   if (scopeKey) completedAgentTurns.set(scopeKey, entry);
+  const stableKey = getAgentTurnStableConversationKey(userText, workspaceRoot, debug);
+  if (stableKey) completedAgentTurns.set(stableKey, entry);
   for (const [key, entry] of completedAgentTurns.entries()) {
     if (!entry?.expiresAt || entry.expiresAt < now) completedAgentTurns.delete(key);
   }
@@ -2479,17 +2577,22 @@ function getCompletedAgentTurn(completedAgentTurns, requestId, userText, workspa
   if (!completedAgentTurns || !requestId || !userText) return null;
   const textHash = hashRelayText(userText);
   const scopeKey = getAgentTurnScopeKey(requestId, userText, workspaceRoot, debug);
+  const stableKey = getAgentTurnStableConversationKey(userText, workspaceRoot, debug);
   const key = `${requestId}:${textHash}`;
-  const entry = completedAgentTurns.get(key) || (scopeKey ? completedAgentTurns.get(scopeKey) : null);
+  const entry = completedAgentTurns.get(key)
+    || (scopeKey ? completedAgentTurns.get(scopeKey) : null)
+    || (stableKey ? completedAgentTurns.get(stableKey) : null);
   if (!entry) return null;
   if (entry.hadError) {
     completedAgentTurns.delete(key);
     if (scopeKey) completedAgentTurns.delete(scopeKey);
+    if (stableKey) completedAgentTurns.delete(stableKey);
     return null;
   }
   if (entry.expiresAt && entry.expiresAt < Date.now()) {
     completedAgentTurns.delete(key);
     if (scopeKey) completedAgentTurns.delete(scopeKey);
+    if (stableKey) completedAgentTurns.delete(stableKey);
     return null;
   }
   return entry;
@@ -2631,8 +2734,18 @@ function completeSessionHistory(session, status = 'completed', modelCallId = '')
 
 function abortAgentSession(session, logger, reason = 'aborted') {
   if (!session || session.aborted) return;
-  if (session.waitingForInteraction && reason === 'runsse_closed') {
+  if (shouldKeepSessionForRunsseRebind(session) && reason === 'runsse_closed') {
     detachWaitingInteractionSession(session, logger, reason);
+    return;
+  }
+  if (
+    reason === 'runsse_closed'
+    && session.active
+    && !session.completed
+    && !session.waitingForInteraction
+    && hasReplayableSessionProgress(session)
+  ) {
+    detachActiveRelaySession(session, logger, reason);
     return;
   }
   if (!session.turnEnded && session.lastUserMessageCapture?.userText) {
@@ -2643,6 +2756,7 @@ function abortAgentSession(session, logger, reason = 'aborted') {
   session.active = false;
   session.relaying = false;
   session.waitingForInteraction = false;
+  session.awaitingRunsseRebind = false;
   session.waitingInteractionSince = 0;
   session.planTurnHandoff = '';
   session.modeTurnHandoff = '';
@@ -2706,6 +2820,17 @@ function finalizeInterceptedAgentSession(session) {
   }
 }
 
+function shouldBufferAgentFrameWhileDetached(session = {}) {
+  return Boolean(
+    session
+    && session.active
+    && !session.completed
+    && !session.aborted
+    && session.streamDetached === true
+    && !session.res
+  );
+}
+
 function ensureQueuedAgentMessages(session) {
   if (!session) return [];
   if (!Array.isArray(session.queuedUserMessages)) session.queuedUserMessages = [];
@@ -2763,7 +2888,22 @@ function detachWaitingInteractionSession(session, logger, reason = 'runsse_close
   session.relaying = false;
   session.req = null;
   session.res = null;
-  logger?.info?.(`agent local relay waiting session detached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || '-'} reason=${reason}`);
+  logger?.info?.(`agent local relay waiting session detached requestId=${session.requestId || '-'} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'} reason=${reason}`);
+  return true;
+}
+
+function detachActiveRelaySession(session, logger, reason = 'runsse_closed') {
+  if (!session || session.aborted || session.completed) return false;
+  clearInterval(session.heartbeat);
+  session.heartbeat = null;
+  session.streamDetached = true;
+  session.intercepted = false;
+  session.req = null;
+  session.res = null;
+  session.detachedAt = Date.now();
+  logger?.info?.(
+    `agent local relay active session detached requestId=${session.requestId || '-'} reason=${reason} relaying=${session.relaying ? '1' : '0'} generatedChunks=${Array.isArray(session.generatedChunks) ? session.generatedChunks.length : 0}`,
+  );
   return true;
 }
 
@@ -2800,6 +2940,7 @@ function finalizeWaitingInteractionSessionStream(session, logger, reason = 'inte
 function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
   if (!session) return null;
   const preservedChunks = cloneAgentGeneratedChunks(session.generatedChunks || []);
+  const wasRelaying = Boolean(session.relaying);
   session.ignoreNextRunsseClose = false;
   session.req = req;
   session.res = res;
@@ -2810,11 +2951,11 @@ function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
   session.completed = false;
   session.intercepted = false;
   session.streamDetached = false;
-  session.relaying = false;
+  session.relaying = wasRelaying;
   beginInterceptedAgentSession(session, logger, { bootstrap: preservedChunks.length === 0 });
   if (preservedChunks.length > 0) {
     replayAgentGeneratedChunks(session, preservedChunks, logger);
-  } else {
+  } else if (!wasRelaying) {
     replayWaitingSessionPlanCheckpoint(session, logger);
     replayPendingInteractionQueries(session, logger);
   }
@@ -2878,7 +3019,15 @@ function getMitmRequestMeta(req) {
   const pathname = String(req.url || req.headers?.[':path'] || '').split('?')[0];
   const method = String(req.method || req.headers?.[':method'] || 'GET').toUpperCase();
   const protocol = req.httpVersion === '2.0' ? 'h2' : 'h1';
-  return { pathname, method, protocol };
+  const authority = normalizeHost(req.headers?.[':authority'] || req.headers?.host || '');
+  const host = normalizeHost(req.headers?.host || req.headers?.[':authority'] || '');
+  const servername = normalizeHost(
+    req.socket?.servername
+    || req.stream?.session?.socket?.servername
+    || req.connection?.servername
+    || '',
+  );
+  return { pathname, method, protocol, authority, host, servername };
 }
 
 function isRelayChatPath(pathname) {
@@ -2947,6 +3096,7 @@ const EMPTY_LOCAL_CONTROL_PLANE_SUFFIXES = new Set([
   'DashboardService/ListMarketplacePlugins',
   'DashboardService/ListMarketplaces',
   'DashboardService/RegisterMarketplaceAndPlugins',
+  'FileSyncService/FSIsEnabledForUser',
   'MCPRegistryService/GetKnownServers',
   'NetworkService/IsConnected',
   'RepositoryService/FastRepoInitHandshakeV2',
@@ -3097,6 +3247,11 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
           displayMessage: 'Local Relay',
           namedModelSelectedDisplayMessage: 'Local Relay',
         },
+      };
+    case 'DashboardService/GetUsageLimitStatusAndActiveGrants':
+      return {
+        typeName: '',
+        value: {},
       };
     case 'DashboardService/GetPlanInfo':
       return {
@@ -3387,7 +3542,15 @@ function normalizeHost(raw) {
   return String(raw || '').trim().toLowerCase().replace(/^\[|\]$/g, '').split(':')[0];
 }
 
-const MITM_HOST_SUFFIXES = ['.cursor.sh', '.cursor.com', '.cursorapi.com'];
+function describeMitmRequestHost(meta = {}) {
+  const parts = [];
+  if (meta.servername) parts.push(`sni=${meta.servername}`);
+  if (meta.authority && meta.authority !== meta.servername) parts.push(`authority=${meta.authority}`);
+  if (meta.host && meta.host !== meta.authority && meta.host !== meta.servername) parts.push(`host=${meta.host}`);
+  return parts.length ? ` ${parts.join(' ')}` : '';
+}
+
+const MITM_HOST_SUFFIXES = ['.cursor.sh', '.cursor.com', '.cursorapi.com', '.cursor-cdn.com'];
 
 function shouldInterceptHost(hostname) {
   const host = normalizeHost(hostname);
@@ -3534,6 +3697,12 @@ function writeAgentFrame(session, frame) {
   if (!session?.active) return;
   session.generatedChunks = session.generatedChunks || [];
   session.generatedChunks.push(buffer);
+  if (shouldBufferAgentFrameWhileDetached(session)) {
+    session.logger?.info?.(
+      `agent local relay buffered detached frame requestId=${session.requestId || '-'} bytes=${buffer.length} bufferedCount=${session.generatedChunks.length}`,
+    );
+    return;
+  }
   try {
     session.res.write(buffer);
     if (typeof session.res.flush === 'function') session.res.flush();
@@ -10401,7 +10570,40 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     triggerDeferredInteractionResume(session, config, logger, stats, 'post_interaction_resume');
   }
 }
-function forwardMitmH2Request(req, res, host, reqPath, method, body, logger, options = {}) {
+async function forwardMitmH2Request(req, res, host, reqPath, method, body, logger, config = {}, options = {}) {
+  const upstreamFetch = buildForwardProxyFetch(config);
+  const headers = sanitizeProxyHeaders(req.headers, host, { forHttp2: false });
+  if (!Object.keys(headers).some((key) => String(key).toLowerCase() === 'host')) {
+    headers.Host = host;
+  }
+  const protocol = String(req.headers?.[':scheme'] || 'https').toLowerCase() === 'http' ? 'http' : 'https';
+  const targetUrl = `${protocol}://${host}${reqPath}`;
+  const response = await upstreamFetch(targetUrl, {
+    method,
+    headers,
+    body: body?.length ? body : undefined,
+  });
+  logger?.info?.(`h2 passthrough via fetch ${host}${reqPath} status=${response.status} contentType=${String(response.headers.get('content-type') || '-')}`);
+  const responseHeaders = {};
+  response.headers.forEach((value, key) => {
+    if (String(key).startsWith(':')) return;
+    responseHeaders[key] = value;
+  });
+  if (!res.headersSent) {
+    res.writeHead(response.status || 502, responseHeaders);
+  }
+  const captureWriter = createResponseCaptureWriter(options.captureResponsePath, logger, 'native h2 response');
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length) {
+    captureWriter?.write(buffer);
+    res.write(buffer);
+  }
+  captureWriter?.end();
+  res.end();
+}
+
+function forwardMitmH2RequestLegacy(req, res, host, reqPath, method, body, logger, options = {}) {
   return new Promise((resolve, reject) => {
     const client = http2.connect(`https://${host}:443`);
     const cleanup = () => {
@@ -10460,13 +10662,13 @@ function forwardMitmH2Request(req, res, host, reqPath, method, body, logger, opt
   });
 }
 
-async function forwardMitmHttpsRequest(req, res, logger, body, options = {}) {
+async function forwardMitmHttpsRequest(req, res, logger, config, body, options = {}) {
   const { isH2, host, path: reqPath, method } = getMitmForwardTarget(req);
   const payload = body === undefined ? await readRequestBody(req) : body;
 
   if (isH2) {
     try {
-      await forwardMitmH2Request(req, res, host, reqPath, method, payload, logger, options);
+      await forwardMitmH2Request(req, res, host, reqPath, method, payload, logger, config, options);
     } catch (error) {
       logger.error(`h2 passthrough failed ${host}${reqPath}: ${error.message}`);
       if (!res.headersSent) {
@@ -10478,39 +10680,28 @@ async function forwardMitmHttpsRequest(req, res, logger, body, options = {}) {
   }
 
   await new Promise((resolve) => {
-    const upstreamReq = https.request({
-      hostname: host,
-      port: 443,
+    const upstreamFetch = buildForwardProxyFetch(config);
+    upstreamFetch(`https://${host}${reqPath}`, {
       method,
-      path: reqPath,
       headers: sanitizeProxyHeaders(req.headers, host),
-    }, (upstreamRes) => {
+      body: payload?.length ? payload : undefined,
+    }).then(async (upstreamRes) => {
       const captureWriter = createResponseCaptureWriter(options.captureResponsePath, logger, 'native response');
-      logger?.info?.(`https upstream response ${host}${reqPath} status=${upstreamRes.statusCode || 0} contentType=${String(upstreamRes.headers?.['content-type'] || '-')}`);
-      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-      upstreamRes.on('data', (chunk) => {
-        const buffer = Buffer.from(chunk);
+      logger?.info?.(`https upstream response ${host}${reqPath} status=${upstreamRes.status || 0} contentType=${String(upstreamRes.headers?.get?.('content-type') || '-')}`);
+      const responseHeaders = {};
+      upstreamRes.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+      res.writeHead(upstreamRes.status || 502, responseHeaders);
+      const buffer = Buffer.from(await upstreamRes.arrayBuffer());
+      if (buffer.length) {
         captureWriter?.write(buffer);
         res.write(buffer);
-      });
-      upstreamRes.on('end', () => {
-        captureWriter?.end();
-        res.end();
-        resolve();
-      });
-      upstreamRes.on('error', (error) => {
-        logger.error(`https upstream stream failed ${host}${reqPath}: ${error.message}`);
-        captureWriter?.end();
-        try {
-          res.end();
-        } catch {
-          /* ignore closed client */
-        }
-        resolve();
-      });
-    });
-
-    upstreamReq.on('error', (error) => {
+      }
+      captureWriter?.end();
+      res.end();
+      resolve();
+    }).catch((error) => {
       logger.error(`https passthrough failed ${host}${reqPath}: ${error.message}`);
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -10518,8 +10709,6 @@ async function forwardMitmHttpsRequest(req, res, logger, body, options = {}) {
       res.end(JSON.stringify({ ok: false, message: error.message }));
       resolve();
     });
-
-    upstreamReq.end(payload?.length ? payload : undefined);
   });
 }
 
@@ -10549,7 +10738,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
 
   if (isLocalRelayMode(config)) {
     const existingWaitingSession = requestId ? agentSessions.get(requestId) : null;
-    if (existingWaitingSession?.waitingForInteraction && !existingWaitingSession.aborted) {
+    if (shouldRetainSessionForRunsseRebind(existingWaitingSession) && !existingWaitingSession?.aborted) {
       const session = reattachWaitingInteractionSession(existingWaitingSession, req, res, rawBody, logger);
       if (pendingCapture) {
         session.lastUserMessageCapture = pendingCapture;
@@ -10655,7 +10844,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
               logger?.info?.(`agent local relay ignored runsse close after reuse requestId=${reusedSession?.requestId || '-'}`);
               return;
             }
-            detachWaitingInteractionSession(reusedSession, logger, 'runsse_reused');
+            abortAgentSession(reusedSession, logger, 'runsse_closed');
           });
           return;
         }
@@ -10693,7 +10882,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
   }
 
   const captureResponsePath = buildCaptureResponsePath(config, 'runsse-response', requestId);
-  await forwardMitmHttpsRequest(req, res, logger, rawBody, { captureResponsePath });
+  await forwardMitmHttpsRequest(req, res, logger, config, rawBody, { captureResponsePath });
   logAgentRunSseResponseSummary(captureResponsePath, requestId, logger);
 }
 
@@ -10854,7 +11043,9 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         }
         session.relaying = false;
         session.waitingForInteraction = false;
+        session.awaitingRunsseRebind = true;
         session.planTurnHandoff = '';
+        session.modeTurnHandoff = 'execute_plan';
         session.deferredInteractionResponse = null;
         const interactionResponse = buildSyntheticPlanExecutionResponse(session, action);
         const pendingInteraction = clonePendingInteractionSnapshot(
@@ -10883,8 +11074,15 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         });
         ack();
         if (session.active && !session.aborted) {
-          resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
-            .catch((error) => failAgentRelaySession(session, logger, error, 'conversation_action_execute_plan'));
+          scheduleExecutePlanSessionResume(
+            session,
+            interactionResponse,
+            config,
+            logger,
+            stats,
+            pendingInteraction,
+            'conversation_action_execute_plan',
+          );
         }
         return;
       }
@@ -10965,6 +11163,13 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       logger.info(
         `agent local relay received interaction_response requestId=${decoded.requestId} interactionKind=${interactionResponse?.kind || '-'} interactionId=${Number(interactionResponse?.id) || 0} matchedPending=${pendingInteraction ? '1' : '0'} pendingKind=${pendingInteraction?.kind || '-'} pendingTool=${pendingInteraction?.toolName || '-'} payload=${JSON.stringify(interactionResponse || {})}`,
       );
+      if (shouldIgnoreStaleInteractionResponseDuringExecutePlan(session, interactionResponse, pendingInteraction)) {
+        logger.info(
+          `agent local relay ignored stale interaction_response during execute_plan requestId=${decoded.requestId} interactionKind=${interactionResponse?.kind || '-'} handoff=${session.modeTurnHandoff || '-'} awaitingRunsseRebind=${session.awaitingRunsseRebind ? '1' : '0'} relaying=${session.relaying ? '1' : '0'}`,
+        );
+        ack();
+        return;
+      }
       if (session && pendingInteraction) {
         appendInteractionResponseToHistory(session, pendingInteraction, interactionResponse);
         syncPresentedPlanStateFromInteractionResponse(session, interactionResponse, pendingInteraction);
@@ -11148,9 +11353,9 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
       if (
         waitingSession
-        && !waitingSession.relaying
         && waitingSession !== session
         && isSameWaitingSessionUserMessage(waitingSession, normalizedUserText)
+        && (!waitingSession.relaying || waitingSession.streamDetached)
       ) {
         if (isPlaceholderRunSseSession(session)) {
           adoptPlaceholderRunSseSession(waitingSession, session, logger);
@@ -11210,7 +11415,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
   }
 
   const captureResponsePath = buildCaptureResponsePath(config, 'bidi-response', decoded.requestId || '');
-  await forwardMitmHttpsRequest(req, res, logger, rawBody, { captureResponsePath });
+  await forwardMitmHttpsRequest(req, res, logger, config, rawBody, { captureResponsePath });
   } catch (error) {
     // 单次 BidiAppend 处理失败不应阻塞后续消息：确保 HTTP 响应始终被发送，
     // 否则 Cursor 客户端会因等待响应而卡死。
@@ -11253,7 +11458,7 @@ async function handleCursorChat(req, res, config, logger, stats) {
     logger.info(`Chat sample saved path=${samplePath}`);
   }
 
-  await forwardMitmHttpsRequest(req, res, logger, rawBody);
+  await forwardMitmHttpsRequest(req, res, logger, config, rawBody);
 }
 
 async function handleNativeTaskRpc(req, pathname, res, config, logger, stats) {
@@ -11412,7 +11617,7 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
   if (isRepositoryServicePath(pathname) && method === 'POST') {
     const rawBody = await readRequestBody(req);
     logger.info(`protocol RepositoryService path=${pathname} rawLen=${rawBody.length}`);
-    await forwardMitmHttpsRequest(req, res, logger, rawBody);
+    await forwardMitmHttpsRequest(req, res, logger, config, rawBody);
     return;
   }
 
@@ -11440,7 +11645,7 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
     return;
   }
 
-  await forwardMitmHttpsRequest(req, res, logger);
+  await forwardMitmHttpsRequest(req, res, logger, config);
 }
 
 /**
@@ -11673,7 +11878,7 @@ async function handleStreamCppRequest(req, res, config, logger, stats) {
   const decoded = streamCpp.decodeStreamCppRequest(rawBody);
   if (!decoded) {
     logger.warn('StreamCpp decode failed, forwarding to upstream');
-    await forwardMitmHttpsRequest(req, res, logger, rawBody);
+    await forwardMitmHttpsRequest(req, res, logger, config, rawBody);
     return;
   }
 
@@ -11683,7 +11888,7 @@ async function handleStreamCppRequest(req, res, config, logger, stats) {
 
   // 如果不是本地 relay 模式，直接转发
   if (!isLocalRelayMode(config)) {
-    await forwardMitmHttpsRequest(req, res, logger, rawBody);
+    await forwardMitmHttpsRequest(req, res, logger, config, rawBody);
     return;
   }
 
@@ -11796,7 +12001,7 @@ async function handleCppConfigRequest(req, res, config, logger, stats) {
   }
 
   // 非 relay 模式：转发
-  await forwardMitmHttpsRequest(req, res, logger, rawBody);
+  await forwardMitmHttpsRequest(req, res, logger, config, rawBody);
 }
 
 /**
@@ -11815,7 +12020,7 @@ async function handleRecordCppFateRequest(req, res, config, logger, stats) {
   }
 
   // 非 relay 模式：转发
-  await forwardMitmHttpsRequest(req, res, logger, rawBody);
+  await forwardMitmHttpsRequest(req, res, logger, config, rawBody);
 }
 
 function trackRunnerEvent(stats, kind, value) {
@@ -12029,15 +12234,17 @@ function startProxy(config) {
     `runner boot pid=${process.pid} port=${config.port} directMitmPort=${stats.directMitmPort || '-'} mode=${mode}`,
   );
 
-  const certPath = String(config.cert.leafCertPath || '').trim();
-  const cert = fs.readFileSync(certPath, 'utf8');
-  const key = fs.readFileSync(config.cert.leafKeyPath, 'utf8');
+  const tlsProvider = createRelayTlsContextProvider(getConfigCustomRoot(config), logger);
+  const certPath = String(tlsProvider.paths?.leafCertPath || config.cert.leafCertPath || '').trim();
 
   logger.info(`tls certificate chain path=${certPath}`);
+  logger.info(`tls dynamic cert provider ready cacheLimit=${tlsProvider.getCacheStats().limit}`);
 
   const tlsOptions = {
-    key,
-    cert,
+    key: tlsProvider.key,
+    cert: tlsProvider.cert,
+    SNICallback: tlsProvider.SNICallback,
+    secureContext: tlsProvider.fallbackContext,
     allowHTTP1: true,
     ALPNProtocols: ['h2', 'http/1.1'],
   };
@@ -12075,10 +12282,11 @@ function startProxy(config) {
 
   function onMitmRequest(req, res, entry) {
     if (entry === 'direct') stats.directTlsRequests += 1;
-    const { pathname, method, protocol } = getMitmRequestMeta(req);
+    const meta = getMitmRequestMeta(req);
+    const { pathname, method, protocol } = meta;
     if (protocol === 'h2') stats.connectH2 = (stats.connectH2 || 0) + 1;
     trackRecentPath(stats, method, pathname);
-    logger.info(`mitm request ${method} ${pathname} proto=${protocol} entry=${entry}`);
+    logger.info(`mitm request ${method} ${pathname} proto=${protocol} entry=${entry}${describeMitmRequestHost(meta)}`);
     handleMitmRequest(req, res, config, logger, stats, shutdown, agentSessions, pendingAgentMessages, completedAgentTurns, pendingAgentInteractions).catch((error) => {
       logger.error(`mitm request failed (${entry}): ${error.stack || error.message}`);
       if (!res.headersSent) {
@@ -12385,6 +12593,8 @@ module.exports = {
   detectDestructiveWrite,
   buildReportBugfixResultsText,
   executeTaskTool,
+  abortAgentSession,
+  shouldBufferAgentFrameWhileDetached,
   // Exposed for diagnostics / streaming RPC tests (pure helpers, no side effects on their own).
   encodeTaskStreamLogFrame,
   encodeTaskLogItemPayload,
@@ -12392,6 +12602,14 @@ module.exports = {
   encodeTaskStatusValue,
   getMaxTaskLogSeq,
   handleTaskStreamLogLive,
+  shouldKeepWaitingForInteractionResponse,
+  shouldIgnoreStaleInteractionResponseDuringExecutePlan,
+  findWaitingSessionByStableConversationId,
+  shouldReuseWaitingSessionForRunRequest,
+  shouldReuseWaitingSessionForPendingCapture,
+  scheduleExecutePlanSessionResume,
+  rememberCompletedAgentTurn,
+  getCompletedAgentTurn,
   // Exposed for Round-2 native-task-UI parity tests.
   emitTaskProgressFrame,
   findTaskRecordAcrossSessions,

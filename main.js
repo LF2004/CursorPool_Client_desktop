@@ -229,6 +229,19 @@ function ensureMainWindow() {
   return createWindow();
 }
 
+async function autoEnsureConfiguredCursorRelayRunner() {
+  try {
+    const status = await readCursorRelayProxyConfig({ lightweight: true });
+    if (!status?.enabled || status?.mockProxy?.active || status?.runner?.running) return;
+    await ensureCursorRelayRunner({
+      mode: String(status?.runner?.mode || '').trim() || undefined,
+      directMitmPort: Number(status?.runner?.directMitmPort) || undefined,
+    });
+  } catch (error) {
+    logMainError('autoEnsureConfiguredCursorRelayRunner', error);
+  }
+}
+
 process.on('uncaughtException', (error) => {
   logMainError('uncaughtException', error);
 });
@@ -259,9 +272,17 @@ app.whenReady().then(() => {
   } catch (error) {
     logMainError('createTray', error);
   }
+  setTimeout(() => {
+    autoEnsureConfiguredCursorRelayRunner().catch((error) => {
+      logMainError('autoEnsureConfiguredCursorRelayRunner timer', error);
+    });
+  }, 1500);
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
     else showMainWindow();
+    autoEnsureConfiguredCursorRelayRunner().catch((error) => {
+      logMainError('autoEnsureConfiguredCursorRelayRunner activate', error);
+    });
   });
 });
 

@@ -43,6 +43,40 @@ const RESTART_MAX_DELAY = 30000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function tryParseJson(text = '') {
+  try {
+    const parsed = JSON.parse(String(text || '').trim());
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function findListeningPidsByPort(port) {
+  const targetPort = Number(port) || 0;
+  if (!targetPort || process.platform !== 'win32') return [];
+  try {
+    const output = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-NetTCPConnection -State Listen -LocalPort ${targetPort} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ConvertTo-Json -Compress`,
+      ],
+      { encoding: 'utf8', windowsHide: true, timeout: 10000 },
+    );
+    const parsed = tryParseJson(output);
+    const values = Array.isArray(parsed) ? parsed : (parsed == null ? [] : [parsed]);
+    return values
+      .map((item) => Number(item) || 0)
+      .filter(Boolean)
+      .filter((item, index, list) => list.indexOf(item) === index);
+  } catch {
+    return [];
+  }
+}
+
 function buildStartOperationKey(options = {}) {
   const port = Number(options.port || DEFAULT_PORT) || DEFAULT_PORT;
   const mode = normalizeRunnerMode(options.mode || process.env.CURSOR_RELAY_RUNNER_MODE);
@@ -971,6 +1005,33 @@ async function startLocalRelayRunner(payload = {}) {
   if (!health.ok) {
     const latestLog = await readRunnerLogTail(customRoot, 120).catch(() => null);
     const portOpen = await isPortOpen(port).catch(() => false);
+    const conflictingPids = portOpen ? findListeningPidsByPort(port) : [];
+    const stalePids = conflictingPids.filter((pid) => Number(pid) !== Number(childPid) && Number(pid) !== Number(runnerChild?.pid || 0));
+    const hasAddrInUse = /EADDRINUSE|address already in use/i.test(String(latestLog?.text || ''));
+    if (stalePids.length) {
+      stalePids.forEach((pid) => terminateRunnerPid(pid, { force: true }));
+      await sleep(400);
+      if (hasAddrInUse) {
+        const retryHealth = await waitForRunnerHealth(port, {
+          attempts: 12,
+          delayMs: 120,
+          isExpected: (result) => (
+            Number(result?.payload?.pid) === Number(childPid)
+            && String(result?.payload?.mode || '') === mode
+          ),
+        });
+        if (retryHealth.ok) {
+          return buildRunnerStartResult({
+            port,
+            written,
+            upstream,
+            health: retryHealth,
+            childPid,
+            reused: false,
+          });
+        }
+      }
+    }
     const logHint = String(latestLog?.text || '')
       .split(/\r?\n/)
       .filter((line) => /error|EADDRINUSE|listen|throw|failed|certificate|openssl|uncaught/i.test(line))
@@ -980,6 +1041,7 @@ async function startLocalRelayRunner(payload = {}) {
       `Local relay runner failed health check on 127.0.0.1:${port}`,
       health.unexpectedRunner ? 'An unexpected runner answered on the relay port.' : '',
       portOpen ? 'The relay port is still occupied after restart.' : '',
+      stalePids.length ? `Killed conflicting listener PID(s): ${stalePids.join(', ')}` : '',
       logHint ? `Recent runner log:\n${logHint}` : '',
     ].filter(Boolean).join('\n');
     await stopLocalRelayRunner({ port });

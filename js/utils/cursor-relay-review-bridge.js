@@ -7,6 +7,7 @@ const REVIEW_BRIDGE_MARKER_FAMILY_REGEX = /__cursorPoolRelayReviewBridge(?:_v\d+
 const REVIEW_BRIDGE_EFFECT_ANCHOR = '},[a,V,t,i]);const Be=di(()=>{';
 const INLINE_DIFF_SERVICE_ANCHOR = 'this._userPlansDir=fV(this.pathService.userHome({preferLocal:!0})),this.experimentService.checkFeatureGate("inline_diffs_v2_adapter")';
 const INLINE_DIFF_SERVICE_ANCHOR_VARIANT = 'this._userPlansDir=UV(this.pathService.userHome({preferLocal:!0}));for(const D of edn.registeredActions)D(this.reactiveStorageService);';
+const INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316 = 'this._userPlansDir=qV(this.pathService.userHome({preferLocal:!0}));for(const D of ndn.registeredActions)D(this.reactiveStorageService);';
 const INLINE_DIFF_SERVICE_DELAYED_REGISTRATION = 'Yi(xF,i8a,1)';
 const INLINE_DIFF_SERVICE_EAGER_REGISTRATION = 'Yi(xF,i8a,0)';
 const REVIEW_EVENTS_PATH = '/__cursorpool__/review-events';
@@ -85,6 +86,20 @@ function restoreRelayReviewBridgePatchedText(text) {
     /this\._userPlansDir=UV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\(Ye,Xe\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,De\),for\(const D of edn\.registeredActions\)D\(this\.reactiveStorageService\);/,
     INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
   );
+  restored = restored.replace(
+    /this\._userPlansDir=qV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\(Ye,Xe\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,Ye\),for\(const D of ndn\.registeredActions\)D\(this\.reactiveStorageService\);/,
+    INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
+  );
+  if (hasAnyRelayReviewBridgePatch(restored)) {
+    restored = restored.replace(
+      /this\._userPlansDir=qV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\([A-Za-z0-9_$]+,[A-Za-z0-9_$]+\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,[A-Za-z0-9_$]+\),for\(const D of ndn\.registeredActions\)D\(this\.reactiveStorageService\);/,
+      INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
+    );
+    restored = restored.replace(
+      /this\._userPlansDir=UV\(this\.pathService\.userHome\(\{preferLocal:!0\}\)\);\(\([A-Za-z0-9_$]+,[A-Za-z0-9_$]+\)=>\{[\s\S]*?globalThis\.__cursorPoolRelayReviewBridge(?:_v\d+)?[\s\S]*?\}\)\(this,[A-Za-z0-9_$]+\),for\(const D of edn\.registeredActions\)D\(this\.reactiveStorageService\);/,
+      INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
+    );
+  }
   return restored;
 }
 
@@ -465,6 +480,11 @@ function patchRelayReviewBridgeInWorkbench(explicitMainJsPath) {
       INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
       `this._userPlansDir=UV(this.pathService.userHome({preferLocal:!0}));${buildInlineDiffServiceReviewBridgeBootstrap('De')}for(const D of edn.registeredActions)D(this.reactiveStorageService);`,
     );
+  } else if (baseText.includes(INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316)) {
+    injected = baseText.replace(
+      INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
+      `this._userPlansDir=qV(this.pathService.userHome({preferLocal:!0}));${buildInlineDiffServiceReviewBridgeBootstrap('Ye')}for(const D of ndn.registeredActions)D(this.reactiveStorageService);`,
+    );
   }
 
   if (injected === baseText) {
@@ -539,6 +559,7 @@ module.exports = {
   REVIEW_BRIDGE_EFFECT_ANCHOR,
   INLINE_DIFF_SERVICE_ANCHOR,
   INLINE_DIFF_SERVICE_ANCHOR_VARIANT,
+  INLINE_DIFF_SERVICE_ANCHOR_VARIANT_V316,
   resolveWorkbenchDesktopMainJsPath,
   hasRelayReviewBridgePatch,
   patchRelayReviewBridgeInWorkbench,

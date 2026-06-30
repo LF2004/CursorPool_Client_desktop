@@ -209,13 +209,94 @@ function looksLikeCursorAccessToken(token) {
   return value.split('.').length === 3
 }
 
+function tryReadAccountFromItemTableWithNodeSqlite(dbPath) {
+  const out = { account: null, moduleError: null, openError: null }
+  if (!fs.existsSync(dbPath)) return out
+
+  let DatabaseSync
+  try {
+    ;({ DatabaseSync } = require('node:sqlite'))
+  } catch (e) {
+    out.moduleError = e.message || String(e)
+    return out
+  }
+
+  function buildAccount(db) {
+    const tableRow = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND lower(name) IN ('itemtable','item_table') LIMIT 1",
+      )
+      .get()
+    const tableName = tableRow?.name || null
+    if (!tableName) return null
+    const stmt = db.prepare(`SELECT value FROM "${tableName}" WHERE key = ?`)
+    const readValue = (key) => {
+      try {
+        const row = stmt.get(key)
+        return row?.value === undefined ? null : row.value
+      } catch {
+        return null
+      }
+    }
+    return {
+      cursorAuthCachedEmail: readValue('cursorAuth/cachedEmail'),
+      cursorEmail: readValue('cursor.email'),
+      cursorAuthAccessToken: readValue('cursorAuth/accessToken'),
+      cursorAuthRefreshToken: readValue('cursorAuth/refreshToken'),
+      cursorAccessToken: readValue('cursor.accessToken'),
+      telemetryDevDeviceId: readValue('telemetry.devDeviceId'),
+      reactiveApplicationUser: readValue(REACTIVE_APP_USER_KEY),
+      applicationUser: readValue(LEGACY_APP_USER_KEY),
+    }
+  }
+
+  let db
+  let tmpPath = null
+  try {
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true, timeout: 8000 })
+    } catch (e1) {
+      const msg = e1.message || String(e1)
+      out.openError = msg
+      const busy =
+        e1.code === 'SQLITE_BUSY' ||
+        (typeof msg === 'string' && /busy|locked|database is locked/i.test(msg))
+      if (!busy) return out
+      tmpPath = path.join(os.tmpdir(), `cpe-vscdb-${process.pid}-${Date.now()}.vscdb`)
+      fs.copyFileSync(dbPath, tmpPath)
+      db = new DatabaseSync(tmpPath, { readOnly: true, timeout: 8000 })
+      out.openError = null
+    }
+    out.account = buildAccount(db)
+    if (!out.account && !out.openError) out.openError = '未找到 ItemTable'
+  } catch (e2) {
+    out.openError = out.openError || e2.message || String(e2)
+  } finally {
+    if (db) {
+      try {
+        db.close()
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    if (tmpPath) {
+      try {
+        fs.unlinkSync(tmpPath)
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+  return out
+}
+
 /**
  * 判断 Cursor 是否已有可用登录态（邮箱 + JWT accessToken 均存在）。
  */
 function readCursorLoginState(opts = {}) {
   const paths = getCursorPaths()
   const dbPath = paths.stateVscdbPath
-  const accountRead = opts.accountRead || readAccountFromItemTable(dbPath)
+  const accountRead = opts.accountRead || readAccountFromItemTableWithFallback(dbPath)
   const acc = accountRead.account
   const authJson = readCursorAuthJsonFile(paths.cursorAuthJsonPath)
   const email = resolveCursorDbEmail(acc)
@@ -324,6 +405,28 @@ function readAccountFromItemTable(dbPath) {
   return out
 }
 
+function readAccountFromItemTableWithFallback(dbPath) {
+  const primary = readAccountFromItemTable(dbPath)
+  if (primary.account) return primary
+  if (!primary.moduleError) return primary
+
+  const fallback = tryReadAccountFromItemTableWithNodeSqlite(dbPath)
+  if (fallback.account) {
+    return {
+      account: fallback.account,
+      moduleError: primary.moduleError,
+      openError: fallback.openError || null,
+      fallbackReader: 'node:sqlite',
+      primaryModuleError: primary.moduleError,
+    }
+  }
+  return {
+    ...primary,
+    fallbackOpenError: fallback.openError || null,
+    fallbackModuleError: fallback.moduleError || null,
+  }
+}
+
 /**
  * 读取 main.js 注入启发式状态（对齐 Tauri is_hook）
  */
@@ -377,7 +480,7 @@ function readHookStatus(opts = {}) {
 function readLocalCursorStateSync(opts = {}) {
   const paths = getCursorPaths()
   const authJson = readCursorAuthJsonFile(paths.cursorAuthJsonPath)
-  const accountRead = readAccountFromItemTable(paths.stateVscdbPath)
+  const accountRead = readAccountFromItemTableWithFallback(paths.stateVscdbPath)
   const cursorExeRunning = opts.skipRuntimeChecks ? null : isCursorRunningHeuristic()
   const hook = opts.skipRuntimeChecks ? null : readHookStatus(opts)
 
@@ -570,6 +673,7 @@ module.exports = {
   isCursorRunningHeuristic,
   readCursorAuthJsonFile,
   readAccountFromItemTable,
+  readAccountFromItemTableWithFallback,
   readCursorLoginState,
   looksLikeCursorAccessToken,
   readHookStatus,

@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const net = require('net');
+const tls = require('tls');
 const { execFileSync, spawnSync } = require('child_process');
 
 const CA_SUBJECT = '/CN=CursorPool Relay CA/O=CursorPool/C=US';
@@ -26,6 +28,8 @@ const LEAF_SANS = [
   '*.cursorapi.com',
   '*.authentication.cursor.sh',
 ];
+const DYNAMIC_TLS_CONTEXT_CACHE_LIMIT = 256;
+const dynamicTlsProviderCache = new Map();
 
 function getRelayDataDir(customRoot) {
   const root = customRoot || path.join(os.homedir(), '.cursorpool', 'relay');
@@ -155,6 +159,18 @@ function derOid(oid) {
   return der(0x06, Buffer.from(bytes));
 }
 
+function encodeIpSubjectAltName(name) {
+  const value = String(name || '').trim();
+  if (!value) return Buffer.alloc(0);
+  if (net.isIP(value) === 4) {
+    const parts = value.split('.').map((item) => Number(item));
+    if (parts.length === 4 && parts.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) {
+      return der(0x87, Buffer.from(parts));
+    }
+  }
+  return Buffer.alloc(0);
+}
+
 function derUtf8(value) {
   return der(0x0c, Buffer.from(String(value), 'utf8'));
 }
@@ -214,7 +230,150 @@ function makeKeyUsageExtension(bits) {
 }
 
 function makeSubjectAltName(names) {
-  return derSeq(...names.map((name) => der(0x82, Buffer.from(String(name), 'ascii'))));
+  return derSeq(...names.map((name) => {
+    const ipSan = encodeIpSubjectAltName(name);
+    if (ipSan.length) return ipSan;
+    return der(0x82, Buffer.from(String(name), 'ascii'));
+  }));
+}
+
+function buildCaNameDer() {
+  return nameDer([
+    ['2.5.4.6', 'US', true],
+    ['2.5.4.10', 'CursorPool', false],
+    ['2.5.4.3', 'CursorPool Relay CA', false],
+  ]);
+}
+
+function buildLeafNameDer(commonName) {
+  return nameDer([
+    ['2.5.4.6', 'US', true],
+    ['2.5.4.10', 'CursorPool', false],
+    ['2.5.4.3', commonName, false],
+  ]);
+}
+
+function normalizeDynamicLeafHost(rawHost) {
+  const value = String(rawHost || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!value) return '';
+  if (value.includes('/') || value.includes('\\') || /\s/.test(value)) return '';
+  return value.split(':')[0];
+}
+
+function buildDynamicLeafCertPem(host, materials) {
+  const normalizedHost = normalizeDynamicLeafHost(host);
+  if (!normalizedHost) throw new Error('Dynamic leaf host is empty.');
+  const certDer = buildCertificateDer({
+    subject: buildLeafNameDer(normalizedHost),
+    issuer: buildCaNameDer(),
+    publicKeyPem: materials.leafPublicKeyPem,
+    issuerPrivateKeyPem: materials.caKeyPem,
+    serial: crypto.randomBytes(16),
+    days: 825,
+    sans: [normalizedHost],
+  });
+  return certPemFromDer(certDer);
+}
+
+function loadDynamicTlsMaterials(paths) {
+  return {
+    caKeyPem: fs.readFileSync(paths.caKeyPath, 'utf8'),
+    leafKeyPem: fs.readFileSync(paths.leafKeyPath, 'utf8'),
+    defaultLeafCertPem: fs.readFileSync(paths.leafCertPath, 'utf8'),
+    leafPublicKeyPem: crypto.createPublicKey(fs.readFileSync(paths.leafKeyPath, 'utf8')).export({
+      type: 'spki',
+      format: 'pem',
+    }),
+  };
+}
+
+function createRelayTlsContextProvider(customRoot = '', logger = null) {
+  const rootKey = String(customRoot || '');
+  const cached = dynamicTlsProviderCache.get(rootKey);
+  if (cached) return cached;
+
+  const paths = ensureRelayCertificates(customRoot);
+  const materials = loadDynamicTlsMaterials(paths);
+  const caName = buildCaNameDer();
+  const contexts = new Map();
+  const fallbackContext = tls.createSecureContext({
+    key: materials.leafKeyPem,
+    cert: materials.defaultLeafCertPem,
+  });
+
+  function trimDynamicTlsContextCache() {
+    while (contexts.size > DYNAMIC_TLS_CONTEXT_CACHE_LIMIT) {
+      const oldestKey = contexts.keys().next().value;
+      if (!oldestKey) break;
+      contexts.delete(oldestKey);
+    }
+  }
+
+  function getOrCreateSecureContext(servername = '') {
+    const host = normalizeDynamicLeafHost(servername);
+    if (!host) {
+      return { host: '', secureContext: fallbackContext, cacheHit: true, dynamic: false };
+    }
+    const existing = contexts.get(host);
+    if (existing) {
+      contexts.delete(host);
+      contexts.set(host, existing);
+      return { host, secureContext: existing.secureContext, cacheHit: true, dynamic: true };
+    }
+    const certPem = certPemFromDer(buildCertificateDer({
+      subject: buildLeafNameDer(host),
+      issuer: caName,
+      publicKeyPem: materials.leafPublicKeyPem,
+      issuerPrivateKeyPem: materials.caKeyPem,
+      serial: crypto.randomBytes(16),
+      days: 825,
+      sans: [host],
+    }));
+    const secureContext = tls.createSecureContext({
+      key: materials.leafKeyPem,
+      cert: certPem,
+    });
+    const entry = {
+      host,
+      secureContext,
+      certPem,
+      createdAt: Date.now(),
+    };
+    contexts.set(host, entry);
+    trimDynamicTlsContextCache();
+    logger?.info?.(`tls dynamic leaf issued host=${host} cacheSize=${contexts.size}`);
+    return { host, secureContext, cacheHit: false, dynamic: true };
+  }
+
+  const provider = {
+    paths,
+    key: materials.leafKeyPem,
+    cert: materials.defaultLeafCertPem,
+    fallbackContext,
+    getSecureContext(servername = '') {
+      return getOrCreateSecureContext(servername);
+    },
+    SNICallback(servername, callback) {
+      try {
+        const resolved = getOrCreateSecureContext(servername);
+        if (typeof callback === 'function') callback(null, resolved.secureContext);
+        return resolved.secureContext;
+      } catch (error) {
+        logger?.warn?.(`tls dynamic leaf issue failed host=${String(servername || '-')}: ${error.message}`);
+        if (typeof callback === 'function') callback(null, fallbackContext);
+        return fallbackContext;
+      }
+    },
+    getCacheStats() {
+      return {
+        size: contexts.size,
+        limit: DYNAMIC_TLS_CONTEXT_CACHE_LIMIT,
+      };
+    },
+  };
+
+  dynamicTlsProviderCache.set(rootKey, provider);
+  return provider;
 }
 
 function buildCertificateDer({
@@ -900,6 +1059,7 @@ module.exports = {
   getRelayDataDir,
   getRelayCertPaths,
   ensureRelayCertificates,
+  createRelayTlsContextProvider,
   getRelayCertStatus,
   getRelayCertStatusReadonly,
   installRelayCaCertificate,

@@ -21,10 +21,13 @@
  * 解决方案：拦截这些关键请求，直接返回伪造但有效的响应
  */
 
-const path = require('path');
-const fs = require('fs');
 const { buildConnectFrame } = require('./cursor-relay-protobuf');
 const protocol = require('./cursor-relay-protocol');
+const {
+  readDefaultUserTemplate,
+  parseTemplateToAccount,
+  checkCursorLogin,
+} = require('./cursor-relay-account-store');
 
 // ── 需要拦截的路径 ────────────────────────────────────────
 
@@ -34,6 +37,7 @@ const AUTH_ENDPOINTS = {
   STRIPE_PROFILE: '/auth/stripe_profile',
   STRIPE: '/auth/stripe',           // [FIX #5] 新增：部分版本可能用此路径
   MEMBERSHIP: '/auth/membership',   // [FIX #5] 新增：会员信息端点
+  OAUTH_TOKEN: '/oauth/token',      // [FIX #6] 新增：最新版先刷 token，再访问启动探活 RPC
   HAS_VALID_PAYMENT_METHOD: '/auth/has_valid_payment_method',
   LOGOUT: '/auth/logout',
 
@@ -60,7 +64,20 @@ const HEALTH_CHECK_ENDPOINTS = {
   TIME_LEFT: '/aiserver.v1.AiService/TimeLeftHealthCheck',
   // agent.v1 也可能有 Ping
   AGENT_PING: '/agent.v1.AgentService/Ping',
+  DASHBOARD_USAGE_AND_GRANTS: '/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants',
+  FILESYNC_ENABLED: '/aiserver.v1.FileSyncService/FSIsEnabledForUser',
+  NETWORK_IS_CONNECTED: '/aiserver.v1.NetworkService/IsConnected',
 };
+
+const HEALTH_CHECK_PATH_KEYWORDS = [
+  'usagelimit',
+  'usage_limit',
+  'usage-limit',
+  'grant',
+  'activegrant',
+  'active_grant',
+  'active-grant',
+];
 
 // ── Membership Type 枚举值（从 workbench.desktop.main.js 提取） ──
 // 关键：Cursor 的 cs 枚举使用全小写字符串！
@@ -88,7 +105,7 @@ function isAuthEndpoint(pathname) {
   // 精确匹配
   if (values.some((p) => normalized === p || normalized.endsWith(p))) return true;
   // 宽松匹配：/auth/* 相关路径
-  if (normalized === '/auth/stripe' || normalized === '/auth/membership') return true;
+  if (normalized === '/auth/stripe' || normalized === '/auth/membership' || normalized === '/oauth/token') return true;
   return false;
 }
 
@@ -97,7 +114,13 @@ function isAuthEndpoint(pathname) {
  */
 function isAuthRelatedPath(pathname) {
   if (!pathname) return false;
-  if (pathname.startsWith('/auth/') || pathname.toLowerCase().includes('stripe') || pathname.toLowerCase().includes('membership')) return true;
+  if (
+    pathname.startsWith('/auth/')
+    || pathname.startsWith('/oauth/')
+    || pathname.toLowerCase().includes('stripe')
+    || pathname.toLowerCase().includes('membership')
+    || pathname.toLowerCase().includes('oauth')
+  ) return true;
   if (pathname === AUTH_ENDPOINTS.GET_TEAMS) return true;
   return false;
 }
@@ -109,7 +132,11 @@ function isAuthRelatedPath(pathname) {
 function isHealthCheckPath(pathname) {
   if (!pathname) return false;
   const normalized = pathname.split('?')[0].split('#')[0];
-  return Object.values(HEALTH_CHECK_ENDPOINTS).some((p) => normalized === p || normalized.endsWith(p));
+  if (Object.values(HEALTH_CHECK_ENDPOINTS).some((p) => normalized === p || normalized.endsWith(p))) {
+    return true;
+  }
+  const lowered = normalized.toLowerCase();
+  return HEALTH_CHECK_PATH_KEYWORDS.some((keyword) => lowered.includes(keyword));
 }
 
 function buildCorsHeaders(req, extra = {}) {
@@ -188,6 +215,11 @@ function buildServerTimeConnectResponse() {
 function buildUsageLimitConnectResponse() {
   // 空 protobuf 消息，所有字段都是默认值
   return Buffer.alloc(0);
+}
+
+function isProtoResponsePath(pathname) {
+  const normalized = String(pathname || '');
+  return normalized.includes('/aiserver.') || normalized.includes('/agent.');
 }
 
 function buildHealthUnaryResponsePayload(payload = 'ok') {
@@ -342,13 +374,24 @@ async function handleHealthCheckIntercept(req, res, pathname, config, logger) {
         ...buildCorsHeaders(req),
       });
       res.end(body);
+    } else if (
+      pathname === HEALTH_CHECK_ENDPOINTS.FILESYNC_ENABLED
+      || pathname === HEALTH_CHECK_ENDPOINTS.NETWORK_IS_CONNECTED
+    ) {
+      const body = Buffer.alloc(0);
+      res.writeHead(200, {
+        'Content-Type': 'application/proto',
+        'Content-Length': String(body.length),
+        ...buildCorsHeaders(req),
+      });
+      res.end(body);
     } else {
       // 其他 unary 调用：返回空 protobuf（所有字段默认值）
       res.writeHead(200, {
-        'Content-Type': 'application/proto',
+        'Content-Type': isProtoResponsePath(pathname) ? 'application/proto' : 'application/json',
         ...buildCorsHeaders(req),
       });
-      res.end();
+      res.end(isProtoResponsePath(pathname) ? buildUsageLimitConnectResponse() : '{}');
     }
 
     logger.info(`health-intercept: ${pathname} returned fake response`);
@@ -411,6 +454,43 @@ function buildFakeLogoutResponse() {
   return {};
 }
 
+function resolveRelayAccountSnapshot() {
+  const loginState = checkCursorLogin();
+  if (loginState?.loggedIn && loginState?.email && loginState?.accessToken) {
+    return {
+      email: String(loginState.email).trim(),
+      accessToken: String(loginState.accessToken).trim(),
+      refreshToken: String(loginState.refreshToken || loginState.accessToken).trim(),
+      stripeMembershipType: MEMBERSHIP_TYPES.ULTRA,
+      source: 'state.vscdb',
+    };
+  }
+
+  const template = readDefaultUserTemplate();
+  const templateAccount = parseTemplateToAccount(template);
+  if (templateAccount?.email && templateAccount?.accessToken) {
+    return {
+      ...templateAccount,
+      source: 'defult_user.json',
+    };
+  }
+
+  return null;
+}
+
+function buildFakeOauthTokenResponse(account = null) {
+  const fallbackToken = String(account?.accessToken || account?.refreshToken || '').trim();
+  return {
+    access_token: fallbackToken,
+    id_token: fallbackToken,
+    refresh_token: String(account?.refreshToken || fallbackToken).trim(),
+    token_type: 'Bearer',
+    expires_in: 604800,
+    scope: 'openid profile email offline_access',
+    shouldLogout: false,
+  };
+}
+
 // ── 处理函数 ─────────────────────────────────────────────────
 
 /**
@@ -439,10 +519,11 @@ function handleAuthIntercept(req, res, pathname, config, logger) {
   try {
     let responseBody;
     let contentType = 'application/json';
+    const relayAccount = resolveRelayAccountSnapshot();
 
     switch (pathname) {
       case AUTH_ENDPOINTS.FULL_STRIPE_PROFILE:
-        responseBody = buildFakeStripeProfile({ email: config.relayEmail });
+        responseBody = buildFakeStripeProfile({ email: relayAccount?.email || config.relayEmail });
         break;
 
       case AUTH_ENDPOINTS.STRIPE_PROFILE:
@@ -453,7 +534,11 @@ function handleAuthIntercept(req, res, pathname, config, logger) {
       // [FIX #5] /auth/stripe 和 /auth/membership 也返回完整 stripe profile
       case AUTH_ENDPOINTS.STRIPE:
       case AUTH_ENDPOINTS.MEMBERSHIP:
-        responseBody = buildFakeStripeProfile({ email: config.relayEmail });
+        responseBody = buildFakeStripeProfile({ email: relayAccount?.email || config.relayEmail });
+        break;
+
+      case AUTH_ENDPOINTS.OAUTH_TOKEN:
+        responseBody = buildFakeOauthTokenResponse(relayAccount);
         break;
 
       case AUTH_ENDPOINTS.HAS_VALID_PAYMENT_METHOD:

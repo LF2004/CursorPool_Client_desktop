@@ -3,5 +3,6 @@
   "cursorAuth/cachedEmail": "xiaofanya@xiaofanya.top",
   "cursorAuth/cachedSignUpType": "Google",
   "cursorAuth/refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJmYWtlLWN1cnNvci1sb2NhbC11c2VyIiwiZW1haWwiOiJ4aWFvZmFuQHhpYW9mYW55YS50b3AiLCJ0eXBlIjoic2Vzc2lvbiIsImlzcyI6ImN1cnNvci1jbGllbnQiLCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIiwiZXhwIjo0MDcwOTA4ODg4fQ.fake-local-state-token",
-  "cursorAuth/stripeMembershipType": "ultra"
+  "cursorAuth/stripeMembershipType": "ultra",
+  "cursorAuth/stripeSubscriptionStatus": "active"
 }

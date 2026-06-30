@@ -55,6 +55,7 @@ const RELAY_BUTTON_IDS = [
 let relayBusyDepth = 0;
 let relayEnabled = false;
 let relayDisableInFlight = false;
+let relayAutoEnsurePromise = null;
 let upstreamProbePromise = null;
 let upstreamProbeCache = null;
 const UPSTREAM_PROBE_CACHE_MS = 45_000;
@@ -860,6 +861,23 @@ function collectRelayRuntimeOptions() {
   };
 }
 
+async function maybeEnsureRelayRunner(local) {
+  const bridge = window.electronBridge;
+  if (!bridge?.cursorRelayEnsureRunner || !bridge?.cursorRelayGetConfig) return local;
+  if (!local?.enabled || local?.mockProxy?.active || local?.runner?.running) return local;
+
+  if (!relayAutoEnsurePromise) {
+    relayAutoEnsurePromise = bridge.cursorRelayEnsureRunner({
+      mode: String(local?.runner?.mode || 'local_relay').trim() || 'local_relay',
+    }).catch(() => null).finally(() => {
+      relayAutoEnsurePromise = null;
+    });
+  }
+
+  await relayAutoEnsurePromise;
+  return bridge.cursorRelayGetConfig({ lightweight: true }).catch(() => local);
+}
+
 function collectUpstreamSessionMeta(upstream) {
   return {
     providerId: upstream.providerId,
@@ -1226,7 +1244,7 @@ async function enableRelayForProfile(profileId) {
         `${describeProfile(active)}${authHint}\n\n${local?.restarted
           ? 'Relay 已启用，Cursor 已重启。在 Cursor 里用 Auto 发消息即可。'
           : restartRequired
-            ? 'Relay 已启用，并已恢复实验 workbench 补丁。请完全退出并重新打开 Cursor 后继续测试。'
+            ? 'Relay 已启用；如需实验性前端注入，请前往偏好设置手动执行并自行验证兼容性。'
             : 'Relay 已启用，并已切到当前选中的模型配置。'}`,
         { title: restartRequired ? 'Relay 已启用，需重启 Cursor' : wasRunning ? '模型已切换' : 'Relay 已启用', tone: restartRequired ? 'warn' : 'success' },
       );
@@ -1486,7 +1504,8 @@ async function refreshRelayStatus() {
     const localState = await window.electronBridge?.getLocalCursorState?.().catch(() => null);
     paintCursorLoginBadge(localState);
 
-    const local = await bridge.cursorRelayGetConfig({ lightweight: true });
+    let local = await bridge.cursorRelayGetConfig({ lightweight: true });
+    local = await maybeEnsureRelayRunner(local);
     const stats = local?.runner?.stats || local?.log?.stats || {};
     const intercept = describeInterceptBadge(stats, local);
 

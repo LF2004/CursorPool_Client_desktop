@@ -10,6 +10,37 @@ const PLAN_WORKFLOW_PHASES = Object.freeze({
   COMPLETED: 'completed',
 });
 
+function getAskQuestionResponseStatus(interactionResponse = {}) {
+  return String(
+    interactionResponse?.askQuestion?.kind
+    || interactionResponse?.askQuestion?.status
+    || interactionResponse?.askQuestion?.result?.kind
+    || interactionResponse?.askQuestion?.result?.status
+    || ''
+  ).trim().toLowerCase();
+}
+
+function normalizeAskQuestionAnswers(answers = []) {
+  return (Array.isArray(answers) ? answers : [])
+    .map((answer) => ({
+      questionId: String(answer?.questionId || answer?.question_id || '').trim(),
+      selectedOptionIds: Array.isArray(answer?.selectedOptionIds)
+        ? answer.selectedOptionIds.filter(Boolean).map((value) => String(value).trim()).filter(Boolean)
+        : (Array.isArray(answer?.selected_option_ids)
+          ? answer.selected_option_ids.filter(Boolean).map((value) => String(value).trim()).filter(Boolean)
+          : []),
+      freeformText: String(answer?.freeformText || answer?.freeform_text || '').trim(),
+    }))
+    .filter((answer) => answer.questionId || answer.selectedOptionIds.length || answer.freeformText);
+}
+
+function hasAskQuestionResponseResolution(interactionResponse = {}) {
+  const status = getAskQuestionResponseStatus(interactionResponse);
+  if (status === 'success') return true;
+  const answers = normalizeAskQuestionAnswers(interactionResponse?.askQuestion?.answers);
+  return answers.some((answer) => answer.selectedOptionIds.length > 0 || Boolean(answer.freeformText));
+}
+
 function getDefaultPlanWorkflowState() {
   return {
     phase: PLAN_WORKFLOW_PHASES.IDLE,
@@ -114,15 +145,8 @@ function buildPlanWorkflowUpdateForInteractionResponse({
 } = {}) {
   const responseKind = String(interactionResponse?.kind || '').trim();
   if (responseKind === 'ask_question_interaction_response') {
-    const askQuestion = interactionResponse?.askQuestion || {};
-    const status = String(askQuestion.kind || '').trim().toLowerCase();
-    const answers = Array.isArray(askQuestion.answers) ? askQuestion.answers : [];
-    const hasAnswers = answers.some((answer) => {
-      const selected = Array.isArray(answer?.selectedOptionIds) ? answer.selectedOptionIds.filter(Boolean) : [];
-      const freeform = String(answer?.freeformText || '').trim();
-      return selected.length > 0 || Boolean(freeform);
-    });
-    if (status === 'success' && hasAnswers) {
+    const status = getAskQuestionResponseStatus(interactionResponse);
+    if (status === 'success' || hasAskQuestionResponseResolution(interactionResponse)) {
       return buildPlanWorkflowStateUpdate(state, PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED, {
         lastInteractionKind: responseKind,
         needsFreshExploreAfterAnswers: true,
@@ -181,6 +205,9 @@ function buildPlanWorkflowUpdateForConversationAction({
 
 module.exports = {
   PLAN_WORKFLOW_PHASES,
+  getAskQuestionResponseStatus,
+  normalizeAskQuestionAnswers,
+  hasAskQuestionResponseResolution,
   getDefaultPlanWorkflowState,
   clonePlanWorkflowState,
   getPlanWorkflowPhaseFromState,
