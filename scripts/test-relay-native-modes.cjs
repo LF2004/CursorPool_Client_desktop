@@ -82,6 +82,7 @@ async function main() {
     .split(',')
     .map((item) => String(item || '').trim())
     .filter(Boolean);
+  const nativeSubagentExec = String(process.env.RELAY_TEST_NATIVE_SUBAGENT_EXEC || '').trim() === '1';
 
   const { activeProfile, upstream } = pickActiveUpstream();
   let started = null;
@@ -94,6 +95,7 @@ async function main() {
       forceRestartRunner: true,
       localNativeAgentTools: true,
       structuredAgentToolCalls: true,
+      nativeSubagentExec,
       nativeMutationTools: true,
       emitLocalToolInteractionFrames: true,
       emitLocalStepFrames: true,
@@ -116,6 +118,7 @@ async function main() {
         profileId: String(activeProfile?.id || ''),
         modelName: String(activeProfile?.modelName || upstream.modelName || ''),
         baseUrl: String(upstream.baseUrl || ''),
+        nativeSubagentExec,
       },
       cases,
     };

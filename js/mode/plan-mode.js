@@ -406,6 +406,24 @@ function buildPendingInteractionResumeState(session = {}, context = {}) {
 
 function buildWaitingForInteractionStatePatch(session = {}, context = {}) {
   const since = String(context.since || '').trim() || new Date().toISOString();
+  const planState = context.plan && typeof context.plan === 'object'
+    ? {
+      plan: String(context.plan.plan || context.plan.plan_uri || '').trim(),
+      plan_text: String(context.plan.plan_text || '').trim(),
+      plan_uri: String(context.plan.plan_uri || '').trim(),
+      todos: Array.isArray(context.plan.todos) ? context.plan.todos.map((todo) => ({ ...todo })) : [],
+    }
+    : null;
+  const currentPlans = planState?.plan_uri
+    ? {
+      [planState.plan_uri]: {
+        plan: planState.plan,
+        plan_text: planState.plan_text,
+        plan_uri: planState.plan_uri,
+        todos: planState.todos,
+      },
+    }
+    : {};
   return {
     current_loop_status: 'waiting_for_interaction',
     waiting_for_interaction: {
@@ -413,7 +431,10 @@ function buildWaitingForInteractionStatePatch(session = {}, context = {}) {
       pending_count: Number(context.pendingCount) || 0,
       since,
     },
-    plan: context.plan || null,
+    plan: planState,
+    current_plan_text: planState?.plan_text || '',
+    current_plans: currentPlans,
+    current_todos: Array.isArray(planState?.todos) ? planState.todos : [],
   };
 }
 

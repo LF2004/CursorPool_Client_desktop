@@ -32,6 +32,7 @@ let runnerConfig = null;
 let intentionalStop = false;
 // 保存上次启动参数，供异常退出后自动重启使用
 let lastStartPayload = null;
+const intentionallyStoppedRunnerPids = new Set();
 // 重启退避状态
 let restartBackoff = {
   consecutiveCrashes: 0,
@@ -55,6 +56,28 @@ function tryParseJson(text = '') {
 function findListeningPidsByPort(port) {
   const targetPort = Number(port) || 0;
   if (!targetPort || process.platform !== 'win32') return [];
+  try {
+    const output = execFileSync(
+      'netstat.exe',
+      ['-ano', '-p', 'tcp'],
+      { encoding: 'utf8', windowsHide: true, timeout: 5000 },
+    );
+    const pids = [];
+    String(output || '').split(/\r?\n/).forEach((line) => {
+      const trimmed = line.trim();
+      if (!/^TCP\s+/i.test(trimmed) || !/\sLISTENING\s/i.test(trimmed)) return;
+      const parts = trimmed.split(/\s+/);
+      const localAddress = String(parts[1] || '').trim();
+      const state = String(parts[3] || '').trim().toUpperCase();
+      const pid = Number(parts[4]) || 0;
+      if (state !== 'LISTENING' || !pid) return;
+      const localPort = Number(localAddress.split(':').pop()) || 0;
+      if (localPort === targetPort && !pids.includes(pid)) pids.push(pid);
+    });
+    if (pids.length) return pids;
+  } catch {
+    /* fallback below */
+  }
   try {
     const output = execFileSync(
       'powershell.exe',
@@ -95,9 +118,9 @@ function buildStartOperationKey(options = {}) {
     port,
     mode,
     forceRestartRunner: options.forceRestartRunner === true,
-    completionModel: String(options.completionModel || '').trim(),
     localNativeAgentTools: options.localNativeAgentTools !== false,
     structuredAgentToolCalls: options.structuredAgentToolCalls !== false,
+    nativeSubagentExec: options.nativeSubagentExec === true,
     nativeMutationTools: options.nativeMutationTools !== false,
     nativeMutationApplyMode: String(options.nativeMutationApplyMode || 'cursor'),
     emitAgentKvBootstrap: options.emitAgentKvBootstrap === true,
@@ -231,13 +254,13 @@ function buildOfficialPassthroughUpstream() {
 function writeRunnerConfig({
   upstream,
   modelRoutes = [],
-  completionModel = '',
   port,
   customRoot,
   mode = RUNNER_MODE_OFFICIAL_PASSTHROUGH,
   directMitmPort = 0,
   localNativeAgentTools = true,
   structuredAgentToolCalls = true,
+  nativeSubagentExec = false,
   nativeMutationTools = true,
   nativeMutationApplyMode = 'cursor',
   emitAgentKvBootstrap = false,
@@ -250,18 +273,19 @@ function writeRunnerConfig({
   historyRoot = '',
   advancedModelBilling = null,
   outboundProxy = null,
+  runtimeTuning = null,
 }) {
   const paths = getRunnerPaths(customRoot);
   const cert = ensureRelayCertificates(customRoot);
   const config = {
     port,
     mode,
-    completionModel: String(completionModel || '').trim(),
     directMitmPort: Number(directMitmPort) || 0,
     mockAgentTools: false,
     mockAgentProtoTools: false,
     localNativeAgentTools: Boolean(localNativeAgentTools),
     structuredAgentToolCalls: Boolean(structuredAgentToolCalls),
+    nativeSubagentExec: Boolean(nativeSubagentExec),
     nativeMutationTools: Boolean(nativeMutationTools),
     nativeMutationApplyMode: String(nativeMutationApplyMode || 'cursor'),
     emitAgentKvBootstrap: Boolean(emitAgentKvBootstrap),
@@ -280,6 +304,9 @@ function writeRunnerConfig({
     outboundProxy: outboundProxy && typeof outboundProxy === 'object'
       ? outboundProxy
       : null,
+    runtimeTuning: runtimeTuning && typeof runtimeTuning === 'object'
+      ? runtimeTuning
+      : {},
     cert: {
       leafCertPath: cert.leafCertPath,
       leafKeyPath: cert.leafKeyPath,
@@ -288,6 +315,22 @@ function writeRunnerConfig({
     },
     upstream: normalizeUpstream(upstream),
     modelRoutes: normalizeModelRoutes(modelRoutes),
+  };
+  config.runtimeTuningDescriptions = {
+    upstreamFetchTimeoutMs: '上游请求建立连接与首包总超时，单位毫秒。',
+    upstreamStreamIdleTimeoutMs: '首轮对话流在没有任何新事件时的空闲超时，单位毫秒。',
+    postToolUpstreamTimeoutMs: '工具执行后的后续请求最大持续时间，单位毫秒。',
+    postToolStreamIdleTimeoutMs: '工具执行后普通续跑流的空闲超时，单位毫秒。',
+    postToolMutationStreamIdleTimeoutMs: '涉及修改文件后的续跑流空闲超时，单位毫秒。',
+    postToolNoVisibleProgressTimeoutMs: '工具后续阶段若长期没有文本/工具/思考可见进展则提前结束等待，单位毫秒。',
+    postMutationSummaryTimeoutMs: '修改完成后总结阶段的最长等待时间，单位毫秒。',
+    postMutationSummaryIdleTimeoutMs: '修改完成后总结阶段的空闲超时，单位毫秒。',
+    mutationToolStreamIdleTimeoutMs: '原生修改工具执行回流的空闲超时，单位毫秒。',
+    mutationToolStreamMaxDurationMs: '原生修改工具执行回流的最大时长，单位毫秒。',
+    deepseekReasoningOnlyStreamMaxMs: 'DeepSeek 仅输出 Thought/思考内容时允许持续的最大时长，单位毫秒。',
+    maxIncompletePostMutationContinuations: '没有明确完成信号时，post-tool 自动 continuation 的最大次数。',
+    maxReadOnlyExplorationContinuations: '只读探索场景的最大 continuation 次数。',
+    emitEditToolPlaceholderFrames: '是否在 edit 类工具尚未拿到 path/内容前就先发空卡片占位。',
   };
   fs.mkdirSync(paths.dataDir, { recursive: true });
   fs.writeFileSync(paths.configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
@@ -380,16 +423,17 @@ function requestRunnerShutdown(port, timeoutMs = 1500) {
 async function waitForRunnerHealth(port, options = {}) {
   const attempts = Number(options.attempts || 10);
   const delayMs = Number(options.delayMs || 100);
+  const probeTimeoutMs = Number(options.probeTimeoutMs || 0);
   const isExpected = typeof options.isExpected === 'function' ? options.isExpected : null;
   for (let i = 0; i < attempts; i += 1) {
     // eslint-disable-next-line no-await-in-loop
-    const health = await probeRunnerHealth(port, i < 6 ? 120 : 250);
+    const health = await probeRunnerHealth(port, probeTimeoutMs || (i < 6 ? 120 : 250));
     if (health.ok && (!isExpected || isExpected(health))) return health;
     // 前 8 次用短间隔(40ms)加速启动探测，之后用配置间隔
     // eslint-disable-next-line no-await-in-loop
     await sleep(i < 8 ? 40 : delayMs);
   }
-  const finalHealth = await probeRunnerHealth(port);
+  const finalHealth = await probeRunnerHealth(port, probeTimeoutMs || 500);
   if (finalHealth.ok && isExpected && !isExpected(finalHealth)) {
     return { ...finalHealth, ok: false, unexpectedRunner: true };
   }
@@ -448,7 +492,6 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   if (String(healthPayload.runnerScriptMtime || '') !== fingerprint.mtime) return false;
   if (Number(healthPayload.runnerScriptSize) !== Number(fingerprint.size)) return false;
   if (String(healthPayload.mode || '') !== String(options.mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return false;
-  if (String(healthPayload.completionModel || '') !== String(options.completionModel || '')) return false;
   if (!outboundProxyMatches(healthPayload.outboundProxy || null, options.outboundProxy || null)) return false;
   const baseUrl = String(upstream.baseUrl || '').trim().replace(/\/+$/, '');
   const modelName = String(upstream.modelName || '').trim();
@@ -473,6 +516,7 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   }
   const wantLocalNative = options.localNativeAgentTools !== false;
   const wantStructured = options.structuredAgentToolCalls !== false;
+  const wantNativeSubagentExec = options.nativeSubagentExec === true;
   const wantNativeMutation = options.nativeMutationTools !== false;
   const wantNativeMutationApplyMode = String(options.nativeMutationApplyMode || 'cursor');
   const wantKvBootstrap = options.emitAgentKvBootstrap === true;
@@ -485,6 +529,7 @@ function runnerUpstreamMatches(healthPayload, upstream, options = {}) {
   const wantReviewBridge = options.enableReviewBridge === true;
   if (Boolean(healthPayload.localNativeAgentTools) !== wantLocalNative) return false;
   if (Boolean(healthPayload.structuredAgentToolCalls) !== wantStructured) return false;
+  if (Boolean(healthPayload.nativeSubagentExec) !== wantNativeSubagentExec) return false;
   if (Boolean(healthPayload.nativeMutationTools ?? true) !== wantNativeMutation) return false;
   if (String(healthPayload.nativeMutationApplyMode || 'cursor') !== wantNativeMutationApplyMode) return false;
   if (Boolean(healthPayload.emitAgentKvBootstrap) !== wantKvBootstrap) return false;
@@ -508,7 +553,6 @@ function getRunnerReuseMismatchReason(healthPayload, upstream, options = {}) {
   if (String(healthPayload.runnerScriptMtime || '') !== fingerprint.mtime) return 'runnerScriptMtime';
   if (Number(healthPayload.runnerScriptSize) !== Number(fingerprint.size)) return 'runnerScriptSize';
   if (String(healthPayload.mode || '') !== String(options.mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return 'mode';
-  if (String(healthPayload.completionModel || '') !== String(options.completionModel || '')) return 'completionModel';
   if (!outboundProxyMatches(healthPayload.outboundProxy || null, options.outboundProxy || null)) return 'outboundProxy';
   const baseUrl = String(upstream.baseUrl || '').trim().replace(/\/+$/, '');
   const modelName = String(upstream.modelName || '').trim();
@@ -533,6 +577,7 @@ function getRunnerReuseMismatchReason(healthPayload, upstream, options = {}) {
   }
   const wantLocalNative = options.localNativeAgentTools !== false;
   const wantStructured = options.structuredAgentToolCalls !== false;
+  const wantNativeSubagentExec = options.nativeSubagentExec === true;
   const wantNativeMutation = options.nativeMutationTools !== false;
   const wantNativeMutationApplyMode = String(options.nativeMutationApplyMode || 'cursor');
   const wantKvBootstrap = options.emitAgentKvBootstrap === true;
@@ -545,6 +590,7 @@ function getRunnerReuseMismatchReason(healthPayload, upstream, options = {}) {
   const wantReviewBridge = options.enableReviewBridge === true;
   if (Boolean(healthPayload.localNativeAgentTools) !== wantLocalNative) return 'localNativeAgentTools';
   if (Boolean(healthPayload.structuredAgentToolCalls) !== wantStructured) return 'structuredAgentToolCalls';
+  if (Boolean(healthPayload.nativeSubagentExec) !== wantNativeSubagentExec) return 'nativeSubagentExec';
   if (Boolean(healthPayload.nativeMutationTools ?? true) !== wantNativeMutation) return 'nativeMutationTools';
   if (String(healthPayload.nativeMutationApplyMode || 'cursor') !== wantNativeMutationApplyMode) return 'nativeMutationApplyMode';
   if (Boolean(healthPayload.emitAgentKvBootstrap) !== wantKvBootstrap) return 'emitAgentKvBootstrap';
@@ -556,6 +602,36 @@ function getRunnerReuseMismatchReason(healthPayload, upstream, options = {}) {
   if (Math.max(1, Math.floor(Number(healthPayload.maxLocalToolCallsPerRound) || 0)) !== wantMaxLocalToolCallsPerRound) return 'maxLocalToolCallsPerRound';
   if (Boolean(healthPayload.enableReviewBridge) !== wantReviewBridge) return 'enableReviewBridge';
   return '';
+}
+
+function runnerHealthMatchesWrittenConfig(result, written, mode) {
+  const payload = result?.payload || {};
+  if (!payload || payload.ok !== true) return false;
+  if (String(payload.mode || '') !== String(mode || RUNNER_MODE_OFFICIAL_PASSTHROUGH)) return false;
+  if (
+    String(payload.upstreamBaseUrl || '').trim().replace(/\/+$/, '')
+    !== String(written?.config?.upstream?.baseUrl || '').trim().replace(/\/+$/, '')
+  ) {
+    return false;
+  }
+  if (
+    String(payload.upstreamModelName || '').trim()
+    !== String(written?.config?.upstream?.modelName || '').trim()
+  ) {
+    return false;
+  }
+  const currentModelRoutes = Array.isArray(payload.modelRoutes)
+    ? payload.modelRoutes
+    : [];
+  const expectedModelRoutes = Array.isArray(written?.config?.modelRoutes)
+    ? written.config.modelRoutes.map((item) => ({
+      modelName: item.modelName,
+      upstreamBaseUrl: String(item.upstream?.baseUrl || ''),
+      upstreamModelName: String(item.upstream?.modelName || ''),
+      upstreamEndpointMode: String(item.upstream?.endpointMode || 'responses'),
+    }))
+    : [];
+  return JSON.stringify(currentModelRoutes) === JSON.stringify(expectedModelRoutes);
 }
 
 function buildRunnerStartResult({
@@ -628,12 +704,17 @@ async function waitForRunnerDown(port, attempts = 10, delayMs = 100) {
   for (let i = 0; i < attempts; i += 1) {
     // eslint-disable-next-line no-await-in-loop
     const health = await probeRunnerHealth(port, 250);
-    if (!health.ok) return true;
+    // Health can time out while the old runner is still listening under load.
+    // Treat the runner as down only after the relay port is also closed.
+    // eslint-disable-next-line no-await-in-loop
+    const portOpen = await isPortOpen(port, 120).catch(() => false);
+    if (!health.ok && !portOpen) return true;
     // eslint-disable-next-line no-await-in-loop
     await sleep(delayMs);
   }
   const finalHealth = await probeRunnerHealth(port, 250);
-  return !finalHealth.ok;
+  const finalPortOpen = await isPortOpen(port, 120).catch(() => false);
+  return !finalHealth.ok && !finalPortOpen;
 }
 
 async function stopLocalRelayRunner(payload = {}) {
@@ -655,7 +736,8 @@ async function stopLocalRelayRunner(payload = {}) {
     health = null;
   }
   const healthPid = Number(health?.payload?.pid) || 0;
-  const pidSet = new Set([knownPid, healthPid].filter(Boolean));
+  const portPids = findListeningPidsByPort(port);
+  const pidSet = new Set([knownPid, healthPid, ...portPids].filter(Boolean));
 
   runnerChild = null;
   runnerConfig = null;
@@ -663,6 +745,8 @@ async function stopLocalRelayRunner(payload = {}) {
   if (!pidSet.size) {
     return { ok: true, stopped: false, running: false, port };
   }
+
+  pidSet.forEach((pid) => intentionallyStoppedRunnerPids.add(pid));
 
   if (fast) {
     requestRunnerShutdown(port, 250).catch(() => null);
@@ -799,7 +883,6 @@ async function startLocalRelayRunner(payload = {}) {
     ? buildOfficialPassthroughUpstream()
     : normalizeUpstream(upstreamPayload || {});
   const modelRoutes = normalizeModelRoutes(payload.modelRoutes);
-  const completionModel = String(payload.completionModel || upstream.completionModel || '').trim();
   const localNativeAgentTools = payload.localNativeAgentTools !== false
     && String(process.env.CURSOR_RELAY_LOCAL_NATIVE_TOOLS || '').trim() !== '0';
   const structuredAgentToolCalls = payload.structuredAgentToolCalls !== false
@@ -813,6 +896,8 @@ async function startLocalRelayRunner(payload = {}) {
     && String(process.env.CURSOR_RELAY_AGENT_EXEC_SERVER_FRAMES || '').trim() !== '0';
   const nativeMutationTools = payload.nativeMutationTools !== false
     && String(process.env.CURSOR_RELAY_NATIVE_MUTATION_TOOLS || '').trim() !== '0';
+  const nativeSubagentExec = payload.nativeSubagentExec === true
+    || String(process.env.CURSOR_RELAY_NATIVE_SUBAGENT_EXEC || '').trim() === '1';
   const nativeMutationApplyMode = String(
     payload.nativeMutationApplyMode
       || process.env.CURSOR_RELAY_NATIVE_MUTATION_APPLY_MODE
@@ -839,9 +924,9 @@ async function startLocalRelayRunner(payload = {}) {
     : resolveRelayOutboundProxy({ localProxyPorts: [port] });
   const reuseOptions = {
     mode,
-    completionModel,
     localNativeAgentTools,
     structuredAgentToolCalls,
+    nativeSubagentExec,
     nativeMutationTools,
     nativeMutationApplyMode,
     emitAgentKvBootstrap,
@@ -876,11 +961,11 @@ async function startLocalRelayRunner(payload = {}) {
       port,
       upstream,
       mode: existingHealth.payload?.mode || mode,
-      completionModel: String(existingHealth.payload?.completionModel || completionModel || ''),
       directMitmPort: Number(existingHealth.payload?.directMitmPort) || 0,
       localNativeAgentTools,
       structuredAgentToolCalls,
       nativeMutationTools,
+      nativeSubagentExec,
       nativeMutationApplyMode,
       emitAgentKvBootstrap,
       emitLocalMutationCheckpoints,
@@ -912,7 +997,7 @@ async function startLocalRelayRunner(payload = {}) {
     });
   }
 
-  await stopLocalRelayRunner({ port });
+  await stopLocalRelayRunner({ port, fast: true });
   appendRunnerLog(
     `[info] runner restart requested requestedModel=${String(upstream.modelName || '')} forceRestart=${forceRestartRunner ? '1' : '0'} mode=${mode}`,
     customRoot,
@@ -925,12 +1010,12 @@ async function startLocalRelayRunner(payload = {}) {
     port,
     customRoot,
     mode,
-    completionModel,
     directMitmPort,
     mockAgentTools: false,
     mockAgentProtoTools: false,
     localNativeAgentTools,
     structuredAgentToolCalls,
+    nativeSubagentExec,
     nativeMutationTools,
     nativeMutationApplyMode,
     emitAgentKvBootstrap,
@@ -943,6 +1028,7 @@ async function startLocalRelayRunner(payload = {}) {
     enableReviewBridge,
     advancedModelBilling,
     outboundProxy,
+    runtimeTuning: payload.runtimeTuning,
     modelRoutes,
   });
   runnerConfig = written.config;
@@ -972,15 +1058,17 @@ async function startLocalRelayRunner(payload = {}) {
   const childPid = runnerChild.pid;
   const savedPayload = lastStartPayload;
   runnerChild.on('exit', (code, signal) => {
+    const expectedStop = intentionalStop || intentionallyStoppedRunnerPids.has(childPid);
+    intentionallyStoppedRunnerPids.delete(childPid);
     if (runnerChild && runnerChild.pid === childPid) {
       runnerChild = null;
       // 主动停止时才清空 config；异常退出保留以供自动重启参考
-      if (intentionalStop) {
+      if (expectedStop) {
         runnerConfig = null;
       }
     }
     // 非主动停止 → 尝试自动重启
-    if (!intentionalStop && savedPayload) {
+    if (!expectedStop && savedPayload) {
       scheduleRunnerRestart(savedPayload, code, signal).catch(() => null);
     }
   });
@@ -992,28 +1080,32 @@ async function startLocalRelayRunner(payload = {}) {
   }
 
   const health = await waitForRunnerHealth(port, {
-    attempts: 40,
-    delayMs: 150,
-    isExpected: (result) => (
-      Number(result?.payload?.pid) === Number(childPid)
-      && String(result?.payload?.mode || '') === mode
-      && String(result?.payload?.upstreamBaseUrl || '').trim() === written.config.upstream.baseUrl
-      && String(result?.payload?.upstreamModelName || '').trim() === written.config.upstream.modelName
-      && JSON.stringify(result?.payload?.modelRoutes || []) === JSON.stringify(
-        Array.isArray(written.config.modelRoutes)
-          ? written.config.modelRoutes.map((item) => ({
-            modelName: item.modelName,
-            upstreamBaseUrl: String(item.upstream?.baseUrl || ''),
-            upstreamModelName: String(item.upstream?.modelName || ''),
-            upstreamEndpointMode: String(item.upstream?.endpointMode || 'responses'),
-          }))
-          : [],
-      )
-    ),
+    attempts: 60,
+    delayMs: 200,
+    probeTimeoutMs: 1500,
+    isExpected: (result) => runnerHealthMatchesWrittenConfig(result, written, mode),
   });
   if (!health.ok) {
     const latestLog = await readRunnerLogTail(customRoot, 120).catch(() => null);
     const portOpen = await isPortOpen(port).catch(() => false);
+    if (portOpen) {
+      const lateHealth = await waitForRunnerHealth(port, {
+        attempts: 8,
+        delayMs: 250,
+        probeTimeoutMs: 3000,
+        isExpected: (result) => runnerHealthMatchesWrittenConfig(result, written, mode),
+      });
+      if (lateHealth.ok) {
+        return buildRunnerStartResult({
+          port,
+          written,
+          upstream,
+          health: lateHealth,
+          childPid,
+          reused: false,
+        });
+      }
+    }
     const conflictingPids = portOpen ? findListeningPidsByPort(port) : [];
     const stalePids = conflictingPids.filter((pid) => Number(pid) !== Number(childPid) && Number(pid) !== Number(runnerChild?.pid || 0));
     const hasAddrInUse = /EADDRINUSE|address already in use/i.test(String(latestLog?.text || ''));
@@ -1024,10 +1116,8 @@ async function startLocalRelayRunner(payload = {}) {
         const retryHealth = await waitForRunnerHealth(port, {
           attempts: 12,
           delayMs: 120,
-          isExpected: (result) => (
-            Number(result?.payload?.pid) === Number(childPid)
-            && String(result?.payload?.mode || '') === mode
-          ),
+          probeTimeoutMs: 1500,
+          isExpected: (result) => runnerHealthMatchesWrittenConfig(result, written, mode),
         });
         if (retryHealth.ok) {
           return buildRunnerStartResult({
@@ -1053,7 +1143,7 @@ async function startLocalRelayRunner(payload = {}) {
       stalePids.length ? `Killed conflicting listener PID(s): ${stalePids.join(', ')}` : '',
       logHint ? `Recent runner log:\n${logHint}` : '',
     ].filter(Boolean).join('\n');
-    await stopLocalRelayRunner({ port });
+    await stopLocalRelayRunner({ port, fast: true });
     throw new Error(detail);
   }
 
@@ -1091,7 +1181,6 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     port: health.payload?.port || port,
     directMitmPort: health.payload?.directMitmPort || runnerConfig?.directMitmPort || 0,
     mode: health.payload?.mode || runnerConfig?.mode || '',
-    completionModel: String(health.payload?.completionModel || runnerConfig?.completionModel || ''),
     mockAgentTools: false,
     mockAgentProtoTools: false,
     localNativeAgentTools: Boolean(health.payload?.localNativeAgentTools || runnerConfig?.localNativeAgentTools),
@@ -1101,6 +1190,9 @@ async function getLocalRelayRunnerStatus(payload = {}) {
     nativeMutationTools: Object.prototype.hasOwnProperty.call(health.payload || {}, 'nativeMutationTools')
       ? Boolean(health.payload?.nativeMutationTools)
       : Boolean(runnerConfig?.nativeMutationTools),
+    nativeSubagentExec: Object.prototype.hasOwnProperty.call(health.payload || {}, 'nativeSubagentExec')
+      ? Boolean(health.payload?.nativeSubagentExec)
+      : Boolean(runnerConfig?.nativeSubagentExec),
     nativeMutationApplyMode: String(health.payload?.nativeMutationApplyMode || runnerConfig?.nativeMutationApplyMode || 'cursor'),
     emitAgentKvBootstrap: Object.prototype.hasOwnProperty.call(health.payload || {}, 'emitAgentKvBootstrap')
       ? Boolean(health.payload?.emitAgentKvBootstrap)
@@ -1137,7 +1229,6 @@ async function getLocalRelayRunnerStatus(payload = {}) {
             displayName: runnerConfig.upstream.displayName || runnerConfig.upstream.modelName,
             baseUrl: runnerConfig.upstream.baseUrl,
             modelName: runnerConfig.upstream.modelName,
-            completionModel: String(runnerConfig.completionModel || runnerConfig.upstream.completionModel || ''),
             availableModels: Array.isArray(runnerConfig.upstream.availableModels)
               ? runnerConfig.upstream.availableModels
               : [runnerConfig.upstream.modelName],
@@ -1152,7 +1243,6 @@ async function getLocalRelayRunnerStatus(payload = {}) {
             displayName: health.payload.upstreamDisplayName || health.payload.upstreamModelName,
             baseUrl: health.payload.upstreamBaseUrl,
             modelName: health.payload.upstreamModelName,
-            completionModel: String(health.payload.completionModel || ''),
             availableModels: Array.isArray(health.payload.upstreamAvailableModels)
               ? health.payload.upstreamAvailableModels
               : [health.payload.upstreamModelName],

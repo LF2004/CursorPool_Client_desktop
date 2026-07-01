@@ -176,14 +176,41 @@ function extractSkillOptions(clientMessage) {
   }
 }
 
+function normalizeAgentModeValue(mode) {
+  if (typeof mode === 'string') {
+    const text = mode.trim();
+    if (text) return text;
+  }
+  switch (Number(mode) || 0) {
+    case 1:
+      return 'AGENT_MODE_AGENT';
+    case 2:
+      return 'AGENT_MODE_ASK';
+    case 3:
+      return 'AGENT_MODE_PLAN';
+    case 4:
+      return 'AGENT_MODE_DEBUG';
+    case 5:
+      return 'AGENT_MODE_TRIAGE';
+    case 6:
+      return 'AGENT_MODE_PROJECT';
+    case 7:
+      return 'AGENT_MODE_MULTITASK';
+    case 8:
+      return 'AGENT_MODE_SUBAGENT';
+    default:
+      return null;
+  }
+}
+
 /**
- * 提取 AgentMode（agent/ask/plan/debug/triage/project/multitask）
+ * 提取 AgentMode（agent/ask/plan/debug/triage/project/multitask/subagent）
  */
 function extractAgentMode(clientMessage) {
   if (!clientMessage?.runRequest?.action) return null;
   try {
     const mode = clientMessage.runRequest.action.mode;
-    return mode || null;
+    return normalizeAgentModeValue(mode);
   } catch {
     return null;
   }
@@ -284,6 +311,26 @@ function normalizeConversationActionForLegacy(convAction) {
         summary.planFileUri = String(ep?.planFileUri || '').trim();
         summary.planFileContent = String(ep?.planFileContent || '').trim();
         summary.requestContext = ep?.requestContext || null;
+        // executionMode: proto AgentMode enum - map number/string to mode name
+        if (ep?.executionMode) {
+          const modeRaw = ep.executionMode;
+          if (typeof modeRaw === 'string') {
+            summary.executionMode = modeRaw;
+          } else if (typeof modeRaw === 'number' && modeRaw > 0) {
+            // map proto AgentMode enum values to mode names
+            const modeMap = {
+              1: 'AGENT_MODE_AGENT',
+              2: 'AGENT_MODE_ASK',
+              3: 'AGENT_MODE_PLAN',
+              4: 'AGENT_MODE_DEBUG',
+              5: 'AGENT_MODE_TRIAGE',
+              6: 'AGENT_MODE_PROJECT',
+              7: 'AGENT_MODE_MULTITASK',
+              8: 'AGENT_MODE_SUBAGENT',
+            };
+            summary.executionMode = modeMap[modeRaw] || 'AGENT_MODE_AGENT';
+          }
+        }
         break;
       }
       case 'cancelAction': {

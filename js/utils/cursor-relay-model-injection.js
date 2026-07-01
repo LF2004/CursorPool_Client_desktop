@@ -43,6 +43,7 @@ const { getRelayDataDir } = require('./cursor-relay-cert');
 const AVAILABLE_MODELS_PATH = '/aiserver.v1.AiService/AvailableModels';
 const GET_USABLE_MODELS_PATH = '/agent.v1.AgentService/GetUsableModels';
 const GET_DEFAULT_MODEL_PATH = '/agent.v1.AgentService/GetDefaultModelForCli';
+const GET_DEFAULT_MODEL_NUDGE_PATH = '/aiserver.v1.AiService/GetDefaultModelNudgeData';
 
 function buildRelayModelParameterDefinitions() {
   return [
@@ -103,6 +104,24 @@ function buildRelayModelVariants(displayName, shortName, rawReasoningEffort = 'm
   ];
 }
 
+function buildRelayModelPickerDisplayConfiguration() {
+  return {
+    routedModelViewConfig: {
+      title: 'Auto',
+      hideRoutedModelView: true,
+      hideSearchBar: false,
+      routedModelViewToNamedViewToggle: {
+        titleMarkdown: 'Models',
+        subtitle: '',
+        setToLastNamedModel: true,
+      },
+    },
+    namedModelsViewConfig: {
+      namedViewToRoutedModelViewNoButton: {},
+    },
+  };
+}
+
 /**
  * 从 relay profile store 收集所有本地模型
  * @returns {{modelName, displayName, displayNameShort, profileId, modelId, reasoningEffort, thinkingMode}[]}
@@ -141,7 +160,6 @@ function collectModelsFromRunnerConfig(customRoot = '') {
       const displayName = String(source.displayName || source.name || source.modelName || '').trim();
       const candidates = [
         String(source.modelName || '').trim(),
-        String(source.completionModel || '').trim(),
         ...(Array.isArray(source.availableModels) ? source.availableModels.map((item) => String(item || '').trim()) : []),
       ].filter(Boolean);
       for (const modelName of candidates) {
@@ -185,7 +203,6 @@ function collectLocalModels() {
       for (const c of store.configs.filter((item) => item && item.modelName)) {
         const candidateNames = [
           String(c.modelName || '').trim(),
-          String(c.completionModel || '').trim(),
         ].filter(Boolean);
         for (const modelName of candidateNames) {
           models.push({
@@ -253,7 +270,8 @@ function isModelListPath(pathname) {
   return (
     pathname === AVAILABLE_MODELS_PATH ||
     pathname === GET_USABLE_MODELS_PATH ||
-    pathname === GET_DEFAULT_MODEL_PATH
+    pathname === GET_DEFAULT_MODEL_PATH ||
+    pathname === GET_DEFAULT_MODEL_NUDGE_PATH
   );
 }
 
@@ -279,6 +297,13 @@ function injectAvailableModelsResponse(upstreamResponseBody) {
   try {
     const decoded = decodeUnaryOrConnect('aiserver.v1.AvailableModelsResponse', upstreamResponseBody);
     return encodeUnaryOrConnect('aiserver.v1.AvailableModelsResponse', decoded, (resp) => {
+      const localModelNames = localModels.map((m) => String(m.modelName || '').trim()).filter(Boolean);
+      const defaultModel = localModelNames[0] || '';
+      const localModelConfig = {
+        defaultModel,
+        fallbackModels: localModelNames,
+        bestOfNDefaultModels: localModelNames,
+      };
 
       // ── 注入到 model_names (field #1, string[]) — 兼容旧路径 ──
       const existingNames = new Set(
@@ -348,12 +373,37 @@ function injectAvailableModelsResponse(upstreamResponseBody) {
         });
         });
 
-      if (!namesToAdd.length && !modelsToAdd.length) return resp;
+      const hasLocalFeatureConfig = [
+        resp.defaultModelConfig,
+        resp.composerModelConfig,
+        resp.cmdKModelConfig,
+        resp.backgroundComposerModelConfig,
+        resp.planExecutionModelConfig,
+      ].some((entry) => {
+        const defaultName = String(entry?.defaultModel || '').trim();
+        const fallback = Array.isArray(entry?.fallbackModels) ? entry.fallbackModels : [];
+        return localModelNames.includes(defaultName) || fallback.some((name) => localModelNames.includes(String(name || '').trim()));
+      });
+
+      if (!namesToAdd.length && !modelsToAdd.length && hasLocalFeatureConfig) return resp;
 
       return {
         ...resp,
         modelNames: [...(resp.modelNames || []), ...namesToAdd],
         models: [...existingModels, ...modelsToAdd],
+        defaultModelConfig: resp.defaultModelConfig || localModelConfig,
+        composerModelConfig: localModelConfig,
+        cmdKModelConfig: localModelConfig,
+        backgroundComposerModelConfig: localModelConfig,
+        planExecutionModelConfig: localModelConfig,
+        specModelConfig: localModelConfig,
+        deepSearchModelConfig: resp.deepSearchModelConfig || { defaultModel },
+        quickAgentModelConfig: resp.quickAgentModelConfig || { defaultModel },
+        slowPoolModelConfig: resp.slowPoolModelConfig || localModelConfig,
+        disableUnusedModelsAfterNHours: Number(resp.disableUnusedModelsAfterNHours) || 2400000,
+        upgradeUnchangedModelsAfterNHours: Number(resp.upgradeUnchangedModelsAfterNHours) || 2,
+        displayConfiguration: resp.displayConfiguration || buildRelayModelPickerDisplayConfiguration(),
+        useModelParameters: true,
       };
     });
   } catch {
@@ -458,6 +508,21 @@ function injectModelListResponse(pathname, upstreamResponseBody) {
     if (pathname === GET_DEFAULT_MODEL_PATH) {
       return injectGetDefaultModelResponse(upstreamResponseBody);
     }
+    if (pathname === GET_DEFAULT_MODEL_NUDGE_PATH) {
+      const localModels = collectLocalModels();
+      const modelNames = localModels.map((m) => String(m.modelName || '').trim()).filter(Boolean);
+      if (!modelNames.length) return null;
+      const decoded = decodeUnaryOrConnect('aiserver.v1.GetDefaultModelNudgeDataResponse', upstreamResponseBody);
+      return encodeUnaryOrConnect('aiserver.v1.GetDefaultModelNudgeDataResponse', decoded, (resp) => ({
+        ...resp,
+        nudgeDate: String(resp.nudgeDate || '0'),
+        shouldDefaultSwitchOnNewChat: false,
+        modelsWithNoDefaultSwitch: Array.from(new Set([
+          ...(Array.isArray(resp.modelsWithNoDefaultSwitch) ? resp.modelsWithNoDefaultSwitch : []),
+          ...modelNames,
+        ])),
+      }));
+    }
   } catch (e) {
     // 注入失败不影响正常流程
   }
@@ -477,6 +542,7 @@ module.exports = {
   AVAILABLE_MODELS_PATH,
   GET_USABLE_MODELS_PATH,
   GET_DEFAULT_MODEL_PATH,
+  GET_DEFAULT_MODEL_NUDGE_PATH,
   collectLocalModels,
   isModelListPath,
   injectAvailableModelsResponse,

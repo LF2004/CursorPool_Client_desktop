@@ -238,6 +238,16 @@ function parseApplicationUser(raw) {
   }
 }
 
+function stableJsonStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJsonStringify(item)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJsonStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function stripKnownOpenAiEndpointSuffix(urlText) {
   const parsed = new URL(urlText);
   const rawPath = (parsed.pathname || '').replace(/\/+$/, '') || '';
@@ -1084,24 +1094,51 @@ async function syncCursorRelayModelCatalog(payload = {}) {
       contextWindow,
       reasoningEffort,
     });
+    const nextReactiveRaw = JSON.stringify(nextReactive);
+
+    const selectedModelRaw = readItem(db, tableName, 'cursorai/selectedModel');
+    const recentModelsRaw = readItem(db, tableName, 'cursorai/recentModels');
+    const serverConfigRaw = readItem(db, tableName, 'cursorai/serverConfig');
+    const featureConfigCacheRaw = readItem(db, tableName, 'cursorai/featureConfigCache');
+    const legacyRaw = readItem(db, tableName, LEGACY_APP_USER_KEY);
+    const nextLegacyRaw = legacyRaw
+      ? JSON.stringify(applyRelayModelCatalog(parseApplicationUser(legacyRaw), {
+        primaryModel,
+        availableModels,
+        contextWindow,
+        reasoningEffort,
+      }))
+      : null;
+    const recentModelsNextRaw = JSON.stringify(mergeUniqueStrings([primaryModel], availableModels));
+    const unchanged = stableJsonStringify(parseApplicationUser(reactiveRaw)) === stableJsonStringify(nextReactive)
+      && String(selectedModelRaw || '') === primaryModel
+      && String(recentModelsRaw || '') === recentModelsNextRaw
+      && serverConfigRaw == null
+      && featureConfigCacheRaw == null
+      && (!legacyRaw || stableJsonStringify(parseApplicationUser(legacyRaw)) === stableJsonStringify(JSON.parse(nextLegacyRaw)));
+    if (unchanged) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'model_catalog_unchanged',
+        dbPath,
+        primaryModel,
+        availableModels,
+        contextWindow,
+        reasoningEffort,
+        reloaded: false,
+      };
+    }
 
     const tx = db.transaction(() => {
-      upsertItem(db, tableName, REACTIVE_APP_USER_KEY, JSON.stringify(nextReactive));
+      upsertItem(db, tableName, REACTIVE_APP_USER_KEY, nextReactiveRaw);
       upsertItem(db, tableName, 'cursorai/selectedModel', primaryModel);
-      upsertItem(db, tableName, 'cursorai/recentModels', JSON.stringify(mergeUniqueStrings([primaryModel], availableModels)));
+      upsertItem(db, tableName, 'cursorai/recentModels', recentModelsNextRaw);
       deleteItem(db, tableName, 'cursorai/serverConfig');
       deleteItem(db, tableName, 'cursorai/featureConfigCache');
 
-      const legacyRaw = readItem(db, tableName, LEGACY_APP_USER_KEY);
       if (legacyRaw) {
-        const legacy = parseApplicationUser(legacyRaw);
-        const nextLegacy = applyRelayModelCatalog(legacy, {
-          primaryModel,
-          availableModels,
-          contextWindow,
-          reasoningEffort,
-        });
-        upsertItem(db, tableName, LEGACY_APP_USER_KEY, JSON.stringify(nextLegacy));
+        upsertItem(db, tableName, LEGACY_APP_USER_KEY, nextLegacyRaw);
       }
     });
     tx();

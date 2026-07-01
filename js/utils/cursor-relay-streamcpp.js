@@ -121,7 +121,7 @@ function decodeStreamCppRequest(rawBody) {
  */
 function buildStreamCppOpenAIRequest(decoded, upstream = {}) {
   const baseUrl = String(upstream.baseUrl || '').replace(/\/+$/, '');
-  const model = upstream.completionModel || upstream.model || upstream.codeModel || 'gpt-4o-mini';
+  const model = upstream.model || upstream.codeModel || 'gpt-4o-mini';
 
   // FIM 格式提示词
   const prefix = decoded.prefix || '';

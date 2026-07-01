@@ -1205,6 +1205,11 @@ message AvailableModelsResponse {
     optional int32 background_composer_sort_order = 28;
     repeated ModelParameterDefinition parameter_definitions = 29;
     repeated AvailableModelsResponse.ModelVariantConfig variants = 30;
+    repeated string legacy_slugs = 36;
+    repeated string id_aliases = 37;
+    optional int32 named_model_section_index = 38;
+    optional string tagline = 39;
+    optional bool visible_in_routed_model_view = 40;
   }
 
   // Copied from: local:aiserver.v1.AvailableModelsResponse.DegradationStatus (var: NPe)
@@ -1221,15 +1226,58 @@ message AvailableModelsResponse {
     repeated string best_of_n_default_models = 3;
   }
 
+  // Copied from newer Cursor builds: controls whether the picker opens on named models or routed Auto view.
+  message ModelPickerDisplayConfiguration {
+    message NamedModelsViewConfig {
+      message NamedViewToRoutedModelViewButton {
+        string markdown = 1;
+      }
+
+      message NamedViewToRoutedModelViewNoButton {
+      }
+
+      message NamedViewToRoutedModelViewToggle {
+        string markdown = 1;
+      }
+
+      optional NamedViewToRoutedModelViewToggle named_view_to_routed_model_view_toggle = 2;
+      optional NamedViewToRoutedModelViewNoButton named_view_to_routed_model_view_no_button = 3;
+      optional NamedViewToRoutedModelViewButton named_view_to_routed_model_view_button = 4;
+    }
+
+    message RoutedModelViewConfig {
+      message RoutedModelViewToNamedViewButton {
+        string markdown = 1;
+      }
+
+      message RoutedModelViewToNamedViewToggle {
+        string title_markdown = 1;
+        optional string subtitle = 2;
+        optional bool set_to_last_named_model = 3;
+      }
+
+      optional string title = 1;
+      optional RoutedModelViewToNamedViewToggle routed_model_view_to_named_view_toggle = 2;
+      optional RoutedModelViewToNamedViewButton routed_model_view_to_named_view_button = 3;
+      optional bool hide_search_bar = 4;
+      optional bool hide_routed_model_view = 5;
+    }
+
+    RoutedModelViewConfig routed_model_view_config = 1;
+    NamedModelsViewConfig named_models_view_config = 2;
+  }
+
   // Copied from: local:aiserver.v1.AvailableModelsResponse.ModelVariantConfig (var: D3t, class: p$)
   message ModelVariantConfig {
     repeated RequestedModel.ModelParameterValue parameter_values = 1;
     string display_name = 2;
+    optional string display_name_outside_picker = 8;
     bool is_max_mode = 3;
     optional bool is_default_max_config = 4;
     optional bool is_default_non_max_config = 5;
     optional AvailableModelsResponse.TooltipData tooltip_data = 6;
     optional string tagline = 7;
+    optional string variant_string_representation = 9;
   }
 
   // Copied from: local:aiserver.v1.AvailableModelsResponse.TooltipData (var: IBe, class: h$)
@@ -1253,6 +1301,9 @@ message AvailableModelsResponse {
   optional FeatureModelConfig deep_search_model_config = 9;
   optional FeatureModelConfig quick_agent_model_config = 10;
   bool use_model_parameters = 11;
+  optional int32 disable_unused_models_after_n_hours = 12;
+  optional int32 upgrade_unchanged_models_after_n_hours = 13;
+  ModelPickerDisplayConfiguration display_configuration = 15;
 }
 
 // Copied from: local:aiserver.v1.AwaitTaskParams (var: ZWe, class: qO)
@@ -26814,4 +26865,3 @@ service VmDaemonService {
 service WebProfilingService {
   rpc SubmitInteractionWindow(SubmitInteractionWindowRequest) returns (SubmitInteractionWindowResponse) {}
 }
-

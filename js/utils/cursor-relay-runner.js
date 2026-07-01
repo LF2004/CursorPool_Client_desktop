@@ -34,6 +34,7 @@ const {
   buildAgentExecLsFrame,
   buildAgentExecShellStreamFrame,
   buildAgentExecDiagnosticsFrame,
+  buildAgentExecSubagentFrame,
   buildConnectEndFrame,
   buildConnectErrorFrame,
   buildStructuredToolCallSnapshot,
@@ -128,6 +129,7 @@ const UPSTREAM_STREAM_IDLE_TIMEOUT_MS = 90 * 1000;
 const POST_TOOL_UPSTREAM_TIMEOUT_MS = 5 * 60 * 1000;
 const POST_TOOL_STREAM_IDLE_TIMEOUT_MS = 90 * 1000;
 const POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS = 45 * 1000;
+const POST_TOOL_NO_VISIBLE_PROGRESS_TIMEOUT_MS = 25 * 1000;
 const POST_MUTATION_SUMMARY_TIMEOUT_MS = 12 * 1000;
 const POST_MUTATION_SUMMARY_IDLE_TIMEOUT_MS = 4500;
 const MUTATION_TOOL_STREAM_IDLE_TIMEOUT_MS = 45 * 1000;
@@ -137,9 +139,9 @@ const DEFAULT_MAX_LOCAL_TOOL_CALLS_PER_ROUND = 12;
 const DEFAULT_MAX_LOCAL_TOOL_ROUNDS = 0;
 const MAX_POST_TOOL_STREAM_RECOVERIES = 2;
 const MAX_COMPLETION_VERIFICATION_ROUNDS = 0;
-const DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS = 16;
+const DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS = 3;
 const DEFAULT_MAX_INCOMPLETE_TODO_CONTINUATIONS = 0;
-const DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS = 6;
+const DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS = 2;
 const WEB_SEARCH_FETCH_TIMEOUT_MS = 4500;
 const POST_MUTATION_STOP_AFTER_TEXT_MS = 2500;
 const FORCE_MUTATION_AFTER_READ_ONLY_ROUNDS = 2;
@@ -150,6 +152,39 @@ const APPROX_CHARS_PER_TOKEN = 4;
 const CURSOR_NATIVE_MAX_CONTEXT_TOKENS = 200000;
 const MAX_INLINE_EDIT_RESULT_CONTENT_CHARS = 512 * 1024;
 const MAX_UPSTREAM_IMAGE_BYTES = 20 * 1024 * 1024;
+const RUNTIME_TUNING_DEFAULTS = Object.freeze({
+  upstreamFetchTimeoutMs: UPSTREAM_FETCH_TIMEOUT_MS,
+  upstreamStreamIdleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+  postToolUpstreamTimeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+  postToolStreamIdleTimeoutMs: POST_TOOL_STREAM_IDLE_TIMEOUT_MS,
+  postToolMutationStreamIdleTimeoutMs: POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS,
+  postToolNoVisibleProgressTimeoutMs: POST_TOOL_NO_VISIBLE_PROGRESS_TIMEOUT_MS,
+  postMutationSummaryTimeoutMs: POST_MUTATION_SUMMARY_TIMEOUT_MS,
+  postMutationSummaryIdleTimeoutMs: POST_MUTATION_SUMMARY_IDLE_TIMEOUT_MS,
+  mutationToolStreamIdleTimeoutMs: MUTATION_TOOL_STREAM_IDLE_TIMEOUT_MS,
+  mutationToolStreamMaxDurationMs: MUTATION_TOOL_STREAM_MAX_DURATION_MS,
+  deepseekReasoningOnlyStreamMaxMs: DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS,
+  maxIncompletePostMutationContinuations: DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS,
+  maxReadOnlyExplorationContinuations: DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS,
+  emitEditToolPlaceholderFrames: false,
+});
+
+const RUNTIME_TUNING_FIELD_DESCRIPTIONS = Object.freeze({
+  upstreamFetchTimeoutMs: '上游请求建立连接与首包总超时，单位毫秒。',
+  upstreamStreamIdleTimeoutMs: '首轮对话流在没有任何新事件时的空闲超时，单位毫秒。',
+  postToolUpstreamTimeoutMs: '工具执行后的后续请求最大持续时间，单位毫秒。',
+  postToolStreamIdleTimeoutMs: '工具执行后普通续跑流的空闲超时，单位毫秒。',
+  postToolMutationStreamIdleTimeoutMs: '涉及修改文件后的续跑流空闲超时，单位毫秒。',
+  postToolNoVisibleProgressTimeoutMs: '工具后续阶段若长期没有文本/工具/思考可见进展则提前结束等待，单位毫秒。',
+  postMutationSummaryTimeoutMs: '修改完成后总结阶段的最长等待时间，单位毫秒。',
+  postMutationSummaryIdleTimeoutMs: '修改完成后总结阶段的空闲超时，单位毫秒。',
+  mutationToolStreamIdleTimeoutMs: '原生修改工具执行回流的空闲超时，单位毫秒。',
+  mutationToolStreamMaxDurationMs: '原生修改工具执行回流的最大时长，单位毫秒。',
+  deepseekReasoningOnlyStreamMaxMs: 'DeepSeek 仅输出 Thought/思考内容时允许持续的最大时长，单位毫秒。',
+  maxIncompletePostMutationContinuations: '没有明确完成信号时，post-tool 自动 continuation 的最大次数。',
+  maxReadOnlyExplorationContinuations: '只读探索场景的最大 continuation 次数。',
+  emitEditToolPlaceholderFrames: '是否在 edit 类工具尚未拿到 path/内容前就先发空卡片占位。',
+});
 const EDIT_STREAM_FLUSH_CHARS = 2048;
 const EDIT_STREAM_FLUSH_MS = 250;
 const EDIT_STREAM_FRAME_CHARS = 2048;
@@ -359,6 +394,29 @@ function shouldEmitThinkingForUpstream(configOrUpstream = {}, modelName = '') {
   if (!isDeepSeekModel(configOrUpstream, modelName)) return true;
   const upstream = configOrUpstream?.upstream || configOrUpstream || {};
   return String(upstream.thinkingMode || 'disabled').trim().toLowerCase() === 'enabled';
+}
+
+function getRuntimeTuningConfig(config = {}) {
+  const raw = config?.runtimeTuning && typeof config.runtimeTuning === 'object'
+    ? config.runtimeTuning
+    : {};
+  const tuning = { ...RUNTIME_TUNING_DEFAULTS };
+  Object.keys(RUNTIME_TUNING_DEFAULTS).forEach((key) => {
+    if (!Object.prototype.hasOwnProperty.call(raw, key)) return;
+    if (typeof RUNTIME_TUNING_DEFAULTS[key] === 'boolean') {
+      tuning[key] = raw[key] === true;
+      return;
+    }
+    const value = Number(raw[key]);
+    if (Number.isFinite(value) && value >= 0) tuning[key] = Math.floor(value);
+  });
+  return tuning;
+}
+
+function getRuntimeTuningValue(config = {}, key, fallback) {
+  const tuning = getRuntimeTuningConfig(config);
+  if (Object.prototype.hasOwnProperty.call(tuning, key)) return tuning[key];
+  return fallback;
 }
 
 function getConfiguredModelRoutes(config = {}) {
@@ -696,9 +754,9 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
   }
   const contentOptions = { allowImages: supportsImageContent(upstream, modelName) };
   const responseInput = toResponsesInput(messages, contentOptions);
-  const deepSeekThinking = buildDeepSeekThinkingOption(upstream, modelName);
-  const mimoThinking = buildMimoThinkingOption(upstream, modelName);
-  const deepSeekReasoningEffort = buildDeepSeekReasoningEffortOption(upstream, modelName);
+  const deepSeekThinking = options.disableThinking === true ? null : buildDeepSeekThinkingOption(upstream, modelName);
+  const mimoThinking = options.disableThinking === true ? null : buildMimoThinkingOption(upstream, modelName);
+  const deepSeekReasoningEffort = options.disableThinking === true ? null : buildDeepSeekReasoningEffortOption(upstream, modelName);
   const openAiReasoning = options.disableReasoning === true ? null : buildOpenAiReasoningOption(upstream, modelName);
   const enableTools = options.enableTools !== false;
   const toolChoice = enableTools ? String(options.toolChoice || 'auto') : '';
@@ -744,6 +802,96 @@ function buildUpstreamAttempts(upstream, modelName, messages, options = {}) {
     },
   };
   return prefersResponsesApi(upstream, options) ? [responsesAttempt, chatAttempt] : [chatAttempt, responsesAttempt];
+}
+
+function shouldRetryReasoningTimeoutWithoutThinking(streamed = {}, recoveryCount = 0) {
+  if (recoveryCount >= 1) return false;
+  if (String(streamed?.stopReason || '').trim() !== 'local_reasoning_timeout') return false;
+  if (String(streamed?.text || '').trim()) return false;
+  if (Array.isArray(streamed?.toolCalls) && streamed.toolCalls.length > 0) return false;
+  return true;
+}
+
+function shouldAbortForNoVisibleProgress(streamed = {}, maxMs = 0) {
+  if (!(Number(maxMs) > 0)) return false;
+  if (String(streamed?.text || '').trim()) return false;
+  if (Array.isArray(streamed?.toolCalls) && streamed.toolCalls.length > 0) return false;
+  if (String(streamed?.reasoning || '').trim()) return false;
+  const durationMs = Number(streamed?.durationMs) || 0;
+  return durationMs >= Number(maxMs);
+}
+
+async function retryStreamWithoutThinking(session, {
+  config = {},
+  logger = null,
+  activeUpstream = {},
+  configuredModel = '',
+  upstreamMessages = [],
+  requestId = '',
+  phase = 'stream_recovery',
+  agentMode = 'AGENT_MODE_AGENT',
+  emit = true,
+  enableTools = true,
+  idleTimeoutMs = UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+  maxDurationMs = 0,
+  extendMaxDurationOnActivity = false,
+  stopOnToolCall = false,
+  stopAfterTextMs = 0,
+} = {}) {
+  logger?.warn?.(
+    `agent local relay retrying without thinking requestId=${requestId || '-'} phase=${phase} model=${configuredModel || '-'}`
+  );
+  const { response: upstream, mode: upstreamMode } = await fetchUpstreamCompletion(
+    activeUpstream,
+    configuredModel,
+    upstreamMessages,
+    logger,
+    buildFetchUpstreamOptionsForSession(session, {
+      enableTools,
+      disableThinking: true,
+      disableReasoning: true,
+      signal: session.abortController?.signal || null,
+      timeoutMs: maxDurationMs > 0 ? maxDurationMs : undefined,
+      requestId,
+      phase,
+      mode: agentMode,
+      outboundProxy: config.outboundProxy || null,
+      localProxyPort: config.port,
+    }, { phase, agentMode, disableThinking: true, disableReasoning: true }),
+  );
+  session.activeUpstreamResponse = upstream;
+  if (!upstream.ok) {
+    const errorText = await upstream.text().catch(() => '');
+    return {
+      streamed: {
+        text: '',
+        reasoning: '',
+        upstreamError: summarizeUpstreamFailure(upstream.status, errorText),
+        toolCalls: [],
+        usage: null,
+        durationMs: 0,
+        deltaCount: 0,
+        eventTypes: '',
+        sawDone: false,
+        stopReason: 'http_error',
+      },
+      upstreamMode,
+    };
+  }
+  const streamed = await streamAgentUpstreamResponse(upstream, session, {
+    collectTools: enableTools,
+    emit,
+    emitThinking: false,
+    phase,
+    idleTimeoutMs,
+    maxDurationMs,
+    extendMaxDurationOnActivity,
+    stopOnToolCall,
+    stopAfterTextMs,
+    reasoningOnlyMaxMs: 0,
+    filterInlineThinking: true,
+  });
+  return { streamed, upstreamMode };
 }
 
 function shouldRetryAlternateEndpoint(status, bodyText = '') {
@@ -1424,12 +1572,34 @@ function writeRecentWorkspaceRoot(root = '', logger = null, source = '') {
   }
 }
 
-function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = null, requestId = '-', userText = '') {
+function extractTrustedWorkspaceRootFromRequestContext(requestContext = null, logger = null, requestId = '-') {
+  const workspacePaths = Array.isArray(requestContext?.workspacePaths) ? requestContext.workspacePaths : [];
+  for (const candidate of workspacePaths) {
+    const normalized = normalizeWorkspaceRoot(candidate || '');
+    if (!normalized) continue;
+    if (isUntrustedWorkspaceRoot(normalized)) {
+      logger?.warn?.(
+        `agent local relay ignored untrusted requestContext workspace requestId=${requestId || '-'} workspace=${JSON.stringify(normalized)}`,
+      );
+      continue;
+    }
+    return normalized;
+  }
+  return '';
+}
+
+function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = null, requestId = '-', userText = '', requestContext = null) {
   const decodedRoot = normalizeWorkspaceRoot(decodedWorkspaceRoot || '');
+  const requestContextRoot = extractTrustedWorkspaceRootFromRequestContext(requestContext, logger, requestId);
   const recentRoot = readRecentWorkspaceRoot();
   const cwdRoot = normalizeWorkspaceRoot(process.cwd());
   const trustedDecodedRoot = decodedRoot && !isUntrustedWorkspaceRoot(decodedRoot) ? decodedRoot : '';
   const trustedRecentRoot = recentRoot && !isUntrustedWorkspaceRoot(recentRoot) ? recentRoot : '';
+  if (requestContextRoot && requestContextRoot !== trustedDecodedRoot) {
+    logger?.info?.(
+      `agent local relay using requestContext workspace requestId=${requestId || '-'} requestContext=${JSON.stringify(requestContextRoot)} decoded=${JSON.stringify(decodedRoot || '')}`,
+    );
+  }
   if (decodedRoot && !trustedDecodedRoot && trustedRecentRoot) {
     logger?.warn?.(
       `agent local relay ignored internal decoded workspace requestId=${requestId || '-'} decoded=${JSON.stringify(decodedRoot)} recent=${JSON.stringify(recentRoot)}`,
@@ -1445,7 +1615,7 @@ function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = n
   // 推断出正确的项目根目录（解决"在项目B却跑到项目A"的问题）。
   // 典型场景：Cursor 传来 workspaceStorage 内部路径，用户拖入项目B的文件。
   let inferredRoot = '';
-  if (!trustedDecodedRoot && userText) {
+  if (!requestContextRoot && !trustedDecodedRoot && userText) {
     inferredRoot = inferWorkspaceRootFromUserText(userText);
     if (inferredRoot && isUntrustedWorkspaceRoot(inferredRoot)) {
       logger?.warn?.(
@@ -1460,7 +1630,7 @@ function selectWorkspaceRootForUserMessage(decodedWorkspaceRoot = '', logger = n
     }
   }
 
-  const selectedRoot = trustedDecodedRoot || inferredRoot || trustedRecentRoot || cwdRoot;
+  const selectedRoot = requestContextRoot || trustedDecodedRoot || inferredRoot || trustedRecentRoot || cwdRoot;
   if (selectedRoot) writeRecentWorkspaceRoot(selectedRoot, logger, `user_message:${requestId || '-'}`);
   return selectedRoot;
 }
@@ -1517,7 +1687,19 @@ function inferWorkspaceRootFromUserText(userText = '') {
 }
 
 function getSessionWorkspaceRoot(session = {}) {
-  const direct = normalizeWorkspaceRoot(session.workspaceRoot || session.lastUserMessageCapture?.workspaceRoot || '');
+  const requestContextRoot = extractTrustedWorkspaceRootFromRequestContext(
+    session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.action?.requestContext
+      || session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.action?.userMessageAction?.requestContext
+      || null,
+    null,
+    session?.lastUserMessageCapture?.requestId || session?.requestId || '-',
+  );
+  const direct = normalizeWorkspaceRoot(
+    requestContextRoot
+    || session.workspaceRoot
+    || session.lastUserMessageCapture?.workspaceRoot
+    || '',
+  );
   const recent = readRecentWorkspaceRoot();
   const cwdRoot = normalizeWorkspaceRoot(process.cwd());
   if (direct && isUntrustedWorkspaceRoot(direct) && recent && !isUntrustedWorkspaceRoot(recent)) return recent;
@@ -1567,14 +1749,14 @@ function getMaxIncompleteContinuationCount(session = {}) {
   }
   const value = Number(config.maxIncompletePostMutationContinuations);
   if (Number.isFinite(value) && value > 0) return Math.max(4, Math.min(128, Math.floor(value)));
-  return DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS;
+  return Math.max(1, Math.min(128, Number(getRuntimeTuningValue(config, 'maxIncompletePostMutationContinuations', DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS)) || DEFAULT_MAX_INCOMPLETE_POST_MUTATION_CONTINUATIONS));
 }
 
 function getMaxReadOnlyExplorationContinuationCount(session = {}) {
   const config = session?.config || {};
   const value = Number(config.maxReadOnlyExplorationContinuations);
   if (Number.isFinite(value) && value >= 0) return Math.max(0, Math.min(64, Math.floor(value)));
-  return DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS;
+  return Math.max(0, Math.min(64, Number(getRuntimeTuningValue(config, 'maxReadOnlyExplorationContinuations', DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS)) || DEFAULT_MAX_READONLY_EXPLORATION_CONTINUATIONS));
 }
 
 function resolveWorkspacePathOrEmpty(inputPath, session = {}) {
@@ -1741,6 +1923,12 @@ function isAwaitingRunsseRebind(session = {}) {
   );
 }
 
+function isExecutePlanForegroundSession(session = {}) {
+  return String(session?.modeTurnHandoff || '').trim() === 'execute_plan'
+    || session?.awaitingRunsseRebind === true
+    || session?.planExecutionForeground === true;
+}
+
 function shouldKeepSessionForRunsseRebind(session = {}) {
   return Boolean(session?.waitingForInteraction) || isAwaitingRunsseRebind(session);
 }
@@ -1768,6 +1956,15 @@ function hasReplayableSessionProgress(session = {}) {
     || (Array.isArray(session?.generatedChunks) && session.generatedChunks.length > 0)
     || session?.relaying
   );
+}
+
+function isSameActiveSessionUserMessage(session = {}, stableConversationId = '', userText = '') {
+  if (!session || session.aborted || session.completed) return false;
+  if (!session.active) return false;
+  const targetStableConversationId = String(stableConversationId || '').trim();
+  if (!targetStableConversationId) return false;
+  if (getSessionStableConversationId(session) !== targetStableConversationId) return false;
+  return isSameWaitingSessionUserMessage(session, userText);
 }
 
 function shouldTreatPlanTurnAsFreshRequest(session = {}) {
@@ -2018,6 +2215,17 @@ function findWaitingSessionByStableConversationId(agentSessions, stableConversat
   return null;
 }
 
+function findActiveSessionByStableConversationId(agentSessions, stableConversationId = '', excludeRequestId = '') {
+  const target = String(stableConversationId || '').trim();
+  if (!target || !agentSessions?.size) return null;
+  for (const session of agentSessions.values()) {
+    if (!session || session.aborted || session.completed || !session.active) continue;
+    if (excludeRequestId && String(session.requestId || '').trim() === String(excludeRequestId || '').trim()) continue;
+    if (getSessionStableConversationId(session) === target) return session;
+  }
+  return null;
+}
+
 function getPendingInteractionEntriesForSession(session = {}) {
   const pendingAgentInteractions = session?.pendingAgentInteractions;
   if (!pendingAgentInteractions?.size) return [];
@@ -2109,12 +2317,16 @@ function replayWaitingSessionPlanCheckpoint(session = {}, logger = null) {
 function scheduleExecutePlanSessionResume(session, interactionResponse, config, logger, stats, pendingInteraction = null, source = 'execute_plan_action') {
   if (!session || session.aborted) return false;
   session.awaitingRunsseRebind = true;
+  session.planExecutionForeground = true;
   session.modeTurnHandoff = 'execute_plan';
   session.deferredInteractionResponse = {
     interactionResponse,
     pendingInteraction,
     capturedAt: new Date().toISOString(),
   };
+  if (session.active && session.res && !session.streamDetached) {
+    detachWaitingInteractionSession(session, logger, `await_runsse_rebind:${source}`);
+  }
   const delayMs = Math.max(0, Number(config?.executePlanResumeDelayMs) || 300);
   setTimeout(() => {
     if (!session || session.aborted || session.relaying) return;
@@ -2190,9 +2402,9 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
   }
   session.relaying = false;
   session.waitingForInteraction = false;
-  session.awaitingRunsseRebind = true;
   session.planTurnHandoff = '';
   session.modeTurnHandoff = 'execute_plan';
+  session.waitingInteractionSince = 0;
   session.deferredInteractionResponse = null;
   const interactionResponse = buildSyntheticPlanExecutionResponse(session, action);
   const pendingInteraction = clonePendingInteractionSnapshot(
@@ -2237,8 +2449,8 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
     payload: {
       type: 'run_request',
       value: {
-        model_id: String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim(),
-        model_name: String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim(),
+        model_id: getEffectiveSessionModel(session),
+        model_name: getEffectiveSessionModel(session),
         prewarm: false,
       },
     },
@@ -2264,15 +2476,8 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
   });
   ack();
   if (session.active && !session.aborted) {
-    scheduleExecutePlanSessionResume(
-      session,
-      interactionResponse,
-      config,
-      logger,
-      stats,
-      pendingInteraction,
-      'run_request_execute_plan',
-    );
+    resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+      .catch((error) => failAgentRelaySession(session, logger, error, 'run_request_execute_plan'));
   }
   return true;
 }
@@ -2763,6 +2968,7 @@ function abortAgentSession(session, logger, reason = 'aborted') {
   session.planTurnHandoff = '';
   session.modeTurnHandoff = '';
   session.streamDetached = false;
+  session.awaitingRunsseRebind = false;
   session.deferredInteractionResponse = null;
   clearInterval(session.heartbeat);
   session.heartbeat = null;
@@ -2851,7 +3057,15 @@ function enqueueQueuedAgentMessage(session, entry, logger, { priority = false, s
 }
 
 function drainQueuedAgentMessage(session, config, logger, stats, reason = 'turn_complete') {
-  if (!session || session.aborted || session.completed || session.relaying || session.waitingForInteraction) return false;
+  if (
+    !session
+    || session.aborted
+    || session.completed
+    || session.relaying
+    || session.waitingForInteraction
+    || session.streamDetached
+    || session.awaitingRunsseRebind
+  ) return false;
   const queue = ensureQueuedAgentMessages(session);
   const next = queue.shift();
   if (!next?.userText) return false;
@@ -2886,6 +3100,7 @@ function detachWaitingInteractionSession(session, logger, reason = 'runsse_close
   clearInterval(session.heartbeat);
   session.heartbeat = null;
   session.streamDetached = true;
+  session.awaitingRunsseRebind = true;
   session.intercepted = false;
   session.relaying = false;
   session.req = null;
@@ -2904,7 +3119,7 @@ function detachActiveRelaySession(session, logger, reason = 'runsse_closed') {
   session.res = null;
   session.detachedAt = Date.now();
   logger?.info?.(
-    `agent local relay active session detached requestId=${session.requestId || '-'} reason=${reason} relaying=${session.relaying ? '1' : '0'} generatedChunks=${Array.isArray(session.generatedChunks) ? session.generatedChunks.length : 0}`,
+    `agent local relay active session detached requestId=${session.requestId || '-'} reason=${reason} relaying=${session.relaying ? '1' : '0'} awaitingRunsseRebind=1 generatedChunks=${Array.isArray(session.generatedChunks) ? session.generatedChunks.length : 0}`,
   );
   return true;
 }
@@ -3075,15 +3290,24 @@ function isRepositoryServicePath(pathname) {
   return /\/aiserver\.v1\.RepositoryService\//i.test(String(pathname || ''));
 }
 
+function isAgentConversationMetadataPath(pathname) {
+  return /\/agent\.v1\.AgentService\/UpdateConversationMetadata$/i.test(String(pathname || ''));
+}
+
 const EMPTY_LOCAL_CONTROL_PLANE_SUFFIXES = new Set([
   'AiService/AvailableDocs',
   'AiService/CppEditHistoryStatus',
   'AiService/KnowledgeBaseList',
   'AiService/ReportProcessMetricsV2',
   'AiService/UpdateVscodeProfile',
+  'AgentService/UpdateConversationMetadata',
   'AnalyticsService/SubmitLogs',
   'AnalyticsService/BootstrapStatsig',
-  'CppService/AvailableModels',
+  'BackgroundComposerService/GetBackgroundComposerUserSettings',
+  'BackgroundComposerService/ListBackgroundComposers',
+  'BackgroundComposerService/ListEnvironments',
+  'BackgroundComposerService/ListPersonalEnvironments',
+  'BackgroundComposerService/ListTeamEnvironments',
   'DashboardService/GetEffectiveUserPlugins',
   'DashboardService/GetGlobalCommands',
   'DashboardService/GetManagedSkills',
@@ -3100,7 +3324,6 @@ const EMPTY_LOCAL_CONTROL_PLANE_SUFFIXES = new Set([
   'DashboardService/RegisterMarketplaceAndPlugins',
   'FileSyncService/FSIsEnabledForUser',
   'MCPRegistryService/GetKnownServers',
-  'NetworkService/IsConnected',
   'RepositoryService/FastRepoInitHandshakeV2',
 ]);
 
@@ -3124,6 +3347,7 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
     fallbackModels: availableModelNames.length ? availableModelNames : [modelName],
     bestOfNDefaultModels: availableModelNames.length ? availableModelNames : [modelName],
   };
+  const displayConfiguration = buildRelayModelPickerDisplayConfiguration();
   const models = availableModelNames.map((name, index) => {
     const upstreamForModel = resolveUpstreamForModel(config, name);
     const displayName = String(upstreamForModel?.displayName || name).trim() || name;
@@ -3185,6 +3409,7 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
         value: {
           modelNames: availableModelNames,
           models,
+          defaultModelConfig: modelConfig,
           composerModelConfig: modelConfig,
           cmdKModelConfig: modelConfig,
           backgroundComposerModelConfig: modelConfig,
@@ -3192,7 +3417,19 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
           specModelConfig: modelConfig,
           deepSearchModelConfig: modelConfig,
           quickAgentModelConfig: modelConfig,
+          slowPoolModelConfig: modelConfig,
+          disableUnusedModelsAfterNHours: 2400000,
+          upgradeUnchangedModelsAfterNHours: 2,
+          displayConfiguration,
           useModelParameters: true,
+        },
+      };
+    case 'CppService/AvailableModels':
+      return {
+        typeName: 'aiserver.v1.AvailableCppModelsResponse',
+        value: {
+          models: availableModelNames,
+          defaultModel: modelName,
         },
       };
     case 'AiService/GetDefaultModel':
@@ -3213,6 +3450,34 @@ function localControlPlaneResponseSpec(pathname, config = {}) {
           shouldDefaultSwitchOnNewChat: false,
           modelsWithNoDefaultSwitch: availableModelNames,
         },
+      };
+    case 'AiService/GetLastDefaultModelNudge':
+      return {
+        typeName: 'aiserver.v1.GetLastDefaultModelNudgeResponse',
+        value: {
+          nudgeDate: '0',
+        },
+      };
+    case 'AiService/GetModelLabels':
+      return {
+        typeName: 'aiserver.v1.GetModelLabelsResponse',
+        value: {
+          modelLabels: availableModelNames.map((name) => {
+            const upstreamForModel = resolveUpstreamForModel(config, name);
+            const displayName = String(upstreamForModel?.displayName || name).trim() || name;
+            return {
+              name,
+              label: displayName,
+              shortLabel: displayName.slice(0, 20) || name,
+              supportsAgent: true,
+            };
+          }),
+        },
+      };
+    case 'NetworkService/IsConnected':
+      return {
+        typeName: 'aiserver.v1.IsConnectedResponse',
+        value: {},
       };
     case 'DashboardService/GetCurrentPeriodUsage':
       return {
@@ -3320,6 +3585,17 @@ function resolveRequestedUpstreamModel(config = {}, options = {}) {
   return fallbackModel;
 }
 
+function getEffectiveSessionModel(session = {}, args = {}) {
+  const explicit = String(args.model || args.model_id || args.modelId || '').trim();
+  if (explicit && explicit !== 'default' && explicit !== 'auto') return explicit;
+  const cached = String(session.routedModel || session.requestedModel || '').trim();
+  if (cached && cached !== 'default' && cached !== 'auto') return cached;
+  const requestedModelId = String(
+    session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
+  ).trim();
+  return resolveRequestedUpstreamModel(session.config || {}, { requestedModel: requestedModelId });
+}
+
 function buildRelayModelParameterDefinitions() {
   return [
     {
@@ -3376,6 +3652,51 @@ function buildRelayModelVariants(displayName, shortName, rawReasoningEffort = 'm
       },
     },
   ];
+}
+
+function buildRelayModelPickerDisplayConfiguration() {
+  return {
+    routedModelViewConfig: {
+      title: 'Auto',
+      hideRoutedModelView: true,
+      hideSearchBar: false,
+      routedModelViewToNamedViewToggle: {
+        titleMarkdown: 'Models',
+        subtitle: '',
+        setToLastNamedModel: true,
+      },
+    },
+    namedModelsViewConfig: {
+      namedViewToRoutedModelViewNoButton: {},
+    },
+  };
+}
+
+async function syncRelayModelCatalogFromRunnerConfig(config = {}, logger = null, reason = 'runner') {
+  try {
+    const modelNames = collectRelayProviderModels(config)
+      .map((item) => String(item?.id || item?.name || '').trim())
+      .filter(Boolean);
+    const activeModel = getActiveRelayProfileModelName(
+      modelNames,
+      String(config.upstream?.modelName || modelNames[0] || '').trim(),
+    );
+    if (!activeModel || !modelNames.length) return { ok: false, skipped: true, reason: 'missing_models' };
+    const { syncCursorRelayModelCatalog } = require('./cursor-model-proxy');
+    const result = await syncCursorRelayModelCatalog({
+      modelName: activeModel,
+      availableModels: modelNames,
+      contextWindow: config.upstream?.contextWindow,
+      reasoningEffort: config.upstream?.reasoningEffort || 'medium',
+    });
+    logger?.info?.(
+      `model catalog sync reason=${reason} ok=${!!result?.ok} skipped=${!!result?.skipped} primary=${activeModel} count=${modelNames.length} resultReason=${result?.reason || '-'}`,
+    );
+    return result;
+  } catch (error) {
+    logger?.warn?.(`model catalog sync failed reason=${reason}: ${error.message || String(error)}`);
+    return { ok: false, error: error.message || String(error) };
+  }
 }
 
 function getActiveRelayProfileModelName(availableModels = [], fallbackModel = '') {
@@ -3509,11 +3830,38 @@ function sanitizeProxyHeaders(headers, hostHeader, { forHttp2 = false } = {}) {
     if (!key || key.startsWith(':')) return;
     const lower = key.toLowerCase();
     if (lower === 'proxy-connection' || lower === 'proxy-authorization') return;
-    if (!forHttp2 && lower === 'connection') return;
+    if (lower === 'connection' || lower === 'keep-alive' || lower === 'transfer-encoding' || lower === 'upgrade') return;
+    if (forHttp2 && (lower === 'host' || lower === 'te')) return;
     next[key] = value;
   });
   if (!forHttp2 && hostHeader) {
     next.host = hostHeader;
+  }
+  return next;
+}
+
+function sanitizeProxyResponseHeaders(headers, { forHttp2 = false } = {}) {
+  const next = {};
+  const forbidden = new Set([
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+  ]);
+  const push = (key, value) => {
+    const lower = String(key || '').toLowerCase();
+    if (!lower || lower.startsWith(':') || forbidden.has(lower)) return;
+    if (forHttp2 && lower === 'host') return;
+    next[key] = value;
+  };
+  if (headers && typeof headers.forEach === 'function') {
+    headers.forEach((value, key) => push(key, value));
+  } else {
+    Object.entries(headers || {}).forEach(([key, value]) => push(key, value));
   }
   return next;
 }
@@ -3611,7 +3959,7 @@ async function proxyHttpAbsoluteRequest(req, res, logger, config = {}, stats = {
     path: `${target.pathname}${target.search}`,
     headers: sanitizeProxyHeaders(req.headers, target.host),
   }, (upstreamRes) => {
-    res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+    res.writeHead(upstreamRes.statusCode || 502, sanitizeProxyResponseHeaders(upstreamRes.headers));
     upstreamRes.pipe(res);
   });
 
@@ -3702,6 +4050,12 @@ function writeAgentFrame(session, frame) {
   if (shouldBufferAgentFrameWhileDetached(session)) {
     session.logger?.info?.(
       `agent local relay buffered detached frame requestId=${session.requestId || '-'} bytes=${buffer.length} bufferedCount=${session.generatedChunks.length}`,
+    );
+    return;
+  }
+  if (!session.res) {
+    session.logger?.warn?.(
+      `agent local relay frame dropped, res is null requestId=${session.requestId || '-'} bytes=${buffer.length}`,
     );
     return;
   }
@@ -3942,8 +4296,8 @@ function buildFallbackPendingPlanExecution(session = {}) {
   return {
     requestId: String(session.requestId || '').trim(),
     queryId: 0,
-    kind: 'create_plan',
-    toolName: 'CreatePlan',
+    kind: 'execute_plan_action',
+    toolName: 'ExecutePlan',
     toolCallId: '',
     arguments: {
       plan: String(planState?.plan_text || planState?.plan || '').trim(),
@@ -4234,6 +4588,7 @@ function beginSessionHistoryTurn(session, config, options = {}) {
   const requestedModelId = String(
     session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
   ).trim();
+  const effectiveModelId = getEffectiveSessionModel(session, { model: requestedModelId });
   if (session.agentHistory?.state) session.agentHistory.state.mode = getCursorModeDirectory(agentModeForHistory);
   if (typeof modeHandler.buildModeHistoryMetadata === 'function') {
     try {
@@ -4279,8 +4634,8 @@ function beginSessionHistoryTurn(session, config, options = {}) {
       payload: {
         type: 'run_request',
         value: {
-          model_id: requestedModelId,
-          model_name: requestedModelId,
+          model_id: effectiveModelId,
+          model_name: effectiveModelId,
           prewarm: false,
         },
       },
@@ -4904,12 +5259,15 @@ function buildFlexibleTextReplacement(beforeContent = '', oldString = '', newStr
 }
 
 function shouldUseNativeExecForTool(session, toolCall) {
+  const toolName = String(toolCall?.name || '').trim();
+  if (toolName.toLowerCase() === 'task') {
+    return session?.config?.nativeSubagentExec === true;
+  }
   // 阶段六：MCP 工具调用需要由 Cursor 客户端执行
   const mcpSkillContext = session?.lastUserMessageCapture?.mcpSkillContext
     || session?.mcpSkillContext
     || null;
   if (mcpSkillContext?.mcpToolMap) {
-    const toolName = String(toolCall?.name || '').trim();
     if (mcpSkill.isMcpToolCall({ function: { name: toolName } }, mcpSkillContext.mcpToolMap)) {
       return true; // MCP 工具走 native exec（发送到 Cursor 客户端执行）
     }
@@ -5170,6 +5528,24 @@ function buildExecServerFrameForTool(toolName, args = {}, toolCallId = '', numer
       numericId: numericExecId,
       toolCallId: execId,
       path: String(firstPath || ''),
+    });
+  }
+  if (lower === 'task') {
+    const subagentType = normalizeTaskSubagentTypeValue(args.subagent_type || args.subagentType || '');
+    const modelId = getEffectiveSessionModel(session, args);
+    return buildAgentExecSubagentFrame({
+      id: execId,
+      execId,
+      numericId: numericExecId,
+      toolCallId: execId,
+      subagentType: subagentType || 'generalPurpose',
+      modelId,
+      prompt: String(args.prompt || args.description || ''),
+      readonly: args.readonly === true || args.readOnly === true,
+      resumeAgentId: String(args.resume || args.resume_agent_id || args.resumeAgentId || ''),
+      runInBackground: args.run_in_background === true || args.runInBackground === true,
+      parentConversationId: String(getSessionStableConversationId(session) || ''),
+      directMetaParentChildSubagent: true,
     });
   }
   return null;
@@ -6374,6 +6750,15 @@ function textLooksLikeSubstantiveFinalAnswer(text = '') {
   return false;
 }
 
+function textLooksLikeExplicitFinalAnswer(text = '') {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  const lower = value.toLowerCase();
+  if (/(?:^|\n)\s*(?:#{1,6}\s*)?(?:final|final answer|summary|conclusion|result|done|completed|verified|resolution)\b/.test(lower)) return true;
+  if (/(?:最终|结论|总结|完成|已完成|无需|不需要|已解决|验证通过|调查结论|调试结论|处理结果)/.test(value)) return true;
+  return false;
+}
+
 function looksLikeReadOnlyExplorationStillInProgress(session = {}, finalText = '', options = {}) {
   if (!options.sawReadOnlyTool || options.sawMutationTool) return false;
   const summaries = Array.isArray(session?.toolResultSummaries) ? session.toolResultSummaries : [];
@@ -6412,6 +6797,7 @@ function shouldContinueIncompleteWork(session = {}, finalText = '', toolCalls = 
   if (maxContinuations > 0 && continuationCount >= maxContinuations) return false;
   const incompleteTodos = getIncompleteTodos(session);
   if (incompleteTodos.length > 0) return true;
+  if (continuationCount >= 1 && !streamEndedWithoutReliableCompletion(options)) return false;
   // Trigger a continuation nudge when the stream ended without a reliable
   // `done` signal and without emitting a tool call — a hard protocol-level
   // gap, not a text-intent guess. This handles the case where the model
@@ -6448,6 +6834,7 @@ function buildIncompleteContinuationMessage(session = {}, finalText = '', contin
     content: [
       `Continuation request ${Number(continuationCount) + 1}/${formatContinuationLimitForLog(maxContinuations)}.`,
       'Structured relay state: no tool call was emitted in the last upstream response.',
+      continuationCount > 0 ? 'Do not repeat prior file excerpts or restate earlier analysis. Either emit the next concrete tool call immediately, or finish with a concise final answer.' : '',
       String(finalText || '').trim() ? `Latest assistant text captured as context only:\n${String(finalText || '').trim()}` : '',
       incompleteTodos.length ? `Incomplete todos:\n${incompleteTodos.map((todo) => `- ${todo.status}: ${todo.content}`).join('\n')}` : '',
       recentToolResults.length ? `Recent tool results:\n${recentToolResults.map((line) => `- ${line}`).join('\n')}` : '',
@@ -6481,6 +6868,7 @@ function buildModeRuntimeHelpers(session = {}) {
     getRecentToolResultContext,
     formatContinuationLimitForLog,
     textLooksLikeSubstantiveFinalAnswer,
+    textLooksLikeExplicitFinalAnswer,
     isMutationToolName,
     isReadOnlyContextToolName,
     canonicalToolName,
@@ -7753,13 +8141,13 @@ function buildTaskStartMessage(record = {}) {
 function buildBackgroundTaskConversationSteps(record = {}) {
   const label = String(record.name || record.title || 'Background task').trim() || 'Background task';
   const summary = String(record.summary || '').trim();
+  const text = summary
+    ? `${buildTaskStartMessage(record)}\n\n${summary}`
+    : `${buildTaskStartMessage(record)}.`;
   return [
     {
-      assistant_message: {
-        text: summary
-          ? `${buildTaskStartMessage(record)}\n\n${summary}`
-          : `${buildTaskStartMessage(record)}.`,
-      },
+      assistantMessage: { text },
+      assistant_message: { text },
     },
   ];
 }
@@ -7795,6 +8183,7 @@ function emitTaskProgressFrame(session = {}, record = {}) {
     transcriptPath: isTerminal ? String(record.transcriptPath || '').trim() : '',
     outputPath: String(record.outputPath || '').trim(),
     includeResult: isTerminal,
+    conversationStepsJson: isTerminal ? buildBackgroundTaskConversationSteps(record) : [],
     startedAtMs: Number(record.createdAt) || now,
     completedAtMs: isTerminal ? now : 0,
   };
@@ -7813,6 +8202,69 @@ function emitTaskProgressFrame(session = {}, record = {}) {
   } catch {
     /* ignore progress frame emission failures */
   }
+}
+
+function buildBackgroundCoordinatorFinalText(session = {}, record = {}) {
+  const status = String(record?.status || '').trim().toLowerCase();
+  const title = String(record?.title || record?.name || 'Background task').trim() || 'Background task';
+  const summary = String(record?.summary || record?.resultText || '').trim();
+  const childCount = Array.isArray(record?.childTaskIds) ? record.childTaskIds.length : 0;
+  const agentMode = String(getSessionAgentMode(session) || '').trim();
+  if (agentMode === 'AGENT_MODE_MULTITASK') {
+    return [
+      `${title} ${status === 'failed' ? 'failed' : 'completed'}.`,
+      childCount ? `Delegated child tasks: ${childCount}.` : '',
+      summary ? `Summary:\n${summary}` : 'Summary is available in the task card.',
+    ].filter(Boolean).join('\n\n');
+  }
+  if (agentMode === 'AGENT_MODE_DEBUG') {
+    return summary || (status === 'failed'
+      ? 'Debug investigation failed. Review the subagent card for the captured logs.'
+      : 'Debug investigation complete. Review the subagent card for evidence and findings.');
+  }
+  return summary || `${title} ${status === 'failed' ? 'failed' : 'completed'}.`;
+}
+
+function maybeFinalizePendingBackgroundSession(session = {}, record = {}) {
+  if (!session?.active || session.aborted || session.completed) return false;
+  const pending = session.waitingForBackgroundTaskCompletion;
+  if (!pending || typeof pending !== 'object') return false;
+  const pendingTaskId = String(pending.taskUuid || '').trim();
+  const recordTaskId = String(record?.taskUuid || record?.agentId || '').trim();
+  if (!pendingTaskId || !recordTaskId || pendingTaskId !== recordTaskId) return false;
+  const status = String(record?.status || '').trim().toLowerCase();
+  if (status !== 'completed' && status !== 'failed') return false;
+
+  const finalText = buildBackgroundCoordinatorFinalText(session, record);
+  session.waitingForBackgroundTaskCompletion = null;
+  session.unfinishedWorkAtEnd = false;
+  clearUnfinishedAgentTask(session);
+  session.hadError = status === 'failed';
+
+  if (finalText) {
+    appendSessionHistory(session, {
+      role: 'assistant',
+      kind: 'assistant_text',
+      payload: { text: finalText, error: status === 'failed' },
+    });
+    writeAgentTextFrame(session, finalText);
+    session.historyTextCursor = String(session.agentTextFrameText || '').length;
+  }
+
+  markUpstreamUsageCompleted(session, session.config, status === 'failed' ? 'failed' : 'success', status === 'failed' ? finalText : '');
+  rememberCompletedAgentTurn(
+    session.completedAgentTurns,
+    session.requestId,
+    String(session.lastUserMessageCapture?.userText || '').trim(),
+    getSessionWorkspaceRoot(session),
+    session.lastUserMessageCapture?.debug || null,
+    session.generatedChunks,
+    { upstreamError: status === 'failed' ? finalText : '', hadError: status === 'failed' },
+  );
+  completeSessionHistory(session, status === 'failed' ? 'failed' : 'completed', `background-task-${session.requestId || ''}`);
+  logGeneratedAgentRunSseSummary(session.generatedChunks || [], session.requestId, session.logger || null);
+  finalizeInterceptedAgentSession(session);
+  return true;
 }
 
 function appendTaskHistoryLifecycle(session = {}, record = {}, phase = 'started') {
@@ -8047,6 +8499,7 @@ function buildForcedModeTaskToolCall(session = {}, userText = '') {
   const mode = String(getSessionAgentMode(session) || '').trim();
   const prompt = String(userText || session.lastUserMessageCapture?.userText || '').trim();
   if (!prompt) return null;
+  if (isExecutePlanForegroundSession(session)) return null;
   if (mode === 'AGENT_MODE_MULTITASK') {
     return {
       name: 'Task',
@@ -8076,6 +8529,7 @@ function shouldPrependForcedModeTask(session = {}, toolCalls = []) {
   const mode = String(getSessionAgentMode(session) || '').trim();
   if (mode !== 'AGENT_MODE_MULTITASK' && mode !== 'AGENT_MODE_DEBUG') return false;
   if (session.syntheticModeTaskStarted) return false;
+  if (isExecutePlanForegroundSession(session)) return false;
   const calls = Array.isArray(toolCalls) ? toolCalls : [];
   if (!calls.length) return false;
   return !calls.some((call) => String(call?.name || '').trim().toLowerCase() === 'task');
@@ -8188,6 +8642,7 @@ function scheduleBackgroundTask(record = {}, args = {}, session = {}, logger) {
   Promise.resolve().then(async () => {
     try {
       await executeBackgroundTask(record, args, session);
+      maybeFinalizePendingBackgroundSession(session, record);
     } catch (error) {
       setTaskStatus(record, 'failed');
       record.resultText = String(error?.message || error || 'Task failed').trim();
@@ -8195,6 +8650,7 @@ function scheduleBackgroundTask(record = {}, args = {}, session = {}, logger) {
       appendTaskLog(record, 'output', `Task failed: ${record.resultText}`, false);
       syncTaskRecordToGlobalRegistry(session.config || {}, record);
       emitTaskProgressFrame(session, record);
+      maybeFinalizePendingBackgroundSession(session, record);
       logger?.warn?.(`background task failed agentId=${record.agentId || record.taskUuid || '-'}: ${record.resultText}`);
     }
   });
@@ -8282,6 +8738,7 @@ function getLatestSessionTaskRecord(session = {}) {
 function registerChildTaskRecord(parentRecord = {}, session = {}, stepText = '', index = 0) {
   if (!parentRecord || !session) return null;
   const parentToolCallId = String(parentRecord.parentToolCallId || parentRecord.taskUuid || parentRecord.agentId || 'task').trim();
+  const model = String(parentRecord.model || '').trim() || getEffectiveSessionModel(session);
   const child = registerTaskSubagent(session, {
     agentId: `${String(parentRecord.agentId || parentRecord.taskUuid || 'task').trim()}-child-${index + 1}`,
     title: stepText || `Subtask ${index + 1}`,
@@ -8289,6 +8746,8 @@ function registerChildTaskRecord(parentRecord = {}, session = {}, stepText = '',
     description: stepText,
     prompt: stepText,
     subagentType: 'generalPurpose',
+    agentMode: 'AGENT_MODE_SUBAGENT',
+    model,
     parentToolCallId: `${parentToolCallId}.child.${index + 1}`,
     status: 'pending',
     summary: '',
@@ -8768,6 +9227,7 @@ async function executeTaskTool(args = {}, session = {}) {
   const description = String(args.description || '').trim();
   const prompt = String(args.prompt || '').trim();
   const subagentType = normalizeTaskSubagentTypeValue(args.subagent_type || args.subagentType || '');
+  const model = getEffectiveSessionModel(session, args);
   const record = registerTaskSubagent(session, {
     description,
     prompt,
@@ -8775,7 +9235,7 @@ async function executeTaskTool(args = {}, session = {}) {
     agentMode: 'AGENT_MODE_SUBAGENT',
     title: getTaskTitle(args, subagentType),
     name: String(args.name || '').trim(),
-    model: String(args.model || '').trim(),
+    model,
     parentToolCallId: String(args.tool_call_id || args.toolCallId || '').trim(),
     resultText: '',
     summary: '',
@@ -8803,7 +9263,7 @@ async function executeTaskTool(args = {}, session = {}) {
       ...args,
       subagent_type: subagentType ? { [subagentType]: subagentType } : (args.subagent_type || args.subagentType || {}),
       agent_mode: 'AGENT_MODE_SUBAGENT',
-      model: String(args.model || '').trim(),
+      model,
       name: String(args.name || '').trim(),
     },
     resultText: buildTaskStartMessage(record),
@@ -8927,7 +9387,7 @@ async function streamAgentUpstreamResponse(upstream, session, options = {}) {
           && normalizeCollectedToolCalls(toolState).length === 0
           && Date.now() - firstReasoningAt >= reasoningOnlyMaxMs
         ) {
-          upstreamError = `上游模型持续只输出 Thought/思考内容超过 ${Math.round(reasoningOnlyMaxMs / 1000)} 秒，本地 Relay 已停止等待以避免空转。`;
+          upstreamError = `上游模型持续只输出 Thought/思考内容超过 ${Math.round(reasoningOnlyMaxMs / 1000)} 秒，本地 Relay 将关闭思考并继续尝试落地执行。`;
           stopReason = 'local_reasoning_timeout';
           session.logger?.warn?.(
             `agent local relay upstream stream reasoning-only stop requestId=${session.requestId || '-'} phase=${phase} maxMs=${reasoningOnlyMaxMs} reasoningLen=${reasoningParts.join('').length}`,
@@ -9141,6 +9601,12 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
         stream_content: getEditStreamSnippetFromArgs(toolCall.arguments || {}),
       };
     }
+    if (String(toolCall.name || '').trim().toLowerCase() === 'task') {
+      toolCall.arguments = {
+        ...(toolCall.arguments || {}),
+        model: getEffectiveSessionModel(session, toolCall.arguments || {}),
+      };
+    }
     appendSessionHistory(session, {
       role: 'assistant',
       kind: 'tool_call',
@@ -9156,6 +9622,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
     const useNativeExec = shouldUseNativeExecForTool(session, toolCall);
     const isMutation = isMutationToolName(toolCall.name);
     const emitToolInteraction = session?.config?.emitLocalToolInteractionFrames !== false || editLikeTool;
+    const emitEditToolPlaceholderFrames = getRuntimeTuningValue(session?.config || {}, 'emitEditToolPlaceholderFrames', false) === true;
     const emitStepFrames = shouldEmitLocalStepFrames(session?.config || {});
     const stepId = (session.nextStepId = (Number(session.nextStepId) || 0) + 1);
     const stepStartedAt = Date.now();
@@ -9164,16 +9631,17 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
       if (emitStepFrames) writeAgentFrame(session, buildAgentStepStartedFrame(stepId));
       const streamedEditState = editLikeTool ? session.upstreamToolArgumentStreams?.get(toolCallId) : null;
       if (editLikeTool) {
-        if (!streamedEditState?.emittedPath) {
+        if (emitEditToolPlaceholderFrames && !streamedEditState?.emittedPath) {
           writeAgentFrame(session, buildAgentPartialToolCallFrame(toolCall.name, buildLeanEditToolArguments(toolCall.arguments), toolCallId, modelCallId));
         }
-        if (!session.upstreamToolArgumentStreams?.get(toolCallId)?.emittedContentLength) {
+        if (emitEditToolPlaceholderFrames && !session.upstreamToolArgumentStreams?.get(toolCallId)?.emittedContentLength) {
           emitEditToolCallDeltaFrames(session, toolCall, toolCallId, modelCallId);
         }
       } else {
         writeAgentFrame(session, buildAgentPartialToolCallFrame(toolCall.name, toolCall.arguments, toolCallId, modelCallId));
       }
-      if (!editLikeTool || !streamedEditState?.completedStarted) {
+      if (!editLikeTool || emitEditToolPlaceholderFrames || streamedEditState?.emittedPath || streamedEditState?.emittedContentLength) {
+        if (!editLikeTool || !streamedEditState?.completedStarted) {
         writeAgentFrame(session, buildAgentToolCallStartedFrame(
           toolCall.name,
           editLikeTool
@@ -9183,6 +9651,7 @@ async function executeRelayToolCalls(session, toolCalls, requestId, logger) {
           modelCallId,
         ));
         if (streamedEditState) streamedEditState.completedStarted = true;
+        }
       }
     }
     if (!execution && useNativeExec) {
@@ -9391,10 +9860,10 @@ async function continueAgentStreamLoop(session, options = {}) {
   if (shouldPrependForcedModeTask(session, toolCalls)) {
     const forcedModeTask = buildForcedModeTaskToolCall(session, userText);
     if (forcedModeTask) {
-      toolCalls = [forcedModeTask, ...toolCalls].slice(0, maxToolCallsPerRound);
+      toolCalls = [forcedModeTask];
       session.syntheticModeTaskStarted = true;
       logger?.info?.(
-        `agent local relay synthetic task prepended requestId=${requestId || '-'} mode=${getSessionAgentMode(session)} firstTool=${toolCalls[0]?.name || '-'} count=${toolCalls.length}`,
+        `agent local relay synthetic task replaced foreground tools requestId=${requestId || '-'} mode=${getSessionAgentMode(session)} tool=${forcedModeTask.name}`,
       );
     }
   }
@@ -9419,9 +9888,82 @@ async function continueAgentStreamLoop(session, options = {}) {
   let incompletePostMutationContinuationCount = 0;
   let lastStreamSawDone = initialStreamed?.sawDone === true;
   let lastStreamStopReason = String(initialStreamed?.stopReason || '').trim();
+  let reasoningTimeoutRecoveryCount = 0;
   const maxToolRounds = getMaxLocalToolRounds(config);
 
   while (session.active && !session.aborted) {
+    if (shouldRetryReasoningTimeoutWithoutThinking(streamed, reasoningTimeoutRecoveryCount)) {
+      const recoveryPhase = `reasoning_timeout_recover_${reasoningTimeoutRecoveryCount + 1}`;
+      const recoveryMessages = [
+        ...upstreamMessages,
+        {
+          role: 'user',
+          content: 'Stop extended thinking immediately. Do not output Thought/思考. Continue with concrete actions or the final answer only.',
+        },
+      ];
+      compacted = compactRelayMessagesForContext(recoveryMessages, config, logger, { requestId, phase: recoveryPhase });
+      upstreamMessages = compacted.messages;
+      usageMeta = compacted.usage;
+      session.contextUsageSnapshot = capturePromptContextForSession(session, upstreamMessages);
+      try {
+        const recovered = await retryStreamWithoutThinking(session, {
+          config,
+          logger,
+          activeUpstream,
+          configuredModel,
+          upstreamMessages,
+          requestId,
+          phase: recoveryPhase,
+          agentMode,
+          emit: true,
+          enableTools: true,
+          idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+          maxDurationMs: 0,
+        });
+        session.activeUpstreamResponse = null;
+        streamed = recovered.streamed;
+        upstreamMode = recovered.upstreamMode || upstreamMode;
+        finalText = streamed.text || '';
+        finalReasoning = streamed.reasoning || '';
+        upstreamError = streamed.upstreamError || '';
+        lastStreamSawDone = streamed.sawDone === true;
+        lastStreamStopReason = String(streamed.stopReason || '').trim();
+        toolCalls = attachDefaultMutationTarget(
+          Array.isArray(streamed.toolCalls) ? streamed.toolCalls.slice(0, maxToolCallsPerRound) : [],
+          session,
+          userText,
+        );
+        reasoningTimeoutRecoveryCount += 1;
+        recordUpstreamUsagePhase(session, config, {
+          phase: recoveryPhase,
+          endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+          model: configuredModel,
+          status: streamed.upstreamError ? 'stream_error' : 'success',
+          error: streamed.upstreamError,
+          usage: streamed.usage,
+          durationMs: streamed.durationMs,
+          promptChars: usageMeta.messageChars,
+          responseTextChars: streamed.text.length,
+          reasoningChars: streamed.reasoning.length,
+          toolCalls: streamed.toolCalls.length,
+          meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes, recovery: 'disable_thinking' },
+        });
+      } catch (error) {
+        session.activeUpstreamResponse = null;
+        upstreamError = summarizeFetchError(error);
+        toolCalls = [];
+        recordUpstreamUsagePhase(session, config, {
+          phase: recoveryPhase,
+          endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
+          model: configuredModel,
+          status: 'fetch_error',
+          error: error.message || String(error),
+          promptChars: usageMeta.messageChars,
+          meta: { ...usageMeta, recovery: 'disable_thinking' },
+        });
+        logger?.error?.(`agent local relay reasoning-timeout recovery failed requestId=${requestId}: ${error.message}`);
+      }
+    }
     if (toolCalls.length) {
       if (maxToolRounds > 0 && toolStep >= maxToolRounds) break;
       toolStep += 1;
@@ -9431,9 +9973,9 @@ async function continueAgentStreamLoop(session, options = {}) {
       const { toolResultMessages, executions } = await executeRelayToolCalls(session, toolCalls, requestId, logger);
       const agentMode = getSessionAgentMode(session);
       const backgroundWaitMs = agentMode === 'AGENT_MODE_MULTITASK'
-        ? 4000
+        ? 12000
         : agentMode === 'AGENT_MODE_DEBUG'
-          ? 8000   // debug subagents run ReadLints/Diagnostics which take longer
+          ? 16000   // debug subagents run ReadLints/Diagnostics which take longer
           : 2500;
       const backgroundTaskRecords = await waitForBackgroundExecutions(
         session,
@@ -9504,6 +10046,45 @@ async function continueAgentStreamLoop(session, options = {}) {
         );
         break;
       }
+      if (postToolTurnAction?.finalText) {
+        finalText = String(postToolTurnAction.finalText || '').trim();
+        upstreamError = '';
+        toolCalls = [];
+        modeLocalFinalized = Boolean(postToolTurnAction.markCompleted);
+        logger?.info?.(
+          `agent local relay post-tool immediate local finalize requestId=${requestId} step=${toolStep} textPreview=${JSON.stringify(finalText.slice(0, 200))}`,
+        );
+        break;
+      }
+      const forcedModeTaskOnly = session.syntheticModeTaskStarted
+        && executions.length === 1
+        && String(executions[0]?.toolCall?.name || '').trim().toLowerCase() === 'task'
+        && (agentMode === 'AGENT_MODE_MULTITASK' || agentMode === 'AGENT_MODE_DEBUG');
+      if (forcedModeTaskOnly) {
+        const latestTask = getLatestSessionTaskRecord(session);
+        const status = String(latestTask?.status || '').trim().toLowerCase();
+        if (status === 'completed' || status === 'failed') {
+          finalText = String(latestTask?.summary || latestTask?.resultText || 'Task completed. Review the subagent card for details.').trim();
+          upstreamError = '';
+          toolCalls = [];
+          modeLocalFinalized = true;
+          logger?.info?.(
+            `agent local relay forced mode task turn finalized requestId=${requestId} step=${toolStep} mode=${agentMode} status=${status || '-'} textPreview=${JSON.stringify(finalText.slice(0, 200))}`,
+          );
+          break;
+        }
+        session.waitingForBackgroundTaskCompletion = {
+          taskUuid: String(latestTask?.taskUuid || latestTask?.agentId || '').trim(),
+          requestedAt: new Date().toISOString(),
+          agentMode,
+        };
+        session.unfinishedWorkAtEnd = true;
+        if (userText) rememberUnfinishedAgentTask(session, userText, 'Background task still running.');
+        logger?.info?.(
+          `agent local relay keeping stream open for background task requestId=${requestId} step=${toolStep} mode=${agentMode} taskUuid=${session.waitingForBackgroundTaskCompletion.taskUuid || '-'} status=${status || '-'}`,
+        );
+        return { waitingForBackgroundTask: true, taskUuid: session.waitingForBackgroundTaskCompletion.taskUuid };
+      }
       nativeMutationAckMissing = executions.some((entry) => entry.execution?.missingNativeAck);
       pendingNativeMutation = executions.some((entry) => entry.execution?.pendingNativeMutation);
       const sawMutationAttempt = executions.some((entry) => isMutationToolName(entry.toolCall?.name));
@@ -9572,9 +10153,9 @@ async function continueAgentStreamLoop(session, options = {}) {
             buildFetchUpstreamOptionsForSession(session, {
               enableTools: true,
               signal: session.abortController?.signal || null,
-              timeoutMs: sawWriteTool
-                ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
-                : POST_TOOL_UPSTREAM_TIMEOUT_MS,
+            timeoutMs: sawWriteTool
+              ? Math.max(getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS), 45 * 1000)
+              : getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS),
               requestId,
               phase: postToolPhase,
               mode: agentMode,
@@ -9604,11 +10185,11 @@ async function continueAgentStreamLoop(session, options = {}) {
               emitThinking,
               phase: postToolPhase,
               idleTimeoutMs: sawWriteTool
-                ? POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS
-                : POST_TOOL_STREAM_IDLE_TIMEOUT_MS,
+                ? getRuntimeTuningValue(config, 'postToolMutationStreamIdleTimeoutMs', POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS)
+                : getRuntimeTuningValue(config, 'postToolStreamIdleTimeoutMs', POST_TOOL_STREAM_IDLE_TIMEOUT_MS),
               maxDurationMs: sawWriteTool
-                ? Math.max(POST_TOOL_UPSTREAM_TIMEOUT_MS, 45 * 1000)
-                : POST_TOOL_UPSTREAM_TIMEOUT_MS,
+                ? Math.max(getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS), 45 * 1000)
+                : getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS),
               extendMaxDurationOnActivity: sawWriteTool,
               stopOnToolCall: true,
               stopAfterTextMs: sawWriteTool ? POST_MUTATION_STOP_AFTER_TEXT_MS : 0,
@@ -9620,6 +10201,15 @@ async function continueAgentStreamLoop(session, options = {}) {
             upstreamError = streamed.upstreamError;
             lastStreamSawDone = streamed.sawDone === true;
             lastStreamStopReason = String(streamed.stopReason || '').trim();
+            if (shouldRetryReasoningTimeoutWithoutThinking(streamed, reasoningTimeoutRecoveryCount)) {
+              continue;
+            }
+            if (shouldAbortForNoVisibleProgress(streamed, getRuntimeTuningValue(config, 'postToolNoVisibleProgressTimeoutMs', POST_TOOL_NO_VISIBLE_PROGRESS_TIMEOUT_MS))) {
+              upstreamError = 'post_tool_no_visible_progress';
+              logger?.warn?.(
+                `agent local relay post-tool no visible progress requestId=${requestId} step=${toolStep} phase=${postToolPhase} durationMs=${streamed.durationMs}`,
+              );
+            }
             toolCalls = attachDefaultMutationTarget(
               streamed.toolCalls.slice(0, maxToolCallsPerRound),
               session,
@@ -9725,7 +10315,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             buildFetchUpstreamOptionsForSession(session, {
               enableTools: true,
               signal: session.abortController?.signal || null,
-              timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              timeoutMs: getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS),
               requestId,
               phase: completionPhase,
               mode: agentMode,
@@ -9754,8 +10344,8 @@ async function continueAgentStreamLoop(session, options = {}) {
               emit: false,
               emitThinking,
               phase: completionPhase,
-              idleTimeoutMs: POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS,
-              maxDurationMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+              idleTimeoutMs: getRuntimeTuningValue(config, 'postToolMutationStreamIdleTimeoutMs', POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS),
+              maxDurationMs: getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS),
               extendMaxDurationOnActivity: true,
               stopOnToolCall: true,
               stopAfterTextMs: POST_MUTATION_STOP_AFTER_TEXT_MS,
@@ -9767,6 +10357,15 @@ async function continueAgentStreamLoop(session, options = {}) {
             upstreamError = streamed.upstreamError;
             lastStreamSawDone = streamed.sawDone === true;
             lastStreamStopReason = String(streamed.stopReason || '').trim();
+            if (shouldRetryReasoningTimeoutWithoutThinking(streamed, reasoningTimeoutRecoveryCount)) {
+              continue;
+            }
+            if (shouldAbortForNoVisibleProgress(streamed, getRuntimeTuningValue(config, 'postToolNoVisibleProgressTimeoutMs', POST_TOOL_NO_VISIBLE_PROGRESS_TIMEOUT_MS))) {
+              upstreamError = 'completion_verify_no_visible_progress';
+              logger?.warn?.(
+                `agent local relay completion verify no visible progress requestId=${requestId} step=${toolStep} phase=${completionPhase} durationMs=${streamed.durationMs}`,
+              );
+            }
             toolCalls = attachDefaultMutationTarget(
               streamed.toolCalls.slice(0, maxToolCallsPerRound),
               session,
@@ -9860,7 +10459,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             enableTools: true,
             toolChoice: forceToolForContinuation ? 'required' : 'auto',
             signal: session.abortController?.signal || null,
-            timeoutMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+            timeoutMs: getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS),
             requestId,
             phase: continuationPhase,
             mode: agentMode,
@@ -9889,8 +10488,8 @@ async function continueAgentStreamLoop(session, options = {}) {
             emit: false,
             emitThinking,
             phase: continuationPhase,
-            idleTimeoutMs: POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS,
-            maxDurationMs: POST_TOOL_UPSTREAM_TIMEOUT_MS,
+            idleTimeoutMs: getRuntimeTuningValue(config, 'postToolMutationStreamIdleTimeoutMs', POST_TOOL_MUTATION_STREAM_IDLE_TIMEOUT_MS),
+            maxDurationMs: getRuntimeTuningValue(config, 'postToolUpstreamTimeoutMs', POST_TOOL_UPSTREAM_TIMEOUT_MS),
             extendMaxDurationOnActivity: true,
             stopOnToolCall: true,
             stopAfterTextMs: POST_MUTATION_STOP_AFTER_TEXT_MS,
@@ -9902,6 +10501,12 @@ async function continueAgentStreamLoop(session, options = {}) {
           upstreamError = streamed.upstreamError;
           lastStreamSawDone = streamed.sawDone === true;
           lastStreamStopReason = String(streamed.stopReason || '').trim();
+          if (shouldAbortForNoVisibleProgress(streamed, getRuntimeTuningValue(config, 'postToolNoVisibleProgressTimeoutMs', POST_TOOL_NO_VISIBLE_PROGRESS_TIMEOUT_MS))) {
+            upstreamError = 'continuation_no_visible_progress';
+            logger?.warn?.(
+              `agent local relay continuation no visible progress requestId=${requestId} phase=${continuationPhase} durationMs=${streamed.durationMs}`,
+            );
+          }
           toolCalls = attachDefaultMutationTarget(
             streamed.toolCalls.slice(0, maxToolCallsPerRound),
             session,
@@ -10035,6 +10640,7 @@ async function continueAgentStreamLoop(session, options = {}) {
   logger?.info?.(
     `agent local relay final text frame requestId=${requestId} finalTextLen=${String(finalText || '').length} sentTextDelta=${session.sentTextDelta ? '1' : '0'} finalAlreadySent=${finalTextAlreadySent ? '1' : '0'} sentTextLen=${String(session.agentTextFrameText || '').length}`,
   );
+  session.planExecutionForeground = false;
   if (isPlanModeSession(session) && !session.unfinishedWorkAtEnd && !upstreamError) {
     setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.COMPLETED, {
       currentRequestId: String(session.requestId || '').trim(),
@@ -10060,11 +10666,18 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
   try {
   const requestId = session.requestId || '-';
   const userText = String(pendingInteraction?.resumeState?.userText || session.lastUserMessageCapture?.userText || '').trim();
-  if (!userText) {
+  const interactionKind = String(interactionResponse?.kind || '').trim();
+  const isExecutePlanResume = interactionKind === 'execute_plan_action';
+  const latestPlanState = getLatestSessionPlanState(session) || {};
+  const hasExecutablePlanContext = Boolean(
+    String(latestPlanState?.plan_text || latestPlanState?.plan || '').trim()
+    || String(latestPlanState?.plan_uri || '').trim(),
+  );
+  if (!userText && !(isExecutePlanResume && hasExecutablePlanContext)) {
     logger?.warn?.(`agent local relay interaction resume skipped requestId=${requestId} reason=missing_user_text`);
     return;
   }
-  if (String(interactionResponse?.kind || '').trim() === 'create_plan_request_response') {
+  if (interactionKind === 'create_plan_request_response') {
     const planState = syncPresentedPlanStateFromInteractionResponse(session, interactionResponse, pendingInteraction);
     if (planState) {
       updatePlanWorkflowForInteractionResponse(session, interactionResponse, pendingInteraction);
@@ -10087,18 +10700,19 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
       return;
     }
   }
-  if (String(interactionResponse?.kind || '').trim() === 'execute_plan_action') {
+  if (interactionKind === 'execute_plan_action') {
     if (isPlanModeSession(session)) {
       setPlanWorkflowPhase(session, PLAN_WORKFLOW_PHASES.EXECUTING, {
-        lastInteractionKind: String(interactionResponse?.kind || '').trim(),
+        lastInteractionKind: interactionKind,
         currentRequestId: String(session.requestId || '').trim(),
       });
     }
-    const planState = getLatestSessionPlanState(session) || {};
+    const planState = latestPlanState;
     session.waitingForInteraction = false;
     session.planTurnHandoff = '';
     session.deferredInteractionResponse = null;
     session.relaying = false;
+    session.planExecutionForeground = true;
     updateSessionHistoryState(session, {
       current_loop_status: 'running',
       waiting_for_interaction: null,
@@ -10111,10 +10725,13 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
         }
         : null,
     });
+    emitPresentedPlanCheckpoint(session, logger, { force: true });
   }
   const configuredModel = resolveRequestedUpstreamModel(config, {
     requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
   });
+  session.requestedModel = String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim();
+  session.routedModel = configuredModel;
   try {
     await syncRequestedModelSelection(configuredModel, logger);
   } catch (error) {
@@ -10122,7 +10739,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
   }
   const activeUpstream = resolveUpstreamForModel(config, configuredModel);
   const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
-    ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
+    ? getRuntimeTuningValue(config, 'deepseekReasoningOnlyStreamMaxMs', DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS)
     : 0;
   const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
   const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
@@ -10311,25 +10928,51 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
     emit: true,
     emitThinking,
     phase: 'interaction_resume',
-    idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+    idleTimeoutMs: getRuntimeTuningValue(config, 'upstreamStreamIdleTimeoutMs', UPSTREAM_STREAM_IDLE_TIMEOUT_MS),
     maxDurationMs: 0,
     reasoningOnlyMaxMs,
     filterInlineThinking,
   });
   session.activeUpstreamResponse = null;
+  let resumedStreamed = streamed;
+  if (shouldRetryReasoningTimeoutWithoutThinking(resumedStreamed)) {
+    const recovered = await retryStreamWithoutThinking(session, {
+      config,
+      logger,
+      activeUpstream,
+      configuredModel,
+      upstreamMessages: [
+        ...compacted.messages,
+        {
+          role: 'user',
+          content: 'Stop extended thinking immediately. Do not output Thought/思考. Continue with concrete actions or the final answer only.',
+        },
+      ],
+      requestId,
+      phase: 'interaction_resume_reasoning_timeout_recover',
+      agentMode,
+      emit: true,
+      enableTools: true,
+      idleTimeoutMs: getRuntimeTuningValue(config, 'upstreamStreamIdleTimeoutMs', UPSTREAM_STREAM_IDLE_TIMEOUT_MS),
+      maxDurationMs: 0,
+    });
+    session.activeUpstreamResponse = null;
+    resumedStreamed = recovered.streamed;
+    upstreamMode = recovered.upstreamMode || upstreamMode;
+  }
   recordUpstreamUsagePhase(session, config, {
     phase: 'interaction_resume',
     endpointMode: upstreamMode || String(activeUpstream?.endpointMode || config.upstream?.endpointMode || 'responses'),
     model: configuredModel,
-    status: streamed.upstreamError ? 'stream_error' : 'success',
-    error: streamed.upstreamError,
-    usage: streamed.usage,
-    durationMs: streamed.durationMs,
+    status: resumedStreamed.upstreamError ? 'stream_error' : 'success',
+    error: resumedStreamed.upstreamError,
+    usage: resumedStreamed.usage,
+    durationMs: resumedStreamed.durationMs,
     promptChars,
-    responseTextChars: streamed.text.length,
-    reasoningChars: streamed.reasoning.length,
-    toolCalls: streamed.toolCalls.length,
-    meta: { ...usageMeta, deltaCount: streamed.deltaCount, eventTypes: streamed.eventTypes },
+    responseTextChars: resumedStreamed.text.length,
+    reasoningChars: resumedStreamed.reasoning.length,
+    toolCalls: resumedStreamed.toolCalls.length,
+    meta: { ...usageMeta, deltaCount: resumedStreamed.deltaCount, eventTypes: resumedStreamed.eventTypes },
   });
   if (!session.active || session.aborted) return;
   session.waitingForInteraction = false;
@@ -10349,7 +10992,7 @@ async function resumeAgentAfterInteractionResponse(session, interactionResponse,
     userText,
     config,
     logger,
-    streamed,
+    streamed: resumedStreamed,
     upstreamMessages: compacted.messages,
     usageMeta,
     configuredModel,
@@ -10408,6 +11051,8 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     const configuredModel = resolveRequestedUpstreamModel(config, {
       requestedModel: session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '',
     });
+    session.requestedModel = String(session?.lastUserMessageCapture?.debug?.agentClientMessage?.runRequest?.requestedModelId || '').trim();
+    session.routedModel = configuredModel;
     try {
       await syncRequestedModelSelection(configuredModel, logger);
     } catch (error) {
@@ -10415,7 +11060,7 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
     }
     const activeUpstream = resolveUpstreamForModel(config, configuredModel);
     const reasoningOnlyMaxMs = isDeepSeekModel(config, configuredModel)
-      ? DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS
+      ? getRuntimeTuningValue(config, 'deepseekReasoningOnlyStreamMaxMs', DEEPSEEK_REASONING_ONLY_STREAM_MAX_MS)
       : 0;
     const emitThinking = shouldEmitThinkingForUpstream(config, configuredModel);
     const filterInlineThinking = isDeepSeekModel(config, configuredModel) && !emitThinking;
@@ -10529,17 +11174,43 @@ async function relayAgentUserMessage(session, userText, config, logger, stats) {
         stopReason: 'http_error',
       };
     } else {
+      const suppressInitialModeText = agentMode === 'AGENT_MODE_MULTITASK' || agentMode === 'AGENT_MODE_DEBUG';
       streamed = await streamAgentUpstreamResponse(upstream, session, {
         collectTools: true,
-        emit: true,
+        emit: !suppressInitialModeText,
         emitThinking,
         phase: 'initial',
-        idleTimeoutMs: UPSTREAM_STREAM_IDLE_TIMEOUT_MS,
+        idleTimeoutMs: getRuntimeTuningValue(config, 'upstreamStreamIdleTimeoutMs', UPSTREAM_STREAM_IDLE_TIMEOUT_MS),
         maxDurationMs: 0,
         reasoningOnlyMaxMs,
         filterInlineThinking,
       });
       session.activeUpstreamResponse = null;
+      if (shouldRetryReasoningTimeoutWithoutThinking(streamed)) {
+        const recovered = await retryStreamWithoutThinking(session, {
+          config,
+          logger,
+          activeUpstream,
+          configuredModel,
+          upstreamMessages: [
+            ...upstreamMessages,
+            {
+              role: 'user',
+              content: 'Stop extended thinking immediately. Do not output Thought/思考. Continue with concrete actions or the final answer only.',
+            },
+          ],
+          requestId,
+          phase: 'initial_reasoning_timeout_recover',
+          agentMode,
+          emit: !suppressInitialModeText,
+          enableTools: true,
+          idleTimeoutMs: getRuntimeTuningValue(config, 'upstreamStreamIdleTimeoutMs', UPSTREAM_STREAM_IDLE_TIMEOUT_MS),
+          maxDurationMs: 0,
+        });
+        session.activeUpstreamResponse = null;
+        streamed = recovered.streamed;
+        upstreamMode = recovered.upstreamMode || upstreamMode;
+      }
     }
 
     recordUpstreamUsagePhase(session, config, {
@@ -10593,11 +11264,7 @@ async function forwardMitmH2Request(req, res, host, reqPath, method, body, logge
     body: body?.length ? body : undefined,
   });
   logger?.info?.(`h2 passthrough via fetch ${host}${reqPath} status=${response.status} contentType=${String(response.headers.get('content-type') || '-')}`);
-  const responseHeaders = {};
-  response.headers.forEach((value, key) => {
-    if (String(key).startsWith(':')) return;
-    responseHeaders[key] = value;
-  });
+  const responseHeaders = sanitizeProxyResponseHeaders(response.headers, { forHttp2: true });
   if (!res.headersSent) {
     res.writeHead(response.status || 502, responseHeaders);
   }
@@ -10639,8 +11306,7 @@ function forwardMitmH2RequestLegacy(req, res, host, reqPath, method, body, logge
     const upstreamReq = client.request(headers);
     upstreamReq.on('response', (responseHeaders) => {
       const status = Number(responseHeaders[':status'] || 502);
-      const responseHeaderMap = { ...responseHeaders };
-      delete responseHeaderMap[':status'];
+      const responseHeaderMap = sanitizeProxyResponseHeaders(responseHeaders, { forHttp2: true });
       logger?.info?.(`h2 upstream response ${host}${reqPath} status=${status} contentType=${String(responseHeaders['content-type'] || '-')}`);
       if (!res.headersSent) {
         res.writeHead(status, responseHeaderMap);
@@ -10697,11 +11363,36 @@ async function forwardMitmHttpsRequest(req, res, logger, config, body, options =
     }).then(async (upstreamRes) => {
       const captureWriter = createResponseCaptureWriter(options.captureResponsePath, logger, 'native response');
       logger?.info?.(`https upstream response ${host}${reqPath} status=${upstreamRes.status || 0} contentType=${String(upstreamRes.headers?.get?.('content-type') || '-')}`);
-      const responseHeaders = {};
-      upstreamRes.headers.forEach((value, key) => {
-        responseHeaders[key] = value;
-      });
+      const responseHeaders = sanitizeProxyResponseHeaders(upstreamRes.headers);
       res.writeHead(upstreamRes.status || 502, responseHeaders);
+      const contentType = String(upstreamRes.headers?.get?.('content-type') || '').toLowerCase();
+      const isStreamingResponse = contentType.includes('text/event-stream');
+      if (isStreamingResponse && upstreamRes.body?.getReader) {
+        try {
+          const reader = upstreamRes.body.getReader();
+          while (true) {
+            // eslint-disable-next-line no-await-in-loop
+            const { done, value } = await reader.read();
+            if (done) break;
+            const buffer = Buffer.from(value || []);
+            if (!buffer.length) continue;
+            captureWriter?.write(buffer);
+            res.write(buffer);
+            if (typeof res.flushHeaders === 'function') {
+              try { res.flushHeaders(); } catch { /* ignore */ }
+            }
+            if (typeof res.flush === 'function') {
+              try { res.flush(); } catch { /* ignore */ }
+            }
+          }
+          captureWriter?.end();
+          res.end();
+          resolve();
+          return;
+        } catch (streamError) {
+          logger.error(`https streaming passthrough failed ${host}${reqPath}: ${streamError.message}`);
+        }
+      }
       const buffer = Buffer.from(await upstreamRes.arrayBuffer());
       if (buffer.length) {
         captureWriter?.write(buffer);
@@ -10796,6 +11487,46 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
         triggerDeferredInteractionResume(session, config, logger, stats, 'runsse_cross_request_reattach');
       }
       return;
+    }
+
+    // Fallback: search all sessions for one awaiting runsse rebind (e.g. after execute_plan_action)
+    if (requestId) {
+      for (const candidate of agentSessions.values()) {
+        if (
+          candidate
+          && !candidate.aborted
+          && !candidate.completed
+          && candidate.awaitingRunsseRebind === true
+          && !candidate.relaying
+        ) {
+          const prevRequestId = String(candidate.requestId || '').trim();
+          if (prevRequestId && prevRequestId !== requestId) {
+            rebindWaitingSessionRequestId(candidate, requestId, logger);
+          }
+          const fallbackSession = reattachWaitingInteractionSession(candidate, req, res, rawBody, logger);
+          if (pendingCapture) {
+            fallbackSession.lastUserMessageCapture = pendingCapture;
+            fallbackSession.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || fallbackSession.workspaceRoot || '');
+            pendingAgentMessages.delete(requestId);
+          }
+          res.on('close', () => {
+            if (fallbackSession?.completed) return;
+            if (fallbackSession?.ignoreNextRunsseClose) {
+              fallbackSession.ignoreNextRunsseClose = false;
+              logger?.info?.(`agent local relay ignored runsse close after finalize requestId=${fallbackSession?.requestId || '-'}`);
+              return;
+            }
+            abortAgentSession(fallbackSession, logger, 'runsse_closed');
+          });
+          if (fallbackSession?.deferredInteractionResponse?.interactionResponse && !fallbackSession.relaying) {
+            triggerDeferredInteractionResume(fallbackSession, config, logger, stats, 'runsse_awaiting_fallback');
+          }
+          logger.info(
+            `agent local relay found awaiting session via fallback requestId=${requestId} prevRequestId=${prevRequestId} handoff=${fallbackSession.modeTurnHandoff || '-'} deferred=${fallbackSession.deferredInteractionResponse?.interactionResponse ? '1' : '0'}`,
+          );
+          return;
+        }
+      }
     }
 
     const session = {
@@ -11052,7 +11783,6 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         }
         session.relaying = false;
         session.waitingForInteraction = false;
-        session.awaitingRunsseRebind = true;
         session.planTurnHandoff = '';
         session.modeTurnHandoff = 'execute_plan';
         session.deferredInteractionResponse = null;
@@ -11083,15 +11813,8 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         });
         ack();
         if (session.active && !session.aborted) {
-          scheduleExecutePlanSessionResume(
-            session,
-            interactionResponse,
-            config,
-            logger,
-            stats,
-            pendingInteraction,
-            'conversation_action_execute_plan',
-          );
+          resumeAgentAfterInteractionResponse(session, interactionResponse, config, logger, stats, pendingInteraction)
+            .catch((error) => failAgentRelaySession(session, logger, error, 'conversation_action_execute_plan'));
         }
         return;
       }
@@ -11100,7 +11823,13 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       // 而不是发新的 runRequest。把它当作普通 user_message 处理。
       if (actionKind === 'user_message_action' && decoded.userText) {
         const normalizedUserText = trimRelayText(decoded.userText, 12000);
-        const userWorkspaceRoot = selectWorkspaceRootForUserMessage(decoded.debug?.workspaceRoot || '', logger, decoded.requestId, normalizedUserText);
+        const userWorkspaceRoot = selectWorkspaceRootForUserMessage(
+          decoded.debug?.workspaceRoot || '',
+          logger,
+          decoded.requestId,
+          normalizedUserText,
+          action.requestContext || null,
+        );
         const userStableConvId = extractStableConversationId(decoded.debug || null)
           || String(action.requestContext?.stableConversationId || '').trim();
         logger.info(
@@ -11252,6 +11981,12 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         || String(decoded.debug?.agentClientMessage?.runRequest?.stableConversationId || '').trim();
       const session = agentSessions.get(decoded.requestId);
       const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      const runRequestActionKind = String(
+        decoded?.debug?.agentClientMessage?.runRequest?.action?.kind
+        || decoded?.debug?.runRequestActionKind
+        || ''
+      ).trim();
+      const hasEmbeddedPlanAction = runRequestActionKind === 'execute_plan_action' || runRequestActionKind === 'start_plan_action';
       if (
         waitingSession
         && !waitingSession.relaying
@@ -11287,6 +12022,18 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         ack();
         return;
       }
+      if (hasEmbeddedPlanAction) {
+        const targetSession = waitingSession || session;
+        if (targetSession?.active) {
+          if (decoded.mode) targetSession.agentMode = normalizeAgentModeName(decoded.mode);
+          logger.info(
+            `agent local relay handling embedded plan run_request requestId=${decoded.requestId} stableConversationId=${JSON.stringify(stableConversationId)} actionKind=${runRequestActionKind} waiting=${targetSession.waitingForInteraction ? '1' : '0'} relaying=${targetSession.relaying ? '1' : '0'}`
+          );
+          if (maybeHandleRunRequestConversationAction(targetSession, decoded, config, logger, stats, pendingAgentInteractions, ack)) {
+            return;
+          }
+        }
+      }
       if (session?.active && session.waitingForInteraction && !session.relaying) {
         if (decoded.mode) session.agentMode = normalizeAgentModeName(decoded.mode);
         if (maybeHandleRunRequestConversationAction(session, decoded, config, logger, stats, pendingAgentInteractions, ack)) {
@@ -11307,7 +12054,13 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
 
     if (decoded.kind === 'user_message' && decoded.requestId && decoded.userText) {
       const normalizedUserText = trimRelayText(decoded.userText, 12000);
-      const workspaceRoot = selectWorkspaceRootForUserMessage(decoded.debug?.workspaceRoot || '', logger, decoded.requestId, normalizedUserText);
+      const workspaceRoot = selectWorkspaceRootForUserMessage(
+        decoded.debug?.workspaceRoot || '',
+        logger,
+        decoded.requestId,
+        normalizedUserText,
+        decoded.debug?.agentClientMessage?.runRequest?.action?.requestContext || null,
+      );
       const stableConversationId = extractStableConversationId(decoded.debug || null);
       // 提取 MCP/Skill 上下文（阶段六：MCP 工具调用与 Skill 透传）
       const mcpSkillContext = (() => {
@@ -11360,6 +12113,31 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       }
       const session = agentSessions.get(decoded.requestId);
       const waitingSession = findWaitingSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      const duplicateActiveSession = findActiveSessionByStableConversationId(agentSessions, stableConversationId, decoded.requestId);
+      if (
+        duplicateActiveSession
+        && duplicateActiveSession !== session
+        && duplicateActiveSession.streamDetached === true
+        && duplicateActiveSession.awaitingRunsseRebind === true
+        && isSameActiveSessionUserMessage(duplicateActiveSession, stableConversationId, normalizedUserText)
+      ) {
+        logger.info(
+          `agent local relay duplicate user_message ignored for detached active session requestId=${decoded.requestId} activeRequestId=${duplicateActiveSession.requestId || '-'} stableConversationId=${JSON.stringify(stableConversationId)} textLen=${normalizedUserText.length}`,
+        );
+        ack();
+        return;
+      }
+      if (
+        duplicateActiveSession
+        && duplicateActiveSession !== session
+        && isSameActiveSessionUserMessage(duplicateActiveSession, stableConversationId, normalizedUserText)
+      ) {
+        logger.info(
+          `agent local relay duplicate user_message ignored requestId=${decoded.requestId} activeRequestId=${duplicateActiveSession.requestId || '-'} stableConversationId=${JSON.stringify(stableConversationId)} textLen=${normalizedUserText.length}`,
+        );
+        ack();
+        return;
+      }
       if (
         waitingSession
         && waitingSession !== session
@@ -11614,6 +12392,18 @@ async function handleMitmRequest(req, res, config, logger, stats, shutdown, agen
     return;
   }
 
+  if (isLocalRelayMode(config) && method === 'POST' && isAgentConversationMetadataPath(pathname)) {
+    const rawBody = await readRequestBody(req);
+    stats.localControlPlaneResponses = (stats.localControlPlaneResponses || 0) + 1;
+    logger.info(`local control-plane response path=${pathname} type=empty rawLen=${rawBody.length} bytes=0`);
+    res.writeHead(200, {
+      'Content-Type': 'application/proto',
+      'Content-Length': '0',
+    });
+    res.end();
+    return;
+  }
+
   if (isLocalRelayMode(config) && method === 'POST' && await handleLocalControlPlaneRequest(req, pathname, res, config, logger, stats)) {
     return;
   }
@@ -11761,11 +12551,18 @@ function buildFakeModelListResponse(pathname, localModels) {
     const activeProfile = getActiveRelayProfile('');
     const defaultContextLimit = Math.max(1, Number(activeProfile?.contextWindow || localModels[0]?.contextWindow || 200000) || 200000);
     const defaultReasoningEffort = String(activeProfile?.reasoningEffort || localModels[0]?.reasoningEffort || 'medium').trim() || 'medium';
+    const defaultModelName = String(activeProfile?.modelName || localModels[0]?.modelName || 'default').trim() || 'default';
+    const modelNames = localModels.map((m) => String(m.modelName || '').trim()).filter(Boolean);
+    const modelConfig = {
+      defaultModel: defaultModelName,
+      fallbackModels: modelNames.length ? modelNames : [defaultModelName],
+      bestOfNDefaultModels: modelNames.length ? modelNames : [defaultModelName],
+    };
 
     if (pathname === modelInjection.AVAILABLE_MODELS_PATH) {
       // [FIX #3] AvailableModelsResponse.models 用正确的 AvailableModel 字段（非 ModelDetails 占位）
       const payload = encodeMessageSync('aiserver.v1.AvailableModelsResponse', {
-        modelNames: localModels.map((m) => m.modelName),
+        modelNames,
         // Cursor UI 从每个 AvailableModel 读: name, supportsAgent(=#5), clientDisplayName(=#17), serverModelName(=#18)
         // 缺少 supportsAgent → 模型不出现在 Agent 下拉框
         models: localModels.map((m) => ({
@@ -11800,6 +12597,18 @@ function buildFakeModelListResponse(pathname, localModels) {
           inputboxShortModelName: m.displayNameShort || m.displayName || m.modelName, // #24
           degradationStatus: 0,                                  // #6 UNSPECIFIED
         })),
+        defaultModelConfig: modelConfig,
+        composerModelConfig: modelConfig,
+        cmdKModelConfig: modelConfig,
+        backgroundComposerModelConfig: modelConfig,
+        planExecutionModelConfig: modelConfig,
+        specModelConfig: modelConfig,
+        deepSearchModelConfig: modelConfig,
+        quickAgentModelConfig: modelConfig,
+        slowPoolModelConfig: modelConfig,
+        disableUnusedModelsAfterNHours: 2400000,
+        upgradeUnchangedModelsAfterNHours: 2,
+        displayConfiguration: buildRelayModelPickerDisplayConfiguration(),
         useModelParameters: true,
       });
       return payload;
@@ -11821,7 +12630,6 @@ function buildFakeModelListResponse(pathname, localModels) {
 
   if (pathname === modelInjection.GET_DEFAULT_MODEL_PATH) {
       // GetDefaultModelForCliResponse { ModelDetails model = 1; } — model 是嵌套消息
-      const defaultModelName = activeProfile?.modelName || (localModels[0]?.modelName || 'default');
       const defaultDisplayName = activeProfile?.name || defaultModelName;
       const payload = encodeMessageSync('agent.v1.GetDefaultModelForCliResponse', {
         model: {
@@ -11906,15 +12714,10 @@ async function handleStreamCppRequest(req, res, config, logger, stats) {
     requestedModel: decoded.modelName || '',
   });
   const upstream = resolveUpstreamForModel(config, configuredModel);
-  // 代码补全用单独的模型（如果有配置）
-  const completionUpstream = {
-    baseUrl: upstream.baseUrl,
-    apiKey: upstream.apiKey,
-    completionModel: config.completionModel || configuredModel,
-    model: config.completionModel || configuredModel,
-  };
+  // 代码补全复用聊天模型（不再单独配置补全模型）
+  // 直接用 upstream 作为补全上游
 
-  const openaiReq = streamCpp.buildStreamCppOpenAIRequest(decoded, completionUpstream);
+  const openaiReq = streamCpp.buildStreamCppOpenAIRequest(decoded, upstream);
   const bindingId = streamCpp.generateBindingId();
   const cursorLine = decoded.cursorPosition.line || 1;
 
@@ -12254,6 +13057,7 @@ function startProxy(config) {
   logger.info(
     `runner boot pid=${process.pid} port=${config.port} directMitmPort=${stats.directMitmPort || '-'} mode=${mode}`,
   );
+  syncRelayModelCatalogFromRunnerConfig(config, logger, 'startup').catch(() => null);
 
   const tlsProvider = createRelayTlsContextProvider(getConfigCustomRoot(config), logger);
   const certPath = String(tlsProvider.paths?.leafCertPath || config.cert.leafCertPath || '').trim();
@@ -12412,7 +13216,6 @@ function startProxy(config) {
         port: config.port,
         directMitmPort: stats.directMitmPort,
         mode,
-        completionModel: String(config.completionModel || ''),
         upstreamBaseUrl: String(config.upstream?.baseUrl || ''),
         upstreamDisplayName: String(config.upstream?.displayName || config.upstream?.modelName || ''),
         upstreamModelName: String(config.upstream?.modelName || ''),
@@ -12434,6 +13237,7 @@ function startProxy(config) {
         mockAgentProtoTools: Boolean(config.mockAgentProtoTools),
         localNativeAgentTools: config.localNativeAgentTools !== false,
         structuredAgentToolCalls: config.structuredAgentToolCalls !== false,
+        nativeSubagentExec: Boolean(config.nativeSubagentExec),
         emitLocalToolInteractionFrames: config.emitLocalToolInteractionFrames !== false,
         emitLocalStepFrames: Boolean(config.emitLocalStepFrames),
         emitSyntheticLocalNativeToolFrames: Boolean(config.emitSyntheticLocalNativeToolFrames),
@@ -12446,7 +13250,21 @@ function startProxy(config) {
         localMutationCheckpointsEnabled: config.emitLocalMutationCheckpoints === true && config.disableLocalMutationCheckpoints !== true,
         enableReviewBridge: Boolean(config.enableReviewBridge),
         localControlPlane: isLocalRelayMode(config),
-        stats,
+        stats: {
+          startTime: stats.startTime,
+          connectTotal: stats.connectTotal,
+          connectMitm: stats.connectMitm,
+          connectH2: stats.connectH2,
+          chatTotal: stats.chatTotal,
+          seenAgentRunSse: stats.seenAgentRunSse,
+          seenBidiAppend: stats.seenBidiAppend,
+          seenBidiUserMessage: stats.seenBidiUserMessage,
+          localRelayTurns: stats.localRelayTurns,
+          localControlPlaneResponses: stats.localControlPlaneResponses,
+          localProviderModelsRequests: stats.localProviderModelsRequests,
+          lastError: stats.lastError || '',
+          recentPaths: Array.isArray(stats.recentPaths) ? stats.recentPaths.slice(-20) : [],
+        },
         cacheStats: null,
       }));
       return;

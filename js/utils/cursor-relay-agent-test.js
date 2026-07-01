@@ -30,6 +30,9 @@ function mapAgentModeNameToNumber(modeName = '') {
     case 'MULTITASK':
     case 'TASK':
       return 7;
+    case 'AGENT_MODE_SUBAGENT':
+    case 'SUBAGENT':
+      return 8;
     default:
       return 1;
   }
@@ -157,7 +160,7 @@ function extractAgentFrameInfo(frame) {
   const execServer = getFieldBytes(root, 2);
   if (execServer?.length) {
     const execFields = parseFields(execServer);
-    const toolField = execFields.find((field) => [2, 3, 5, 7, 14].includes(field.field));
+    const toolField = execFields.find((field) => [2, 3, 5, 7, 14, 28].includes(field.field));
     const execId = decodeUtf8(getFieldBytes(execFields, 15) || getFieldBytes(execFields, 1) || Buffer.alloc(0)).trim();
     const toolMap = {
       2: 'shell_args',
@@ -165,6 +168,7 @@ function extractAgentFrameInfo(frame) {
       5: 'grep_args',
       7: 'read_args',
       14: 'shell_stream_args',
+      28: 'subagent_args',
     };
     return {
       kind: 'exec_server',

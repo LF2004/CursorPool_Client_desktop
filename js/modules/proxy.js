@@ -216,16 +216,13 @@ function renderConfigCard(profile) {
   const endpointText = profile.providerId === 'anthropic'
     ? ''
     : ` · ${escapeHtml(endpointLabel(profile.endpointMode))}`;
-  const completionText = profile.completionModel
-    ? ` · Tab ${escapeHtml(profile.completionModel)}`
-    : '';
 
   return `
     <article class="relay-config-card${isActive ? ' active' : ''}" data-config-id="${escapeHtml(profile.id)}">
       <div class="relay-card-head">
         <div class="relay-card-title-wrap">
           <h4 class="relay-card-name">${escapeHtml(profile.name)}</h4>
-          <p class="relay-card-model mono">${escapeHtml(profile.modelName || '未填模型')}${endpointText}${escapeHtml(thinkingText)}${completionText}</p>
+          <p class="relay-card-model mono">${escapeHtml(profile.modelName || '未填模型')}${endpointText}${escapeHtml(thinkingText)}</p>
         </div>
         <span class="relay-card-provider">
           ${providerIconHtml(profile.providerId)}
@@ -502,13 +499,33 @@ function fillModalForm(profile) {
   setModalProviderTab(modalProviderId);
   if ($('relayModalName')) $('relayModalName').value = p.name || '';
   if ($('relayModalModel')) $('relayModalModel').value = p.modelName || '';
-  if ($('relayModalCompletionModel')) $('relayModalCompletionModel').value = p.completionModel || '';
   if ($('relayModalApiKey')) $('relayModalApiKey').value = p.apiKey || '';
   if ($('relayModalBaseUrl')) $('relayModalBaseUrl').value = p.baseUrl || PROVIDER_BASE_URLS[modalProviderId] || '';
   if ($('relayModalContext')) $('relayModalContext').value = String(p.contextWindow || DEFAULT_CONTEXT_WINDOW);
   if ($('relayModalReasoning')) $('relayModalReasoning').value = p.reasoningEffort || DEFAULT_REASONING_EFFORT;
   if ($('relayModalThinking')) $('relayModalThinking').value = p.thinkingMode || DEFAULT_DEEPSEEK_THINKING_MODE;
   if ($('relayModalEndpoint')) $('relayModalEndpoint').value = p.endpointMode || DEFAULT_ENDPOINT_MODE;
+  
+  // 新增字段
+  if ($('relayModalMaxTokens')) $('relayModalMaxTokens').value = p.maxCompletionTokens > 0 ? String(p.maxCompletionTokens) : '';
+  if ($('relayModalAnthropicMaxTokens')) $('relayModalAnthropicMaxTokens').value = p.anthropicMaxTokens > 0 ? String(p.anthropicMaxTokens) : '';
+  if ($('relayModalAnthropicThinking')) $('relayModalAnthropicThinking').value = p.anthropicThinkingEffort || 'medium';
+  if ($('relayModalOpenAIExtraParamsEnabled')) $('relayModalOpenAIExtraParamsEnabled').checked = Boolean(p.openAIExtraParamsEnabled);
+  if ($('relayModalOpenAIExtraParamsJSON')) {
+    $('relayModalOpenAIExtraParamsJSON').value = p.openAIExtraParamsJSON || '{}';
+    $('relayModalOpenAIExtraParamsJSON').disabled = !p.openAIExtraParamsEnabled;
+  }
+  if ($('relayModalAnthropicExtraParamsEnabled')) $('relayModalAnthropicExtraParamsEnabled').checked = Boolean(p.anthropicExtraParamsEnabled);
+  if ($('relayModalAnthropicExtraParamsJSON')) {
+    $('relayModalAnthropicExtraParamsJSON').value = p.anthropicExtraParamsJSON || '{}';
+    $('relayModalAnthropicExtraParamsJSON').disabled = !p.anthropicExtraParamsEnabled;
+  }
+  if ($('relayModalCustomHeadersEnabled')) $('relayModalCustomHeadersEnabled').checked = Boolean(p.customHeadersEnabled);
+  if ($('relayModalCustomHeadersJSON')) {
+    $('relayModalCustomHeadersJSON').value = p.customHeadersJSON || '{}';
+    $('relayModalCustomHeadersJSON').disabled = !p.customHeadersEnabled;
+  }
+  
   if ($('relayModalNotes')) $('relayModalNotes').value = p.notes || '';
   const testEl = $('relayModalTestStatus');
   if (testEl) {
@@ -549,6 +566,17 @@ function collectModalFormProfile() {
   const rawContextWindow = Number(($('relayModalContext')?.value || '').trim() || DEFAULT_CONTEXT_WINDOW);
   const contextWindow = Math.max(1, Math.min(MAX_CONTEXT_WINDOW, Number.isFinite(rawContextWindow) ? rawContextWindow : DEFAULT_CONTEXT_WINDOW));
   if ($('relayModalContext')) $('relayModalContext').value = String(contextWindow);
+  const rawMaxTokens = Number(($('relayModalMaxTokens')?.value || '').trim()) || 0;
+  const rawAnthropicMaxTokens = Number(($('relayModalAnthropicMaxTokens')?.value || '').trim()) || 0;
+  const maxCompletionTokens = Math.max(0, rawMaxTokens);
+  const anthropicMaxTokens = Math.max(0, rawAnthropicMaxTokens);
+  const anthropicThinkingEffort = ($('relayModalAnthropicThinking')?.value || 'medium').trim();
+  const openAIExtraParamsEnabled = Boolean($('relayModalOpenAIExtraParamsEnabled')?.checked);
+  const openAIExtraParamsJSON = ($('relayModalOpenAIExtraParamsJSON')?.value || '{}').trim() || '{}';
+  const anthropicExtraParamsEnabled = Boolean($('relayModalAnthropicExtraParamsEnabled')?.checked);
+  const anthropicExtraParamsJSON = ($('relayModalAnthropicExtraParamsJSON')?.value || '{}').trim() || '{}';
+  const customHeadersEnabled = Boolean($('relayModalCustomHeadersEnabled')?.checked);
+  const customHeadersJSON = ($('relayModalCustomHeadersJSON')?.value || '{}').trim() || '{}';
   return {
     ...base,
     id: existing?.id || base.id,
@@ -557,13 +585,21 @@ function collectModalFormProfile() {
     baseUrl: normalizeBaseUrlInput(rawBaseUrl),
     apiKey: ($('relayModalApiKey')?.value || '').trim() || existing?.apiKey || '',
     modelName: ($('relayModalModel')?.value || '').trim(),
-    completionModel: ($('relayModalCompletionModel')?.value || '').trim(),
     endpointMode: inferredEndpointMode,
     reasoningEffort: ($('relayModalReasoning')?.value || DEFAULT_REASONING_EFFORT).trim(),
     thinkingMode: modalProviderId === 'deepseek' || modalProviderId === 'mimo'
       ? (($('relayModalThinking')?.value || DEFAULT_DEEPSEEK_THINKING_MODE).trim())
       : '',
     contextWindow,
+    maxCompletionTokens,
+    anthropicMaxTokens,
+    anthropicThinkingEffort,
+    openAIExtraParamsEnabled,
+    openAIExtraParamsJSON,
+    anthropicExtraParamsEnabled,
+    anthropicExtraParamsJSON,
+    customHeadersEnabled,
+    customHeadersJSON,
     notes: ($('relayModalNotes')?.value || '').trim(),
   };
 }
@@ -1219,7 +1255,6 @@ async function enableRelayForProfile(profileId) {
         local = await bridge.cursorRelayApply({
           upstream,
           modelRoutes: collectRelayModelRoutes(),
-          completionModel: active.completionModel || upstream.completionModel || '',
           forceRestartRunner: true,
           restartCursor: false,
           reloadCursor: false,

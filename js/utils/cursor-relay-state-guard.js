@@ -99,6 +99,10 @@ let guardTimers = {
 };
 let isGuardRunning = false;
 let activeSessions = new Map(); // requestId → { lastKvPush, modelListPushed }
+let lastModelCatalogSync = {
+  signature: '',
+  at: 0,
+};
 
 function getLocalModelCatalogSnapshot() {
   const localModels = collectLocalModels();
@@ -128,6 +132,35 @@ function getLocalModelCatalogSnapshot() {
     contextWindow: Number(activeProfile?.contextWindow) > 0 ? Number(activeProfile.contextWindow) : undefined,
     reasoningEffort: String(activeProfile?.reasoningEffort || '').trim() || undefined,
   };
+}
+
+async function syncLocalModelCatalogIfNeeded(options = {}) {
+  const modelCatalog = getLocalModelCatalogSnapshot();
+  if (!modelCatalog) return null;
+  const signature = JSON.stringify({
+    modelName: modelCatalog.modelName,
+    availableModels: modelCatalog.availableModels,
+    contextWindow: modelCatalog.contextWindow || 0,
+    reasoningEffort: modelCatalog.reasoningEffort || '',
+  });
+  const now = Date.now();
+  const minIntervalMs = Math.max(30000, Number(options.minIntervalMs) || 5 * 60 * 1000);
+  if (
+    options.force !== true
+    && lastModelCatalogSync.signature === signature
+    && now - lastModelCatalogSync.at < minIntervalMs
+  ) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'model_catalog_guard_throttled',
+    };
+  }
+  const result = await syncCursorRelayModelCatalog(modelCatalog);
+  if (result?.ok) {
+    lastModelCatalogSync = { signature, at: now };
+  }
+  return result;
 }
 
 // ── 第一层：DB 写入守护 ───────────────────────────────────
@@ -173,8 +206,7 @@ async function performDbGuardCheck(options = {}) {
     }
 
     if (!needsWrite) {
-      const modelCatalog = getLocalModelCatalogSnapshot();
-      const modelSync = modelCatalog ? await syncCursorRelayModelCatalog(modelCatalog) : null;
+      const modelSync = await syncLocalModelCatalogIfNeeded();
       return {
         checked: true,
         reason: 'values_intact',
@@ -185,8 +217,7 @@ async function performDbGuardCheck(options = {}) {
 
     // 执行写入
     const result = await ensureCursorAccount({ allowRunningCursor: true });
-    const modelCatalog = getLocalModelCatalogSnapshot();
-    const modelSync = modelCatalog ? await syncCursorRelayModelCatalog(modelCatalog) : null;
+    const modelSync = await syncLocalModelCatalogIfNeeded({ force: true });
     return {
       checked: true,
       written: result?.applied || false,

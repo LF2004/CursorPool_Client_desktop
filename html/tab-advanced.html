@@ -328,13 +328,6 @@
           <input id="relayModalModel" class="input mono" placeholder="如 gpt-4o-mini" />
         </div>
         <div class="relay-modal-field">
-          <label class="relay-modal-label" for="relayModalCompletionModel">
-            <button type="button" class="relay-field-hint-btn" data-relay-field="completionModel" aria-label="Tab 补全模型说明"><i class="fa fa-info-circle"></i></button>
-            Tab 补全模型
-          </label>
-          <input id="relayModalCompletionModel" class="input mono" placeholder="留空则复用聊天模型" />
-        </div>
-        <div class="relay-modal-field">
           <label class="relay-modal-label" for="relayModalApiKey">
             <button type="button" class="relay-field-hint-btn" data-relay-field="apiKey" aria-label="访问密钥说明"><i class="fa fa-info-circle"></i></button>
             访问密钥
@@ -393,6 +386,72 @@
             备注
           </label>
           <textarea id="relayModalNotes" class="input relay-modal-notes" rows="3" placeholder="可选备注"></textarea>
+        </div>
+        
+        <div class="relay-modal-field" id="relayModalMaxTokensField">
+          <label class="relay-modal-label" for="relayModalMaxTokens">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="maxCompletionTokens" aria-label="最大输出 Token 说明"><i class="fa fa-info-circle"></i></button>
+            <span id="relayModalMaxTokensLabel">最大输出 Token</span>
+          </label>
+          <input id="relayModalMaxTokens" class="input" inputmode="numeric" placeholder="例如：65536（留空用默认值）" />
+        </div>
+        
+        <div class="relay-modal-field hidden" id="relayModalAnthropicMaxTokensField">
+          <label class="relay-modal-label" for="relayModalAnthropicMaxTokens">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="anthropicMaxTokens" aria-label="Anthropic 最大输出 Token 说明"><i class="fa fa-info-circle"></i></button>
+            Anthropic 最大输出 Token
+          </label>
+          <input id="relayModalAnthropicMaxTokens" class="input" inputmode="numeric" placeholder="例如：65536（留空用默认值）" />
+        </div>
+        
+        <div class="relay-modal-field hidden" id="relayModalAnthropicThinkingField">
+          <label class="relay-modal-label" for="relayModalAnthropicThinking">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="anthropicThinkingEffort" aria-label="Anthropic 思考强度说明"><i class="fa fa-info-circle"></i></button>
+            Anthropic 思考强度
+          </label>
+          <select id="relayModalAnthropicThinking" class="input adv-select">
+            <option value="low">低</option>
+            <option value="medium" selected>中</option>
+            <option value="high">高</option>
+            <option value="xhigh">极高</option>
+            <option value="max">Max</option>
+          </select>
+        </div>
+        
+        <div class="relay-modal-field relay-modal-field-full hidden" id="relayModalOpenAIExtraParamsField">
+          <label class="relay-modal-label">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="openAIExtraParams" aria-label="OpenAI 额外参数说明"><i class="fa fa-info-circle"></i></button>
+            OpenAI 额外参数 JSON
+          </label>
+          <div class="relay-modal-checkbox-row">
+            <input type="checkbox" id="relayModalOpenAIExtraParamsEnabled" class="relay-modal-checkbox" />
+            <label for="relayModalOpenAIExtraParamsEnabled">启用</label>
+          </div>
+          <textarea id="relayModalOpenAIExtraParamsJSON" class="input relay-modal-json" rows="5" placeholder='{"service_tier": "auto"}' disabled></textarea>
+        </div>
+        
+        <div class="relay-modal-field relay-modal-field-full hidden" id="relayModalAnthropicExtraParamsField">
+          <label class="relay-modal-label">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="anthropicExtraParams" aria-label="Anthropic 额外参数说明"><i class="fa fa-info-circle"></i></button>
+            Anthropic 额外参数 JSON
+          </label>
+          <div class="relay-modal-checkbox-row">
+            <input type="checkbox" id="relayModalAnthropicExtraParamsEnabled" class="relay-modal-checkbox" />
+            <label for="relayModalAnthropicExtraParamsEnabled">启用</label>
+          </div>
+          <textarea id="relayModalAnthropicExtraParamsJSON" class="input relay-modal-json" rows="5" placeholder='{}' disabled></textarea>
+        </div>
+        
+        <div class="relay-modal-field relay-modal-field-full">
+          <label class="relay-modal-label">
+            <button type="button" class="relay-field-hint-btn" data-relay-field="customHeaders" aria-label="自定义请求头说明"><i class="fa fa-info-circle"></i></button>
+            自定义请求头 JSON
+          </label>
+          <div class="relay-modal-checkbox-row">
+            <input type="checkbox" id="relayModalCustomHeadersEnabled" class="relay-modal-checkbox" />
+            <label for="relayModalCustomHeadersEnabled">启用</label>
+          </div>
+          <textarea id="relayModalCustomHeadersJSON" class="input relay-modal-json" rows="5" placeholder='{"X-Custom-Header": "value"}' disabled></textarea>
         </div>
       </div>
 

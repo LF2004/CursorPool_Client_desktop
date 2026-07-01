@@ -85,14 +85,12 @@ function buildPlanInitialPromptContexts(input = {}) {
 }
 
 function buildModeHistoryMetadata(session = {}) {
-  const record = session?.lastTaskSubagentId && typeof session === 'object'
-    ? null
-    : null;
-  void record;
+  const lastTaskId = session?.lastTaskSubagentId || null;
   return {
     mode_contract_id: 'multitask_v1',
     coordinator: 'foreground_parent',
     expected_artifacts: ['task_registry', 'child_tasks', 'task_summaries'],
+    last_task_subagent_id: lastTaskId,
   };
 }
 
@@ -121,6 +119,36 @@ function hasCompletedChildWork(record = {}) {
   return childCount > 0 && summary.length > 80;
 }
 
+function getChildTaskRecords(record = {}, session = {}, helpers = {}) {
+  const childIds = Array.isArray(record?.childTaskIds) ? record.childTaskIds : [];
+  if (!childIds.length) return [];
+  const registrySession = record?.__sessionRef || session || helpers.session || {};
+  const registry = typeof helpers.getSessionTaskRegistry === 'function'
+    ? helpers.getSessionTaskRegistry(registrySession)
+    : null;
+  if (!registry?.subagents || typeof registry.subagents.get !== 'function') return [];
+  return childIds
+    .map((childId) => registry.subagents.get(String(childId || '').trim()))
+    .filter(Boolean);
+}
+
+function isTerminalTaskStatus(status = '') {
+  const normalized = String(status || '').trim().toLowerCase();
+  return normalized === 'completed' || normalized === 'failed';
+}
+
+function hasChildTaskClosure(record = {}, session = {}, helpers = {}) {
+  const childIds = Array.isArray(record?.childTaskIds) ? record.childTaskIds : [];
+  if (!childIds.length) return false;
+  const childRecords = getChildTaskRecords(record, session, helpers);
+  if (childRecords.length !== childIds.length) return false;
+  return childRecords.every((child) => {
+    const status = String(child?.status || '').trim().toLowerCase();
+    const summary = String(child?.summary || child?.resultText || '').trim();
+    return isTerminalTaskStatus(status) && Boolean(summary);
+  });
+}
+
 function textLooksLikeCoordinatorWrapUp(text = '') {
   const finalLower = String(text || '').trim().toLowerCase();
   if (!finalLower) return false;
@@ -134,6 +162,18 @@ function textLooksLikeCoordinatorWrapUp(text = '') {
   );
 }
 
+function buildCoordinatorFinalText(record = {}) {
+  const childCount = Array.isArray(record?.childTaskIds) ? record.childTaskIds.length : 0;
+  const summary = String(record?.summary || record?.resultText || '').trim();
+  const title = String(record?.title || record?.name || 'Multitask coordinator').trim();
+  const lines = [
+    `${title} completed.`,
+    childCount ? `Delegated child tasks: ${childCount}.` : '',
+    summary ? `Summary:\n${summary}` : 'Summary is available in the task card.',
+  ].filter(Boolean);
+  return lines.join('\n\n');
+}
+
 module.exports = {
   MULTITASK_TOOL_NAMES,
   buildToolDefinitionsForChat,
@@ -143,6 +183,23 @@ module.exports = {
   buildModeHistoryMetadata,
   shouldUseNativeExecForTool,
   interceptToolExecution,
+  getPostToolTurnAction(session = {}, executions = [], context = {}, helpers = {}) {
+    const latestTask = helpers.getLatestSessionTaskRecord?.(session);
+    const status = String(latestTask?.status || '').trim().toLowerCase();
+    const childTaskClosure = hasChildTaskClosure(latestTask, session, helpers);
+    const taskExecuted = (Array.isArray(executions) ? executions : []).some((entry) => (
+      String(entry?.toolCall?.name || '').trim().toLowerCase() === 'task'
+      || entry?.execution?.isBackground === true
+    ));
+    if (taskExecuted && status === 'completed' && childTaskClosure) {
+      return {
+        finalText: buildCoordinatorFinalText(latestTask),
+        markCompleted: true,
+      };
+    }
+    void context;
+    return null;
+  },
   shouldForceContinuationToolChoice(session = {}, finalText = '', options = {}, helpers = {}) {
     const latestTask = helpers.getLatestSessionTaskRecord?.(session);
     if (isMissingChildTaskFanout(latestTask)) return true;
@@ -175,6 +232,10 @@ module.exports = {
     const hasPendingTask = status === 'pending' || status === 'in_progress';
     const missingChildTaskFanout = isMissingChildTaskFanout(latestTask);
     const completedChildWork = hasCompletedChildWork(latestTask);
+    const childTaskClosure = hasChildTaskClosure(latestTask, session, helpers);
+    const waitingForChildClosure = Array.isArray(latestTask?.childTaskIds)
+      && latestTask.childTaskIds.length > 0
+      && !childTaskClosure;
     const finalLower = String(finalText || '').trim().toLowerCase();
     const toolCount = Array.isArray(session?.toolResultSummaries) ? session.toolResultSummaries.length : 0;
     const onlyForegroundToolsSoFar = toolCount > 0 && !latestTask;
@@ -188,7 +249,7 @@ module.exports = {
       return false;
     }
     if (
-      (hasPendingTask || onlyForegroundToolsSoFar || missingChildTaskFanout)
+      (hasPendingTask || onlyForegroundToolsSoFar || missingChildTaskFanout || waitingForChildClosure)
       && !toolCalls.length
       && !upstreamError
       && (
@@ -197,11 +258,13 @@ module.exports = {
         || finalLower.includes('started successfully')
         || finalLower.includes('child task')
         || finalLower.includes('coordinator')
+        || finalLower.includes('delegated child tasks')
+        || finalLower.includes('multitask coordinator completed')
         || finalLower.includes('继续')
         || finalLower.includes('checking')
       )
     ) {
-      return continuationCount < 4;
+      return continuationCount < 6;
     }
     void options;
     return false;

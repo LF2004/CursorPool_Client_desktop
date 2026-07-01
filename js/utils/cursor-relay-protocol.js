@@ -40,6 +40,7 @@ const EXEC_SERVER_MESSAGE_FIELDS = {
   22: 'computer_use_args',
   23: 'write_shell_stdin_args',
   27: 'execute_hook_args',
+  28: 'subagent_args',
 };
 
 const EXEC_CLIENT_RESULT_FIELDS = {
@@ -632,6 +633,16 @@ function summarizeExecServerToolArgs(tool, payload) {
       base.path = textField(1);
       base.toolCallId = textField(2);
       break;
+    case 'subagent_args':
+      base.toolCallId = textField(1);
+      base.subagentType = textField(2);
+      base.modelId = textField(3);
+      base.prompt = textField(4);
+      base.readonly = Boolean(getFieldVarint(fields, 5));
+      base.resumeAgentId = textField(6);
+      base.runInBackground = Boolean(getFieldVarint(fields, 7));
+      base.parentConversationId = textField(9);
+      break;
     default:
       base.fields = getFieldNumbers(fields);
       break;
@@ -995,6 +1006,8 @@ function mapAgentModeNumberToName(value) {
       return 'AGENT_MODE_PROJECT';
     case 7:
       return 'AGENT_MODE_MULTITASK';
+    case 8:
+      return 'AGENT_MODE_SUBAGENT';
     default:
       return 'AGENT_MODE_UNSPECIFIED';
   }
@@ -1744,6 +1757,24 @@ function buildAgentExecDiagnosticsFrame(options = {}) {
   return buildAgentExecServerMessageFrame(9, concatBytes([
     encodeOptionalStringField(1, options.path),
     encodeOptionalStringField(2, options.toolCallId),
+  ]), options);
+}
+
+function buildAgentExecSubagentFrame(options = {}) {
+  return buildAgentExecServerMessageFrame(28, concatBytes([
+    encodeOptionalStringField(1, options.toolCallId || options.tool_call_id),
+    encodeOptionalStringField(2, options.subagentType || options.subagent_type),
+    encodeOptionalStringField(3, options.modelId || options.model_id || options.model),
+    encodeOptionalStringField(4, options.prompt),
+    encodeOptionalBoolField(5, options.readonly),
+    encodeOptionalStringField(6, options.resumeAgentId || options.resume_agent_id || options.resume),
+    encodeOptionalBoolField(7, options.runInBackground ?? options.run_in_background),
+    encodeOptionalStringField(9, options.parentConversationId || options.parent_conversation_id),
+    encodeOptionalBoolField(13, options.interrupt),
+    encodeOptionalStringField(15, options.forkAgentId || options.fork_agent_id),
+    encodeOptionalStringField(16, options.rootParentConversationId || options.root_parent_conversation_id),
+    encodeOptionalBoolField(18, options.directMetaParentChildSubagent || options.direct_meta_parent_child_subagent),
+    encodeOptionalStringField(20, options.cloudBaseBranch || options.cloud_base_branch),
   ]), options);
 }
 
@@ -2544,7 +2575,15 @@ function buildStructuredToolCallSnapshot(toolName = '', args = {}, execution = {
         ? { error: { error: String(execution.resultText || 'Task failed').trim() } }
         : {
           success: {
-            conversationSteps: Array.isArray(execution.conversationStepsJson) ? execution.conversationStepsJson : [],
+            conversationSteps: (Array.isArray(execution.conversationStepsJson) ? execution.conversationStepsJson : [])
+              .map((step) => {
+                if (!step || typeof step !== 'object') return null;
+                const assistant = step.assistantMessage || step.assistant_message;
+                const text = String(assistant?.text || '').trim();
+                if (!text) return step;
+                return { assistantMessage: { text } };
+              })
+              .filter(Boolean),
             agentId: String(execution.agentId || '').trim(),
             isBackground: execution.isBackground === true,
             durationMs: Number(execution.durationMs) || 0,
@@ -3253,6 +3292,7 @@ module.exports = {
   buildAgentExecLsFrame,
   buildAgentExecShellStreamFrame,
   buildAgentExecDiagnosticsFrame,
+  buildAgentExecSubagentFrame,
   buildAgentKvSetBlobFrame,
   buildAgentTextDeltaFrame,
   buildAgentThinkingDeltaFrame,

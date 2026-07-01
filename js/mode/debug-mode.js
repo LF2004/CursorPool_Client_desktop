@@ -170,6 +170,7 @@ function buildLocalDebugConclusion(record = {}) {
 
 function textLooksLikeConcreteDebugConclusion(text = '') {
   const finalLower = String(text || '').trim().toLowerCase();
+  const raw = String(text || '').trim();
   if (!finalLower) return false;
   return (
     finalLower.includes('root cause')
@@ -178,9 +179,15 @@ function textLooksLikeConcreteDebugConclusion(text = '') {
     || finalLower.includes('verified')
     || finalLower.includes('resolution')
     || finalLower.includes('fix')
-    || finalLower.includes('null')
-    || finalLower.includes('getcontext')
-    || finalLower.includes('canvas')
+    || finalLower.includes('final')
+    || finalLower.includes('conclusion')
+    || raw.includes('最终')
+    || raw.includes('结论')
+    || raw.includes('调试结论')
+    || raw.includes('无需调试')
+    || raw.includes('不需要调试')
+    || raw.includes('没有发现')
+    || raw.includes('已完成')
   );
 }
 
@@ -192,6 +199,7 @@ function hasCompletedDebugBackgroundTask(executions = []) {
 }
 
 function shouldContinueIncompleteWork(session = {}, finalText = '', toolCalls = [], upstreamError = '', continuationCount = 0, options = {}, helpers = {}) {
+  if (String(finalText || '').trim() && helpers.textLooksLikeExplicitFinalAnswer?.(finalText)) return false;
   const latestTask = helpers.getLatestSessionTaskRecord?.(session);
   const status = String(latestTask?.status || '').trim().toLowerCase();
   const hasPendingDebugTask = status === 'pending' || status === 'in_progress';
@@ -288,29 +296,22 @@ module.exports = {
   },
   shouldRecoverPostToolStream(session = {}, upstreamError = '', finalText = '', toolCalls = [], recoveryCount = 0, helpers = {}) {
     if (Array.isArray(toolCalls) && toolCalls.length) return false;
+    if (upstreamError) return false;
     const latestTask = helpers.getLatestSessionTaskRecord?.(session);
     const missingDebugEvidence = isDebugEvidenceMissing(latestTask);
+    if (
+      String(finalText || '').trim()
+      && helpers.textLooksLikeExplicitFinalAnswer?.(finalText)
+    ) {
+      return false;
+    }
     if (!missingDebugEvidence && helpers.textLooksLikeSubstantiveFinalAnswer?.(finalText) && textLooksLikeConcreteDebugConclusion(finalText)) {
       return false;
     }
     if (!String(finalText || '').trim()) return true;
-    const finalLower = String(finalText || '').trim().toLowerCase();
-    const looksLikeConcreteDebugConclusion = (
-      finalLower.includes('root cause')
-      || finalLower.includes('fix')
-      || finalLower.includes('resolved')
-      || finalLower.includes('canvas')
-      || finalLower.includes('getcontext')
-      || finalLower.includes('debug logs')
-      || finalLower.includes('reproduction')
-    );
-    if (!missingDebugEvidence && looksLikeConcreteDebugConclusion) {
-      return false;
-    }
     if (helpers.textLooksLikeSubstantiveFinalAnswer?.(finalText) && recoveryCount > 0) {
       return false;
     }
-    void upstreamError;
     return true;
   },
   shouldForceContinuationToolChoice(session = {}, finalText = '', options = {}, helpers = {}) {
@@ -348,6 +349,14 @@ module.exports = {
     void options;
   },
   shouldContinueIncompleteWork,
+  hasIncompleteWorkAtEnd(session = {}, finalText = '', toolCalls = [], upstreamError = '', options = {}, helpers = {}) {
+    if (String(finalText || '').trim() && helpers.textLooksLikeExplicitFinalAnswer?.(finalText)) return false;
+    if (String(finalText || '').trim() && textLooksLikeConcreteDebugConclusion(finalText)) return false;
+    if (upstreamError) return false;
+    const latestTask = helpers.getLatestSessionTaskRecord?.(session);
+    if (latestTask && isDebugEvidenceMissing(latestTask)) return true;
+    return false;
+  },
   getUpstreamRequestOptions() {
     return {};
   },

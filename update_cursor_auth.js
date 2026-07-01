@@ -119,6 +119,40 @@ function createStateDbBackupSet(dbPath) {
   return { backupBase, copied };
 }
 
+function cleanupCursorpoolBackupSets(filePath, keepSets = 3) {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  if (!fs.existsSync(dir)) return { removed: 0, kept: 0 };
+  const pattern = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.cursorpool-(.+?)\\.bak(?:-(?:wal|shm))?$`);
+  const groups = new Map();
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const match = entry.name.match(pattern);
+    if (!match) continue;
+    const groupKey = match[1];
+    const fullPath = path.join(dir, entry.name);
+    const stat = fs.statSync(fullPath);
+    const group = groups.get(groupKey) || { key: groupKey, files: [], latestMtimeMs: 0 };
+    group.files.push(fullPath);
+    group.latestMtimeMs = Math.max(group.latestMtimeMs, stat.mtimeMs || 0);
+    groups.set(groupKey, group);
+  }
+  const sorted = Array.from(groups.values()).sort((a, b) => b.latestMtimeMs - a.latestMtimeMs);
+  const keep = Math.max(0, Number(keepSets) || 0);
+  let removed = 0;
+  for (const group of sorted.slice(keep)) {
+    for (const fullPath of group.files) {
+      try {
+        fs.unlinkSync(fullPath);
+        removed += 1;
+      } catch {
+        /* ignore cleanup failures */
+      }
+    }
+  }
+  return { removed, kept: Math.min(sorted.length, keep) };
+}
+
 function restoreStateDbBackupSet(backup) {
   if (!backup?.copied?.length) return;
   for (const item of backup.copied) {
@@ -133,6 +167,30 @@ function createAuthJsonBackup(authPath) {
   const backupPath = `${authPath}.cursorpool-${stamp}.bak`;
   fs.copyFileSync(authPath, backupPath);
   return { authPath, existed: true, backupPath };
+}
+
+function cleanupAuthJsonBackups(authPath, keepFiles = 3) {
+  const dir = path.dirname(authPath);
+  const base = path.basename(authPath);
+  if (!fs.existsSync(dir)) return { removed: 0, kept: 0 };
+  const pattern = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.cursorpool-.+?\\.bak$`);
+  const files = fs.readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && pattern.test(entry.name))
+    .map((entry) => {
+      const fullPath = path.join(dir, entry.name);
+      return { fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs || 0 };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let removed = 0;
+  for (const file of files.slice(Math.max(0, Number(keepFiles) || 0))) {
+    try {
+      fs.unlinkSync(file.fullPath);
+      removed += 1;
+    } catch {
+      /* ignore cleanup failures */
+    }
+  }
+  return { removed, kept: Math.min(files.length, Math.max(0, Number(keepFiles) || 0)) };
 }
 
 function restoreAuthJsonBackup(backup) {
@@ -261,10 +319,17 @@ async function applyCursorAuth(payload) {
     }
   }
 
+  const backupCleanup = cleanupCursorpoolBackupSets(dbPath, 3);
+  const authBackupCleanup = shouldWriteAuthJson
+    ? cleanupAuthJsonBackups(authPath, 3)
+    : { removed: 0, kept: 0 };
+
   return {
     dbPath,
     authPath: shouldWriteAuthJson ? authPath : null,
     backupPath: backup.backupBase,
+    backupCleanup,
+    authBackupCleanup,
     mode: shouldWriteAuthJson ? 'state_vscdb_and_auth_json' : 'state_vscdb_itemtable',
   };
 }

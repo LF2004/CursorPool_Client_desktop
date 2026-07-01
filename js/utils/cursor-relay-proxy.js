@@ -282,7 +282,6 @@ function sanitizeRelayUpstream(upstream = null) {
     baseUrl,
     apiKey,
     modelName,
-    completionModel: String(upstream.completionModel || '').trim(),
     availableModels: Array.isArray(upstream.availableModels)
       ? upstream.availableModels.map((item) => String(item || '').trim()).filter(Boolean)
       : [],
@@ -322,7 +321,6 @@ function relayProfileToUpstream(profile = null) {
     baseUrl,
     apiKey,
     modelName,
-    completionModel: String(profile.completionModel || '').trim(),
     endpointMode: String(profile.endpointMode || 'responses').trim() || 'responses',
     reasoningEffort: String(profile.reasoningEffort || 'medium').trim() || 'medium',
     thinkingMode: String(profile.thinkingMode || '').trim(),
@@ -355,16 +353,21 @@ function buildRelayStartOptionsFromConfig(config = null, overrides = {}) {
   ) || 12)));
   return {
     mode: nextMode,
-    completionModel: String(overrides.completionModel ?? existing.completionModel ?? '').trim(),
     directMitmPort: Number(overrides.directMitmPort ?? existing.directMitmPort) || 0,
     localNativeAgentTools: isLocalRelay ? overrides.localNativeAgentTools !== false : overrides.localNativeAgentTools !== false,
     structuredAgentToolCalls: isLocalRelay ? overrides.structuredAgentToolCalls !== false : overrides.structuredAgentToolCalls !== false,
+    nativeSubagentExec: isLocalRelay
+      ? overrides.nativeSubagentExec !== false && existing.nativeSubagentExec !== false
+      : (overrides.nativeSubagentExec === true || existing.nativeSubagentExec === true),
     emitLocalToolInteractionFrames: isLocalRelay ? overrides.emitLocalToolInteractionFrames !== false : overrides.emitLocalToolInteractionFrames !== false,
     emitLocalStepFrames: isLocalRelay
       ? overrides.emitLocalStepFrames !== false
       : (overrides.emitLocalStepFrames === true || existing.emitLocalStepFrames === true),
     emitSyntheticLocalNativeToolFrames: false,
     maxLocalToolCallsPerRound,
+    runtimeTuning: overrides.runtimeTuning && typeof overrides.runtimeTuning === 'object'
+      ? overrides.runtimeTuning
+      : (existing.runtimeTuning && typeof existing.runtimeTuning === 'object' ? existing.runtimeTuning : {}),
     enableReviewBridge: Object.prototype.hasOwnProperty.call(overrides, 'enableReviewBridge')
       ? overrides.enableReviewBridge === true
       : DEFAULT_ENABLE_REVIEW_BRIDGE,
@@ -973,6 +976,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
     const officialPassthrough = runnerMode === 'official_passthrough';
     const localNativeAgentTools = officialPassthrough ? false : true;
     const structuredAgentToolCalls = officialPassthrough ? false : payload.structuredAgentToolCalls !== false;
+    const nativeSubagentExec = officialPassthrough ? false : payload.nativeSubagentExec !== false;
     if (installCert) {
       certInstallResult = installRelayCaCertificate(undefined, {
         installMachineStore: payload.installMachineCert !== false,
@@ -986,16 +990,17 @@ async function applyCursorRelayProxyConfig(payload = {}) {
       mode: runnerMode,
       ...(upstream ? { upstream } : {}),
       modelRoutes: sanitizeRelayModelRoutes(payload.modelRoutes),
-      completionModel: String(payload.completionModel || upstream?.completionModel || '').trim(),
       port: frontProxyPort,
       forceRestartRunner: payload.forceRestartRunner === true,
       directMitmPort,
       localNativeAgentTools,
       structuredAgentToolCalls,
+      nativeSubagentExec,
       nativeMutationTools: officialPassthrough ? false : payload.nativeMutationTools,
       emitLocalToolInteractionFrames: payload.emitLocalToolInteractionFrames !== false,
       emitSyntheticLocalNativeToolFrames: false,
       maxLocalToolCallsPerRound: payload.maxLocalToolCallsPerRound,
+      runtimeTuning: payload.runtimeTuning,
       enableReviewBridge,
     });
     if (upstream && runnerMode !== 'official_passthrough') {
@@ -1076,7 +1081,7 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   proxyServer = String(payload.proxyServer || runner.proxyServer || '').trim();
   proxyPacUrl = String(payload.proxyPacUrl || '').trim();
   if (!proxyServer && !proxyPacUrl) {
-    await stopLocalRelayRunner({ port: frontProxyPort });
+    await stopLocalRelayRunner({ port: frontProxyPort, fast: true });
     throw new Error('proxyServer or proxyPacUrl is required');
   }
 
@@ -1130,11 +1135,15 @@ async function applyCursorRelayProxyConfig(payload = {}) {
   const cursorSettingsResult = applyCursorHttpProxySettings(proxyServer, {
     disableHttp2,
     proxyStrictSSL,
+    proxySupport: 'on',
+    systemCertificatesV2: true,
   });
   systemProxyResult = useSystemProxy
     ? applyRelaySystemProxy(proxyServer, bypassList, {
       disableHttp2,
       proxyStrictSSL,
+      proxySupport: 'on',
+      systemCertificatesV2: true,
     })
     : {
       settings: cursorSettingsResult,
@@ -1373,8 +1382,20 @@ async function ensureCursorRelayRunner(payload = {}) {
     };
   }
 
-  const upstream = sanitizeRelayUpstream(payload.upstream)
+  let upstream = sanitizeRelayUpstream(payload.upstream)
     || sanitizeRelayUpstream(lastConfig?.upstream);
+
+  // 构建所有模型的路由表，实现无需重启即可切换模型
+  const store = loadRelayProfileStore('');
+  const modelRoutes = buildRelayModelRoutesFromStore(store);
+
+  // 兜底：如果 payload 和 lastConfig 都没有 upstream，从 profile store 的 active profile 拉取
+  if (!upstream) {
+    const activeProfile = store.activeId
+      ? store.configs.find((c) => String(c?.id || '') === store.activeId)
+      : (Array.isArray(store.configs) ? store.configs[0] : null);
+    upstream = relayProfileToUpstream(activeProfile);
+  }
   if (!upstream) {
     throw new Error('Relay runner 未运行，且没有可用于自启动的上游配置。请先选择模型配置并启用 Relay。');
   }
@@ -1384,14 +1405,17 @@ async function ensureCursorRelayRunner(payload = {}) {
     directMitmPort: payload.directMitmPort,
     localNativeAgentTools: payload.localNativeAgentTools,
     structuredAgentToolCalls: payload.structuredAgentToolCalls,
+    nativeSubagentExec: payload.nativeSubagentExec,
     emitLocalToolInteractionFrames: payload.emitLocalToolInteractionFrames,
     emitSyntheticLocalNativeToolFrames: payload.emitSyntheticLocalNativeToolFrames,
     maxLocalToolCallsPerRound: payload.maxLocalToolCallsPerRound,
+    runtimeTuning: payload.runtimeTuning || lastConfig?.runtimeTuning,
     enableReviewBridge: payload.enableReviewBridge,
   });
   const runner = await startLocalRelayRunner({
     upstream,
     port,
+    modelRoutes: sanitizeRelayModelRoutes(modelRoutes),
     forceRestartRunner: payload.forceRestartRunner === true,
     ...startOptions,
   });
@@ -1441,6 +1465,8 @@ async function realignCursorRelayProxyTargets(payload = {}) {
   const cursorSettings = applyCursorHttpProxySettings(proxyServer, {
     disableHttp2: true,
     proxyStrictSSL: false,
+    proxySupport: 'on',
+    systemCertificatesV2: true,
   });
   const refreshed = await readCursorRelayProxyConfig({ lightweight: true });
   return {
@@ -1504,7 +1530,6 @@ async function quickSwitchRelayModel(payload = {}) {
     ? status.runner.upstream
     : null;
   const sameRunnerUpstream = isSameRelayUpstreamConfig(activeRunnerUpstream, upstream);
-  const sameCompletionModel = String(status?.runner?.completionModel || '') === String(profile.completionModel || '');
 
   if (
     relayEnabled
@@ -1513,7 +1538,6 @@ async function quickSwitchRelayModel(payload = {}) {
     && (currentMode === 'local_relay' || !currentMode)
     && currentRunnerModelNames.has(String(profile.modelName || '').trim())
     && sameRunnerUpstream
-    && sameCompletionModel
   ) {
     appendRunnerLog(`[info] quickSwitch hot-switch profileId=${profileId} model=${String(profile.modelName || '')} runnerRestart=0`, '');
     return {
@@ -1531,7 +1555,6 @@ async function quickSwitchRelayModel(payload = {}) {
     const applied = await applyCursorRelayProxyConfig({
       upstream,
       modelRoutes,
-      completionModel: profile.completionModel || upstream.completionModel || '',
       forceRestartRunner: false,
       restartCursor: false,
       reloadCursor: false,
@@ -1540,6 +1563,7 @@ async function quickSwitchRelayModel(payload = {}) {
       mode: 'local_relay',
       localNativeAgentTools: true,
       structuredAgentToolCalls: true,
+      nativeSubagentExec: true,
       emitLocalToolInteractionFrames: true,
       emitLocalStepFrames: true,
       enableReviewBridge: DEFAULT_ENABLE_REVIEW_BRIDGE,
@@ -1561,7 +1585,6 @@ async function quickSwitchRelayModel(payload = {}) {
   const applied = await applyCursorRelayProxyConfig({
     upstream,
     modelRoutes,
-    completionModel: profile.completionModel || upstream.completionModel || '',
     forceRestartRunner: false,
     restartCursor: false,
     reloadCursor: false,
@@ -1574,6 +1597,9 @@ async function quickSwitchRelayModel(payload = {}) {
     structuredAgentToolCalls: switchingFromOfficialPassthrough
       ? true
       : status?.runner?.structuredAgentToolCalls !== false,
+    nativeSubagentExec: switchingFromOfficialPassthrough
+      ? true
+      : status?.runner?.nativeSubagentExec !== false,
     nativeMutationTools: switchingFromOfficialPassthrough
       ? true
       : status?.runner?.nativeMutationTools !== false,
@@ -1645,7 +1671,7 @@ async function disableCursorRelayProxyConfig(payload = {}) {
       extraCaCertPath: getRelayCertStatusReadonly().caCertPath,
     });
     restarted = Boolean(launch?.ok);
-    await stopLocalRelayRunner();
+    await stopLocalRelayRunner({ fast: true });
     runnerStopped = true;
   } else if (payload.fast === true || payload.stopRunner === true || payload.stopRunner !== false) {
     await stopLocalRelayRunner({ fast: stopRunnerFast });

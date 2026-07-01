@@ -11,7 +11,7 @@ const USAGE_VIEW_MODES = {
   detail: 'detail',
 };
 const usageViewState = {
-  mode: USAGE_VIEW_MODES.compact,
+  mode: USAGE_VIEW_MODES.detail,
 };
 
 let usagePollTimer = null;
@@ -137,7 +137,6 @@ function computeCacheStats(summary = {}) {
   const totalTokens = Number(summary.total_tokens) || (inputTokens + outputTokens);
   const billablePrompt = Math.max(0, inputTokens - cachedTokens);
   const cacheHitRate = inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : null;
-  // 本地 Relay Response Cache 统计（从 runner health 端点获取）
   return {
     inputTokens,
     cachedTokens,
@@ -150,13 +149,11 @@ function computeCacheStats(summary = {}) {
 
 function renderCacheSummary(summary = {}) {
   const stats = computeCacheStats(summary);
-  // 仪表盘显示本地 Relay 缓存命中率（更有意义，上游 prompt cache 多为 0）
   const gaugeRate = stats.cacheHitRate;
   const rateText = gaugeRate == null ? '-' : `${formatNumber(gaugeRate, 2)}%`;
   setTextIfChanged($('usageCacheHitRate'), rateText);
   // 上游 Prompt 缓存率（次要显示）
-  const upstreamRateText = stats.cacheHitRate == null ? '-' : `${formatNumber(stats.cacheHitRate, 2)}%`;
-  setTextIfChanged($('usageCacheUpstreamRate'), 'Prompt Cache');
+  setTextIfChanged($('usageCacheUpstreamRate'), '');
   setTextIfChanged($('usageCacheTokenTotal'), formatCompactToken(stats.totalTokens));
   setTextIfChanged($('usageCachePromptTotal'), formatCompactToken(stats.inputTokens));
   setTextIfChanged($('usageCachePromptCached'), formatCompactToken(stats.cachedTokens));
@@ -365,10 +362,7 @@ function buildCacheHelpPopoverHtml() {
   return `
     <div class="usage-popover-title">缓存命中率说明</div>
     <div class="usage-popover-rows">
-      <div class="usage-popover-row"><span>本地缓存命中率</span><span>本地 Relay 命中 ÷ 总查询</span></div>
       <div class="usage-popover-row"><span>上游 Prompt 缓存率</span><span>缓存读取 ÷ Prompt 消耗</span></div>
-      <div class="usage-popover-row"><span>本地命中</span><span>本地 Relay 响应缓存命中次数</span></div>
-      <div class="usage-popover-row"><span>本地请求</span><span>本地 Relay 缓存查询总次数</span></div>
       <div class="usage-popover-row"><span>Token 消耗</span><span>输入 + 输出 Token 总量</span></div>
       <div class="usage-popover-row"><span>Prompt 消耗</span><span>全部 Prompt Token</span></div>
       <div class="usage-popover-row"><span>缓存读取</span><span>上游 API Prompt 缓存命中 Token</span></div>
@@ -387,13 +381,9 @@ function computeRowCacheStatus(row) {
 
 function buildCacheCellHtml(row, { compact = false } = {}) {
   const { cachedInputTokens, hasUpstreamCache, upstreamCacheRate } = computeRowCacheStatus(row);
-  const parts = [];
-  if (hasUpstreamCache) {
-    const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
-    parts.push(`<span class="usage-cache-detail usage-cache-prompt" title="上游 Prompt 缓存读取 ${formatNumber(cachedInputTokens)} tokens"><i class="fa fa-minus-square" aria-hidden="true"></i>${compact ? rateText : `Prompt ${rateText}`}</span>`);
-  }
-  if (!parts.length) return '<span class="usage-muted">-</span>';
-  return `<span class="usage-cache-stack${compact ? ' usage-cache-stack-compact' : ''}">${parts.join('')}</span>`;
+  if (!hasUpstreamCache) return '<span class="usage-muted">-</span>';
+  const rateText = `${formatNumber(upstreamCacheRate, upstreamCacheRate >= 10 ? 0 : 1)}%`;
+  return `<span class="usage-cache-detail usage-cache-prompt" title="上游 Prompt 缓存命中率 ${rateText}，读取 ${formatNumber(cachedInputTokens)} tokens"><i class="fa fa-minus-square" aria-hidden="true"></i>${rateText}</span>`;
 }
 
 function buildCompactCacheTags(row) {
@@ -462,7 +452,6 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
     const phase = String(row.phase || '-');
     const endpointMode = String(row.endpoint_mode || '').trim();
     const modeLabel = formatUsageModeLabel(row.mode);
-    const compactCacheTags = buildCompactCacheTags(row);
     const modelId = String(row.model || '').trim();
     const displayName = String(row.display_name || '').trim();
     const primaryModelText = displayName || modelId || '-';
@@ -475,7 +464,6 @@ function renderRows(rows = [], { preserveScroll = false } = {}) {
           <div class="usage-model${displayName ? '' : ' mono'}" title="${escapeHtml(primaryModelText)}">${escapeHtml(primaryModelText)}</div>
           <div class="usage-model-meta">
             ${showModelIdMeta ? `<span class="usage-muted mono">${escapeHtml(modelId)}</span>` : ''}
-            ${compactCacheTags}
           </div>
         </td>
         <td class="usage-mode-cell"><span class="usage-mode-badge">${escapeHtml(modeLabel)}</span></td>
@@ -615,6 +603,28 @@ export function stopUsagePolling() {
   usageScrollEndTimer = null;
 }
 
+async function populateUsageModelFilter() {
+  const select = $('usageModelFilter');
+  if (!select) return;
+  const models = [];
+  try {
+    if (window.electronBridge?.cursorRelayProfilesLoad) {
+      const store = await window.electronBridge.cursorRelayProfilesLoad();
+      if (Array.isArray(store?.configs)) {
+        for (const c of store.configs) {
+          if (c.modelName && !models.includes(c.modelName)) {
+            models.push(c.modelName);
+          }
+        }
+      }
+    }
+  } catch (_) { /* 静默失败，下拉保持 "全部模型" */ }
+  // 保留当前选中值（如果模型列表中还有）
+  const currentValue = select.value;
+  select.innerHTML = '<option value="">全部模型</option>'
+    + models.map((m) => `<option value="${escapeHtml(m)}"${m === currentValue ? ' selected' : ''}>${escapeHtml(m)}</option>`).join('');
+}
+
 export function bindUsageEvents() {
   attachUsagePopoverHandlers();
   applyUsageViewMode(usageViewState.mode);
@@ -648,7 +658,12 @@ export function bindUsageEvents() {
   if (billingScopeFilter) {
     billingScopeFilter.onchange = () => refreshUsage(1);
   }
-  ['usageDateFrom', 'usageDateTo', 'usageModelFilter', 'usageAccountFilter', 'usageRequestFilter'].forEach((id) => {
+  const modelFilter = $('usageModelFilter');
+  if (modelFilter) {
+    modelFilter.onchange = () => refreshUsage(1);
+    populateUsageModelFilter().catch(() => {});
+  }
+  ['usageDateFrom', 'usageDateTo', 'usageAccountFilter', 'usageRequestFilter'].forEach((id) => {
     const el = $(id);
     if (!el) return;
     el.onkeydown = (event) => {

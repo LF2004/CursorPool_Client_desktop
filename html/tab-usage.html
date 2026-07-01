@@ -6,12 +6,12 @@
       <span class="record-date-arrow"><i class="fa fa-long-arrow-right"></i></span>
       <input type="date" id="usageDateTo" class="input record-date no-drag" title="结束日期" />
     </div>
-    <input type="text" id="usageModelFilter" class="input no-drag usage-filter-input" placeholder="模型" />
+    <select id="usageModelFilter" class="input no-drag usage-filter-input"><option value="">全部模型</option></select>
     <input type="text" id="usageRequestFilter" class="input no-drag usage-filter-input" placeholder="Request ID" />
     <div class="usage-filter-actions">
       <div class="usage-view-toggle" role="tablist" aria-label="调用记录视图">
-        <button type="button" id="usageViewCompactBtn" class="ghost-btn active" data-usage-view="compact" aria-pressed="true">精简</button>
-        <button type="button" id="usageViewDetailBtn" class="ghost-btn" data-usage-view="detail" aria-pressed="false">详情</button>
+        <button type="button" id="usageViewCompactBtn" class="ghost-btn" data-usage-view="compact" aria-pressed="false">精简</button>
+        <button type="button" id="usageViewDetailBtn" class="ghost-btn active" data-usage-view="detail" aria-pressed="true">详情</button>
       </div>
       <button type="button" id="usageRefreshBtn" class="ghost-btn">刷新</button>
       <button type="button" id="usageClearBtn" class="record-btn-danger">清空记录</button>
@@ -33,7 +33,6 @@
             <path id="usageCacheGaugeFill" class="usage-cache-gauge-fill" d="M 10 58 A 50 50 0 0 1 110 58" pathLength="157.08" stroke-dasharray="157.08" stroke-dashoffset="157.08" />
           </svg>
           <strong id="usageCacheHitRate" class="usage-cache-rate">-</strong>
-          <span id="usageCacheUpstreamRate" class="usage-cache-rate-sub">Prompt Cache</span>
         </div>
         <div class="usage-cache-stats">
           <div class="usage-cache-stat usage-cache-stat-sub">

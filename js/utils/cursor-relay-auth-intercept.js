@@ -139,6 +139,15 @@ function isHealthCheckPath(pathname) {
   return HEALTH_CHECK_PATH_KEYWORDS.some((keyword) => lowered.includes(keyword));
 }
 
+function isDiagnosticBypassHost(req) {
+  const host = String(
+    req?.headers?.host
+    || req?.headers?.[':authority']
+    || ''
+  ).trim().toLowerCase();
+  return host === 'marketplace.cursorapi.com' || host === 'prod.authentication.cursor.sh';
+}
+
 function buildCorsHeaders(req, extra = {}) {
   const origin = String(req?.headers?.origin || '').trim();
   return {
@@ -226,6 +235,38 @@ function buildHealthUnaryResponsePayload(payload = 'ok') {
   return encodeStringField(1, payload);
 }
 
+function shouldUseConnectUnaryProtocol(req) {
+  const contentType = String(req?.headers?.['content-type'] || '').toLowerCase();
+  const connectVersion = String(req?.headers?.['connect-protocol-version'] || '').trim();
+  return Boolean(connectVersion) || contentType.includes('application/connect+proto');
+}
+
+function buildUnaryHealthHeaders(req, bodyLength, extra = {}) {
+  const headers = {
+    'Content-Type': 'application/proto',
+    'Content-Length': String(Math.max(0, Number(bodyLength) || 0)),
+    ...buildCorsHeaders(req),
+    ...extra,
+  };
+  if (shouldUseConnectUnaryProtocol(req)) {
+    headers['Connect-Protocol-Version'] = '1';
+  }
+  return headers;
+}
+
+function flushResponse(res) {
+  try {
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (typeof res.flush === 'function') res.flush();
+  } catch {
+    /* ignore */
+  }
+}
+
 function buildStreamingHealthConnectResponse(payload = 'foo', chunkCount = 5, metadata = {}) {
   const frames = [];
   const total = Math.max(1, Number(chunkCount) || 5);
@@ -234,6 +275,20 @@ function buildStreamingHealthConnectResponse(payload = 'foo', chunkCount = 5, me
   }
   frames.push(protocol.buildConnectEndFrame(metadata));
   return Buffer.concat(frames);
+}
+
+async function writeStreamingHealthConnectResponse(res, payload = 'foo', chunkCount = 5, metadata = {}) {
+  const total = Math.max(1, Number(chunkCount) || 5);
+  for (let index = 0; index < total; index += 1) {
+    res.write(buildConnectFrame(buildHealthUnaryResponsePayload(payload)));
+    flushResponse(res);
+    // Cursor 诊断会检测是否逐段到达，必须制造真实的 chunked/streaming 行为。
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => setTimeout(resolve, 35));
+  }
+  res.write(protocol.buildConnectEndFrame(metadata));
+  flushResponse(res);
+  res.end();
 }
 
 function buildBidiPollConnectResponse(payload = 'foo', chunkCount = 5, metadata = {}) {
@@ -348,50 +403,44 @@ async function handleHealthCheckIntercept(req, res, pathname, config, logger) {
       });
       res.end(body);
     } else if (isStreaming) {
-      // Cursor 的网络检测会校验是否拿到了多个有效 chunk，不能只返回 200 + 空 body。
-      const body = buildStreamingHealthConnectResponse(requestPayload || 'foo', 5, {});
       res.writeHead(200, {
         'Content-Type': 'application/connect+proto',
         'Connect-Protocol-Version': '1',
-        'Content-Length': String(body.length),
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'X-Accel-Buffering': 'no',
         ...buildCorsHeaders(req),
       });
-      res.end(body);
+      flushResponse(res);
+      await writeStreamingHealthConnectResponse(res, requestPayload || 'foo', 5, {});
     } else if (pathname === HEALTH_CHECK_ENDPOINTS.SERVER_TIME) {
       // ServerTime 需要返回时间戳
       const body = buildServerTimeConnectResponse();
-      res.writeHead(200, {
-        'Content-Type': 'application/proto',
-        'Content-Length': body.length,
-        ...buildCorsHeaders(req),
-      });
+      res.writeHead(200, buildUnaryHealthHeaders(req, body.length));
       res.end(body);
     } else if (pathname === HEALTH_CHECK_ENDPOINTS.PING || pathname === HEALTH_CHECK_ENDPOINTS.UNARY || pathname === HEALTH_CHECK_ENDPOINTS.AGENT_PING) {
       const body = buildHealthUnaryResponsePayload(requestPayload || 'ping');
-      res.writeHead(200, {
-        'Content-Type': 'application/proto',
-        'Content-Length': String(body.length),
-        ...buildCorsHeaders(req),
-      });
+      res.writeHead(200, buildUnaryHealthHeaders(req, body.length));
       res.end(body);
     } else if (
       pathname === HEALTH_CHECK_ENDPOINTS.FILESYNC_ENABLED
       || pathname === HEALTH_CHECK_ENDPOINTS.NETWORK_IS_CONNECTED
     ) {
       const body = Buffer.alloc(0);
-      res.writeHead(200, {
-        'Content-Type': 'application/proto',
-        'Content-Length': String(body.length),
-        ...buildCorsHeaders(req),
-      });
+      res.writeHead(200, buildUnaryHealthHeaders(req, body.length));
       res.end(body);
     } else {
       // 其他 unary 调用：返回空 protobuf（所有字段默认值）
-      res.writeHead(200, {
-        'Content-Type': isProtoResponsePath(pathname) ? 'application/proto' : 'application/json',
-        ...buildCorsHeaders(req),
-      });
-      res.end(isProtoResponsePath(pathname) ? buildUsageLimitConnectResponse() : '{}');
+      const isProto = isProtoResponsePath(pathname);
+      const body = isProto ? buildUsageLimitConnectResponse() : '{}';
+      const length = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body));
+      res.writeHead(200, isProto
+        ? buildUnaryHealthHeaders(req, length)
+        : {
+          'Content-Type': 'application/json',
+          'Content-Length': String(length),
+          ...buildCorsHeaders(req),
+        });
+      res.end(body);
     }
 
     logger.info(`health-intercept: ${pathname} returned fake response`);
@@ -400,6 +449,27 @@ async function handleHealthCheckIntercept(req, res, pathname, config, logger) {
     logger.error(`health-intercept error for ${pathname}: ${e.message}`);
     return false;
   }
+}
+
+function handleDiagnosticHostIntercept(req, res, pathname, logger) {
+  if (!isDiagnosticBypassHost(req)) return false;
+  const method = String(req?.method || 'GET').toUpperCase();
+  if (method === 'OPTIONS') {
+    res.writeHead(204, buildCorsHeaders(req));
+    res.end();
+    logger.info(`diag-host-intercept: ${method} ${pathname} returned preflight response`);
+    return true;
+  }
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  res.writeHead(200, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Content-Length': '0',
+    'Cache-Control': 'no-store',
+    ...buildCorsHeaders(req),
+  });
+  res.end();
+  logger.info(`diag-host-intercept: ${method} ${pathname} returned synthetic 200`);
+  return true;
 }
 
 // ── 伪造响应构建 ─────────────────────────────────────────
@@ -506,6 +576,7 @@ function buildFakeOauthTokenResponse(account = null) {
 function handleAuthIntercept(req, res, pathname, config, logger) {
   // 先检查健康检查/指标上报端点（Connect RPC）
   if (isHealthCheckPath(pathname)) return handleHealthCheckIntercept(req, res, pathname, config, logger);
+  if (handleDiagnosticHostIntercept(req, res, pathname, logger)) return true;
   if (String(req?.method || '').toUpperCase() === 'OPTIONS' && (isAuthEndpoint(pathname) || isAuthRelatedPath(pathname))) {
     res.writeHead(204, buildCorsHeaders(req));
     res.end();

@@ -9,8 +9,10 @@ const RUNNER_CONFIG_PATH = path.join(os.homedir(), '.cursorpool', 'relay', 'runn
 const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const CURSOR_PROXY_KEYS = [
   'http.proxy',
+  'http.proxyKerberosServicePrincipal',
   'http.proxySupport',
   'http.proxyStrictSSL',
+  'http.experimental.systemCertificatesV2',
   'cursor.general.disableHttp2',
 ];
 
@@ -296,9 +298,10 @@ function applyCursorHttpProxySettings(proxyServer, options = {}) {
   if (!proxyUrl) {
     return { ok: false, message: 'Missing proxy server' };
   }
-  const proxySupport = String(options.proxySupport || 'override').trim() || 'override';
+  const proxySupport = String(options.proxySupport || 'on').trim() || 'on';
   const proxyStrictSSL = options.proxyStrictSSL === true;
   const disableHttp2 = options.disableHttp2 !== false;
+  const systemCertificatesV2 = options.systemCertificatesV2 !== false;
 
   const { settingsPath, exists, data, parseError } = readCursorSettings();
   const backup = readBackup() || {};
@@ -314,8 +317,10 @@ function applyCursorHttpProxySettings(proxyServer, options = {}) {
 
   const next = { ...data };
   next['http.proxy'] = proxyUrl;
+  next['http.proxyKerberosServicePrincipal'] = proxyUrl;
   next['http.proxySupport'] = proxySupport;
   next['http.proxyStrictSSL'] = proxyStrictSSL;
+  next['http.experimental.systemCertificatesV2'] = systemCertificatesV2;
   next['cursor.general.disableHttp2'] = disableHttp2;
   writeCursorSettings(next);
 
@@ -327,6 +332,7 @@ function applyCursorHttpProxySettings(proxyServer, options = {}) {
     httpProxy: proxyUrl,
     proxySupport,
     proxyStrictSSL,
+    systemCertificatesV2,
     disableHttp2,
   };
 }
@@ -401,7 +407,9 @@ function readRelayProxyState(options = {}) {
       path: cursorSettings.settingsPath,
       httpProxy: String(cursorSettings.data['http.proxy'] || '').trim(),
       proxySupport: String(cursorSettings.data['http.proxySupport'] || '').trim(),
+      proxyKerberosServicePrincipal: String(cursorSettings.data['http.proxyKerberosServicePrincipal'] || '').trim(),
       proxyStrictSSL: cursorSettings.data['http.proxyStrictSSL'],
+      systemCertificatesV2: cursorSettings.data['http.experimental.systemCertificatesV2'],
       disableHttp2: cursorSettings.data['cursor.general.disableHttp2'],
     },
     windows,

@@ -4,10 +4,13 @@ const tls = require('tls');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFileSync } = require('child_process');
 const { Readable } = require('stream');
 const { normalizeProxyUrl, resolveRelayOutboundProxy } = require('./cursor-relay-system-proxy');
 
 let relayCaCache = { path: '', pem: '' };
+let extraCaCache = { key: '', ca: null };
+let windowsRootCaCache = { loadedAt: 0, pem: '' };
 
 function normalizeHeaders(headers = {}) {
   const out = {};
@@ -76,6 +79,101 @@ function readRelayCaForProxy(proxy) {
   }
 }
 
+function normalizeCaPem(pem = '') {
+  const text = String(pem || '').trim();
+  if (!text.includes('-----BEGIN CERTIFICATE-----')) return '';
+  return `${text}\n`;
+}
+
+function readPemFile(filePath = '') {
+  const resolved = String(filePath || '').trim();
+  if (!resolved) return '';
+  try {
+    return normalizeCaPem(fs.readFileSync(resolved, 'utf8'));
+  } catch {
+    return '';
+  }
+}
+
+function readExtraCaFromEnv() {
+  const paths = [
+    process.env.CURSOR_RELAY_OUTBOUND_CA_CERT,
+    process.env.NODE_EXTRA_CA_CERTS,
+    process.env.SSL_CERT_FILE,
+  ]
+    .map((item) => String(item || '').trim())
+    .filter((item, index, list) => item && list.indexOf(item) === index);
+  return paths.map(readPemFile).filter(Boolean).join('');
+}
+
+function readWindowsRootCaBundle() {
+  if (process.platform !== 'win32') return '';
+  const now = Date.now();
+  if (windowsRootCaCache.pem && now - windowsRootCaCache.loadedAt < 24 * 60 * 60 * 1000) {
+    return windowsRootCaCache.pem;
+  }
+  try {
+    const script = [
+      "$stores=@('Cert:\\CurrentUser\\Root','Cert:\\LocalMachine\\Root');",
+      'foreach($store in $stores){',
+      '  Get-ChildItem $store -ErrorAction SilentlyContinue | ForEach-Object {',
+      "    '-----BEGIN CERTIFICATE-----';",
+      "    [Convert]::ToBase64String($_.RawData,'InsertLineBreaks');",
+      "    '-----END CERTIFICATE-----';",
+      "    '';",
+      '  }',
+      '}',
+    ].join('');
+    const pem = normalizeCaPem(execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { encoding: 'utf8', windowsHide: true, timeout: 15000, maxBuffer: 16 * 1024 * 1024 },
+    ));
+    const cachePath = path.join(os.homedir(), '.cursorpool', 'relay', 'windows-root-ca-bundle.pem');
+    try {
+      fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+      fs.writeFileSync(cachePath, pem, 'utf8');
+    } catch {
+      /* ignore cache write errors */
+    }
+    windowsRootCaCache = { loadedAt: now, pem };
+    return pem;
+  } catch {
+    const cachePath = path.join(os.homedir(), '.cursorpool', 'relay', 'windows-root-ca-bundle.pem');
+    const cached = readPemFile(cachePath);
+    if (cached) {
+      windowsRootCaCache = { loadedAt: now, pem: cached };
+      return cached;
+    }
+    windowsRootCaCache = { loadedAt: now, pem: '' };
+    return '';
+  }
+}
+
+function buildCaBundle(proxy, tlsOptions = {}) {
+  const explicitCaPath = String(tlsOptions.caCertPath || tlsOptions.caPath || '').trim();
+  const key = JSON.stringify({
+    proxyHost: String(proxy?.hostname || '').toLowerCase(),
+    explicitCaPath,
+    envCa: [
+      process.env.CURSOR_RELAY_OUTBOUND_CA_CERT,
+      process.env.NODE_EXTRA_CA_CERTS,
+      process.env.SSL_CERT_FILE,
+    ].map((item) => String(item || '').trim()).join('|'),
+  });
+  if (extraCaCache.key === key && extraCaCache.ca) return extraCaCache.ca;
+
+  const ca = []
+    .concat(tls.rootCertificates || [])
+    .concat(readWindowsRootCaBundle() || [])
+    .concat(readExtraCaFromEnv() || [])
+    .concat(readPemFile(explicitCaPath) || [])
+    .concat(readRelayCaForProxy(proxy) || [])
+    .filter(Boolean);
+  extraCaCache = { key, ca };
+  return ca.length ? ca : undefined;
+}
+
 function createNodeResponse(res, url) {
   const status = res.statusCode || 0;
   const headers = headersFromNode(res.headers);
@@ -135,7 +233,7 @@ function requestHttpViaProxy(target, proxy, options, signal) {
   });
 }
 
-function requestHttpsViaProxy(target, proxy, options, signal) {
+function requestHttpsViaProxy(target, proxy, options, signal, tlsOptions = {}) {
   return new Promise((resolve, reject) => {
     const targetPort = Number(target.port) || 443;
     const proxyTransport = proxy.protocol === 'https:' ? https : http;
@@ -184,7 +282,7 @@ function requestHttpsViaProxy(target, proxy, options, signal) {
         socket,
         servername: target.hostname,
         ALPNProtocols: ['http/1.1'],
-        ca: readRelayCaForProxy(proxy) || undefined,
+        ca: buildCaBundle(proxy, tlsOptions),
       }, () => {
         const headers = normalizeHeaders(options.headers);
         if (!Object.keys(headers).some((key) => key.toLowerCase() === 'host')) {
@@ -208,7 +306,7 @@ function requestHttpsViaProxy(target, proxy, options, signal) {
   });
 }
 
-async function fetchViaHttpProxy(url, options = {}, proxyUrl = '') {
+async function fetchViaHttpProxy(url, options = {}, proxyUrl = '', tlsOptions = {}) {
   const target = new URL(String(url || ''));
   const normalizedProxy = normalizeProxyUrl(proxyUrl);
   if (!normalizedProxy || shouldBypassProxy(target)) return fetch(url, options);
@@ -217,7 +315,7 @@ async function fetchViaHttpProxy(url, options = {}, proxyUrl = '') {
     throw new Error(`Unsupported outbound proxy protocol: ${proxy.protocol}`);
   }
   if (target.protocol === 'http:') return requestHttpViaProxy(target, proxy, options, options.signal);
-  if (target.protocol === 'https:') return requestHttpsViaProxy(target, proxy, options, options.signal);
+  if (target.protocol === 'https:') return requestHttpsViaProxy(target, proxy, options, options.signal, tlsOptions);
   return fetch(url, options);
 }
 
@@ -226,9 +324,12 @@ function createProxyAwareFetch(proxyConfig = null, options = {}) {
     ? proxyConfig
     : resolveRelayOutboundProxy(options);
   const proxyUrl = resolved?.enabled ? String(resolved.url || '').trim() : '';
+  const tlsOptions = {
+    caCertPath: resolved?.caCertPath || options.caCertPath || '',
+  };
   const proxyFetch = async (url, fetchOptions = {}) => {
     if (!proxyUrl) return fetch(url, fetchOptions);
-    return fetchViaHttpProxy(url, fetchOptions, proxyUrl);
+    return fetchViaHttpProxy(url, fetchOptions, proxyUrl, tlsOptions);
   };
   proxyFetch.proxy = resolved || { enabled: false, url: '', source: 'none' };
   return proxyFetch;

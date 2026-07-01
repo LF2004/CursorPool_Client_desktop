@@ -344,7 +344,7 @@ function saveRelayProfileStore(store = {}, customRoot = '') {
         base_url: item.baseUrl,
         api_key: item.apiKey,
         model_name: item.modelName,
-        completion_model: item.completionModel,
+        completion_model: item.completionModel || '',
         endpoint_mode: item.endpointMode,
         reasoning_effort: item.reasoningEffort,
         thinking_mode: item.thinkingMode,
