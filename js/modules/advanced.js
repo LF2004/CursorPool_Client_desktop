@@ -587,13 +587,16 @@ export function bindAdvancedEvents(_opts = {}) {
       document.querySelectorAll('.adv-subtab').forEach((b) => b.classList.toggle('active', b === btn));
       const pref = $('advPanelPrefs');
       const proxy = $('advPanelProxy');
+      const runtime = $('advPanelRuntime');
       const ab = $('advPanelAbout');
       if (pref) pref.classList.toggle('hidden', tab !== 'prefs');
       if (proxy) proxy.classList.toggle('hidden', tab !== 'proxy');
+      if (runtime) runtime.classList.toggle('hidden', tab !== 'runtime');
       if (ab) ab.classList.toggle('hidden', tab !== 'about');
       const activePanel =
         tab === 'prefs' ? pref :
         tab === 'proxy' ? proxy :
+        tab === 'runtime' ? runtime :
         ab;
       if (activePanel) {
         animateSubpanel(activePanel);
@@ -609,6 +612,9 @@ export function bindAdvancedEvents(_opts = {}) {
         void refreshReviewBridgeStatus(false);
       }
       if (tab === 'proxy') {
+        refreshProxyStatus().catch(() => {});
+      }
+      if (tab === 'runtime') {
         refreshProxyStatus().catch(() => {});
       }
     };

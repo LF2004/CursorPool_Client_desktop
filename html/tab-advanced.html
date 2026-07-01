@@ -1,6 +1,7 @@
 <div id="advanced" class="panel advanced-panel">
   <div class="adv-subtab-bar">
     <button type="button" class="adv-subtab active" data-adv-tab="proxy"><i class="fa fa-plug"></i> 本地代理</button>
+    <button type="button" class="adv-subtab" data-adv-tab="runtime"><i class="fa fa-sliders"></i> 运行调优</button>
     <button type="button" class="adv-subtab" data-adv-tab="prefs"><i class="fa fa-wrench"></i> 偏好设置</button>
     <button type="button" class="adv-subtab" data-adv-tab="about"><i class="fa fa-info-circle"></i> 关于</button>
   </div>
@@ -267,6 +268,120 @@
         </button>
         <button type="button" id="relayOfficialCaptureBtn" class="ghost-btn">
           <i class="fa fa-exchange"></i> 记录官方 Agent 流量
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="advPanelRuntime" class="adv-subpanel hidden">
+    <div class="adv-pref-block relay-runtime-block">
+      <h3 class="adv-section-title"><i class="fa fa-sliders"></i> 运行调优</h3>
+      <p id="relayRuntimeTuningHintTop" class="adv-hint">全局 Relay 运行调优。所有模型共用，只调整等待、续跑与本地回显节奏，不改动模式逻辑。</p>
+
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTuneUpstreamFetchTimeoutMs">上游请求总超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTuneUpstreamFetchTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="300000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTuneUpstreamStreamIdleTimeoutMs">首轮流空闲超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTuneUpstreamStreamIdleTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="90000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTunePostToolUpstreamTimeoutMs">工具后总等待上限</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTunePostToolUpstreamTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="300000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTunePostToolStreamIdleTimeoutMs">工具后续跑空闲超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTunePostToolStreamIdleTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="90000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTunePostToolMutationStreamIdleTimeoutMs">修改后续跑空闲超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTunePostToolMutationStreamIdleTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="45000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTunePostToolNoVisibleProgressTimeoutMs">工具后无可见进展超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTunePostToolNoVisibleProgressTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="25000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTunePostMutationSummaryTimeoutMs">修改总结总超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTunePostMutationSummaryTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="12000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTunePostMutationSummaryIdleTimeoutMs">修改总结空闲超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTunePostMutationSummaryIdleTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="4500" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTuneMutationToolStreamIdleTimeoutMs">修改工具流空闲超时</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTuneMutationToolStreamIdleTimeoutMs" class="input flex-1" inputmode="numeric" placeholder="45000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTuneMutationToolStreamMaxDurationMs">修改工具流最大时长</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTuneMutationToolStreamMaxDurationMs" class="input flex-1" inputmode="numeric" placeholder="80000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTuneDeepseekReasoningOnlyStreamMaxMs">仅思考等待上限</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTuneDeepseekReasoningOnlyStreamMaxMs" class="input flex-1" inputmode="numeric" placeholder="12000" />
+          <span class="adv-kv-value">ms</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTuneMaxIncompletePostMutationContinuations">修改后自动续跑次数</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTuneMaxIncompletePostMutationContinuations" class="input flex-1" inputmode="numeric" placeholder="3" />
+          <span class="adv-kv-value">次</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <label class="adv-label-inline" for="relayTuneMaxReadOnlyExplorationContinuations">只读探索续跑次数</label>
+        <div class="adv-input-with-btn">
+          <input id="relayTuneMaxReadOnlyExplorationContinuations" class="input flex-1" inputmode="numeric" placeholder="2" />
+          <span class="adv-kv-value">次</span>
+        </div>
+      </div>
+      <div class="adv-form-row">
+        <span class="adv-label-inline">Edit 空卡片占位</span>
+        <div class="relay-modal-checkbox-row">
+          <input type="checkbox" id="relayTuneEmitEditToolPlaceholderFrames" class="relay-modal-checkbox" />
+          <label for="relayTuneEmitEditToolPlaceholderFrames">提前显示 edit 占位卡片</label>
+        </div>
+      </div>
+      <div class="adv-actions-row">
+        <button type="button" id="relayRuntimeTuningSaveBtn" class="primary-btn">
+          <i class="fa fa-save"></i> 保存调优
+        </button>
+        <button type="button" id="relayRuntimeTuningResetBtn" class="ghost-btn">
+          <i class="fa fa-undo"></i> 恢复默认
         </button>
       </div>
     </div>

@@ -65,7 +65,9 @@ const {
   appendHistoryItem: appendAgentHistoryItem,
   completeTurn: completeAgentHistoryTurn,
   mergeConversationMetadata: mergeAgentHistoryMetadata,
+  pruneStructuredStatePromptContexts: pruneAgentHistoryStructuredStatePromptContexts,
   updateConversationState: updateAgentHistoryConversationState,
+  updateConversationWorkspaceRoot: updateAgentHistoryWorkspaceRoot,
   updateUsage: updateAgentHistoryUsage,
 } = require('./cursor-relay-agent-history');
 const {
@@ -192,6 +194,7 @@ const MAX_EDIT_STREAM_CONTENT_CHARS = 1400;
 const EXEC_CLIENT_WAIT_TIMEOUT_MS = 8000;
 const RECENT_EXECUTION_WORKSPACE_PATH = path.join(process.env.USERPROFILE || process.cwd(), '.cursorpool', 'relay', 'recent-execution-workspace.json');
 const DEFAULT_RELAY_SCAN_IGNORE = Object.freeze(['node_modules', '.git', 'dist', 'build']);
+const LAUNCHER_PID = Number(process.env.CURSOR_RELAY_LAUNCHER_PID || 0);
 
 const { appendRunnerLog, initRunnerLogs } = require('./cursor-relay-log');
 const { createProxyAwareFetch } = require('./proxy-aware-fetch');
@@ -1708,6 +1711,32 @@ function getSessionWorkspaceRoot(session = {}) {
   return cwdRoot || process.cwd();
 }
 
+function syncSessionWorkspaceRoot(session = {}, workspaceRoot = '', logger = null, source = '') {
+  const normalized = normalizeWorkspaceRoot(workspaceRoot || '');
+  if (!normalized || isUntrustedWorkspaceRoot(normalized)) return '';
+  const previous = normalizeWorkspaceRoot(session.workspaceRoot || session.lastUserMessageCapture?.workspaceRoot || '');
+  const workspaceChanged = Boolean(previous && previous !== normalized);
+  const foreignPlanState = isPlanStateLikelyForeignToWorkspace(getLatestSessionPlanState(session), normalized);
+  session.workspaceRoot = normalized;
+  if (session.lastUserMessageCapture && typeof session.lastUserMessageCapture === 'object') {
+    session.lastUserMessageCapture.workspaceRoot = normalized;
+  }
+  writeRecentWorkspaceRoot(normalized, logger, source || 'session_sync');
+  if (session.agentHistory?.conversation) {
+    try {
+      updateAgentHistoryWorkspaceRoot(session.agentHistory.conversation, normalized);
+    } catch (error) {
+      logger?.warn?.(`agent local relay failed to sync history workspace root source=${source || '-'} root=${JSON.stringify(normalized)} error=${error.message}`);
+    }
+  }
+  if (workspaceChanged || foreignPlanState) {
+    pruneForeignStructuredPlanContexts(session, normalized, logger, source || 'workspace_sync');
+    clearSessionPlanPresentationState(session, { clearTodos: true });
+    logger?.info?.(`agent local relay corrected workspace root source=${source || '-'} previous=${JSON.stringify(previous)} next=${JSON.stringify(normalized)} clearedPlan=${foreignPlanState ? '1' : '0'}`);
+  }
+  return normalized;
+}
+
 function resolveWorkspacePath(inputPath, session = {}) {
   const raw = normalizeWorkspacePath(inputPath);
   const workspaceRoot = getSessionWorkspaceRoot(session);
@@ -2352,16 +2381,17 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
     `agent local relay run_request embedded action requestId=${decoded?.requestId || '-'} actionKind=${actionKind} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'}`
   );
   if (isStartPlan) {
+    const fallbackPlanState = getWorkspaceBoundPlanState(session) || {};
     ensureOpenSessionHistoryTurn(session, config, {
       includeUserMessage: false,
       includeRequestContext: false,
       includeModePromptContexts: false,
     });
     const planState = {
-      plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
-      plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
-      plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
-      todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+      plan: String(action.plan || action.userText || fallbackPlanState.plan || '').trim(),
+      plan_text: String(action.plan || action.userText || fallbackPlanState.plan_text || '').trim(),
+      plan_uri: String(action.planFileUri || fallbackPlanState.plan_uri || '').trim(),
+      todos: Array.isArray(fallbackPlanState.todos) ? fallbackPlanState.todos : [],
     };
     rememberSessionPlanState(session, planState);
     updatePlanWorkflowForConversationAction(session, actionKind, action);
@@ -2381,11 +2411,12 @@ function maybeHandleRunRequestConversationAction(session, decoded, config, logge
     ack();
     return true;
   }
+  const fallbackPlanState = getWorkspaceBoundPlanState(session) || {};
   const planState = {
-    plan: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan || '').trim(),
-    plan_text: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan_text || '').trim(),
-    plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
-    todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+    plan: String(action.planFileContent || action.plan || fallbackPlanState.plan || '').trim(),
+    plan_text: String(action.planFileContent || action.plan || fallbackPlanState.plan_text || '').trim(),
+    plan_uri: String(action.planFileUri || fallbackPlanState.plan_uri || '').trim(),
+    todos: Array.isArray(fallbackPlanState.todos) ? fallbackPlanState.todos : [],
   };
   rememberSessionPlanState(session, planState);
   updatePlanWorkflowForConversationAction(session, actionKind, action);
@@ -2538,10 +2569,16 @@ function shouldKeepWaitingForInteractionResponse(pendingInteraction = {}, intera
   if (pendingKind !== 'ask_question' || responseKind !== 'ask_question_interaction_response') return false;
   const status = getAskQuestionResponseStatus(interactionResponse);
   const hasResolution = hasAskQuestionResponseResolution(interactionResponse);
-  if (status === 'success' || hasResolution) return false;
+  const answers = Array.isArray(interactionResponse?.askQuestion?.answers) ? interactionResponse.askQuestion.answers : [];
+  const hasConcreteAnswer = answers.some((answer) => {
+    if (!answer || typeof answer !== 'object') return false;
+    if (Array.isArray(answer.selectedOptionIds) && answer.selectedOptionIds.length > 0) return true;
+    return String(answer.freeformText || '').trim().length > 0;
+  });
+  if (status === 'success' && (hasResolution || hasConcreteAnswer)) return false;
   if (status === 'rejected') return false;
   if (status === 'error') return false;
-  return false;
+  return true;
 }
 
 function shouldIgnoreStaleInteractionResponseDuringExecutePlan(session = {}, interactionResponse = {}, pendingInteraction = null) {
@@ -2845,6 +2882,30 @@ function startAgentHeartbeat(session) {
   }, AGENT_HEARTBEAT_INTERVAL_MS);
 }
 
+function isLauncherProcessAlive() {
+  if (!LAUNCHER_PID || LAUNCHER_PID === process.pid) return true;
+  try {
+    process.kill(LAUNCHER_PID, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function startLauncherWatchdog(shutdown) {
+  if (!LAUNCHER_PID) return null;
+  const interval = setInterval(() => {
+    if (isLauncherProcessAlive()) return;
+    try {
+      shutdown?.('launcher_exit');
+    } catch {
+      /* ignore */
+    }
+  }, 5000);
+  interval.unref?.();
+  return interval;
+}
+
 function startInitialVisibleProgressTimer(session, logger, requestId = '') {
   const delayMs = INITIAL_VISIBLE_PROGRESS_MS;
   if (delayMs <= 0 || !session?.active) return null;
@@ -2856,6 +2917,42 @@ function startInitialVisibleProgressTimer(session, logger, requestId = '') {
   }, delayMs);
 }
 
+function startPlanningProgressTimer(session, logger, phase = 'planning_next_moves') {
+  if (!session?.active) return null;
+  clearPlanningProgressTimer(session);
+  const messages = [
+    '正在分析刚刚的工具结果，准备下一步操作...\n\n',
+    '正在整理修改影响范围，并决定是否继续调用工具...\n\n',
+    '正在验证当前修改结果，确认是否可以收尾...\n\n',
+  ];
+  const emitStepFrames = shouldEmitLocalStepFrames(session?.config || {});
+  const planningStepId = emitStepFrames
+    ? (session.nextStepId = (Number(session.nextStepId) || 0) + 1)
+    : 0;
+  session.activePlanningProgress = {
+    phase,
+    startedAt: Date.now(),
+    stepId: planningStepId,
+  };
+  if (planningStepId) {
+    writeAgentFrame(session, buildAgentStepStartedFrame(planningStepId));
+  }
+  let index = 0;
+  const emit = () => {
+    if (!session?.active || session.aborted || session.turnEnded) return;
+    if (session.toolCallsInFlight && session.toolCallsInFlight > 0) return;
+    const text = messages[Math.min(index, messages.length - 1)];
+    logger?.info?.(`agent local relay planning progress emitted requestId=${session.requestId || '-'} phase=${phase} index=${index + 1}`);
+    writeAgentTextFrame(session, text, { tokenDelta: true });
+    index += 1;
+    if (index < messages.length) {
+      session.planningProgressTimer = setTimeout(emit, 6000);
+    }
+  };
+  session.planningProgressTimer = setTimeout(emit, 9000);
+  return session.planningProgressTimer;
+}
+
 function clearTimer(timer) {
   if (!timer) return;
   try {
@@ -2865,9 +2962,33 @@ function clearTimer(timer) {
   }
 }
 
+function clearPlanningProgressTimer(session = {}) {
+  const planningState = session?.activePlanningProgress || null;
+  if (session?.planningProgressTimer) {
+    clearTimer(session.planningProgressTimer);
+    session.planningProgressTimer = null;
+  }
+  if (!planningState) return;
+  if (planningState?.stepId && session?.active && !session.aborted) {
+    writeAgentFrame(
+      session,
+      buildAgentStepCompletedFrame(
+        planningState.stepId,
+        Math.max(0, Date.now() - (Number(planningState.startedAt) || Date.now())),
+      ),
+    );
+  }
+  session.activePlanningProgress = null;
+}
+
 function beginInterceptedAgentSession(session, logger, options = {}) {
-  if (!session?.active || session.intercepted) return;
+  if (!session?.active || session.intercepted) return false;
+  if (!session.res || typeof session.res.writeHead !== 'function') {
+    logger?.warn?.(`agent local relay skipped intercepted session bootstrap requestId=${session?.requestId || '-'} reason=no_response`);
+    return false;
+  }
   session.intercepted = true;
+  clearPlanningProgressTimer(session);
   try {
     if (typeof session.res?.socket?.setNoDelay === 'function') session.res.socket.setNoDelay(true);
     if (typeof session.res?.socket?.setKeepAlive === 'function') session.res.socket.setKeepAlive(true, 1000);
@@ -2885,6 +3006,7 @@ function beginInterceptedAgentSession(session, logger, options = {}) {
     sendAgentRunSseBootstrap(session, logger);
   }
   startAgentHeartbeat(session);
+  return true;
 }
 
 function replayAgentGeneratedChunks(session, chunks = [], logger = null) {
@@ -2970,6 +3092,7 @@ function abortAgentSession(session, logger, reason = 'aborted') {
   session.streamDetached = false;
   session.awaitingRunsseRebind = false;
   session.deferredInteractionResponse = null;
+  clearPlanningProgressTimer(session);
   clearInterval(session.heartbeat);
   session.heartbeat = null;
   const clearedPendingInteractions = clearPendingInteractionEntriesForSession(session);
@@ -3071,8 +3194,8 @@ function drainQueuedAgentMessage(session, config, logger, stats, reason = 'turn_
   if (!next?.userText) return false;
   session.agentMode = normalizeAgentModeName(next.capture?.mode || session.agentMode || 'AGENT_MODE_AGENT');
   session.lastUserMessageCapture = next.capture || session.lastUserMessageCapture || null;
-  session.workspaceRoot = normalizeWorkspacePath(next.workspaceRoot || next.capture?.workspaceRoot || session.workspaceRoot || '');
-  beginInterceptedAgentSession(session, logger);
+  syncSessionWorkspaceRoot(session, next.workspaceRoot || next.capture?.workspaceRoot || session.workspaceRoot || '', logger, `drain_queue:${reason}`);
+  if (!beginInterceptedAgentSession(session, logger)) return false;
   logger?.info?.(
     `agent local relay draining queued message requestId=${session.requestId || '-'} reason=${reason} remaining=${queue.length} workspaceRoot=${JSON.stringify(session.workspaceRoot || '')}`
   );
@@ -3114,12 +3237,31 @@ function detachActiveRelaySession(session, logger, reason = 'runsse_closed') {
   clearInterval(session.heartbeat);
   session.heartbeat = null;
   session.streamDetached = true;
+  session.awaitingRunsseRebind = true;
   session.intercepted = false;
   session.req = null;
   session.res = null;
   session.detachedAt = Date.now();
   logger?.info?.(
     `agent local relay active session detached requestId=${session.requestId || '-'} reason=${reason} relaying=${session.relaying ? '1' : '0'} awaitingRunsseRebind=1 generatedChunks=${Array.isArray(session.generatedChunks) ? session.generatedChunks.length : 0}`,
+  );
+  return true;
+}
+
+function parkActiveRelaySessionForRunsseRebind(session, logger, reason = 'missing_response_stream') {
+  if (!session || session.aborted || session.completed) return false;
+  session.active = true;
+  session.relaying = false;
+  session.intercepted = false;
+  session.streamDetached = true;
+  session.awaitingRunsseRebind = true;
+  session.req = null;
+  session.res = null;
+  session.activeUpstreamResponse = null;
+  clearInterval(session.heartbeat);
+  session.heartbeat = null;
+  logger?.warn?.(
+    `agent local relay parked active session requestId=${session.requestId || '-'} reason=${reason} awaitingRunsseRebind=1 generatedChunks=${Array.isArray(session.generatedChunks) ? session.generatedChunks.length : 0}`
   );
   return true;
 }
@@ -3168,6 +3310,7 @@ function reattachWaitingInteractionSession(session, req, res, rawBody, logger) {
   session.completed = false;
   session.intercepted = false;
   session.streamDetached = false;
+  session.awaitingRunsseRebind = false;
   session.relaying = wasRelaying;
   beginInterceptedAgentSession(session, logger, { bootstrap: preservedChunks.length === 0 });
   if (preservedChunks.length > 0) {
@@ -4209,6 +4352,82 @@ function getLatestSessionPlanState(session = {}) {
     : null;
 }
 
+function getWorkspaceBoundPlanState(session = {}, options = {}) {
+  const planState = getLatestSessionPlanState(session);
+  if (!planState) return null;
+  const workspaceRoot = normalizeWorkspaceRoot(
+    options.workspaceRoot
+    || getSessionWorkspaceRoot(session)
+    || session?.agentHistory?.state?.workspace_root
+    || ''
+  );
+  if (!workspaceRoot) return planState;
+  return isPlanStateLikelyForeignToWorkspace(planState, workspaceRoot)
+    ? null
+    : planState;
+}
+
+function isStructuredStatePromptSource(source = '') {
+  const normalized = String(source || '').trim();
+  return normalized === 'structured_state/current_plan'
+    || normalized === 'structured_state/todo_list'
+    || normalized === 'structured_state/todo_reminder';
+}
+
+function pruneForeignStructuredPlanContexts(session = {}, workspaceRoot = '', logger = null, source = '') {
+  const normalizedWorkspace = normalizeWorkspaceRoot(workspaceRoot || getSessionWorkspaceRoot(session) || '');
+  if (!normalizedWorkspace) return 0;
+  let removed = 0;
+  if (session?.agentHistory?.conversation) {
+    try {
+      removed += Number(pruneAgentHistoryStructuredStatePromptContexts(
+        session.agentHistory.conversation,
+        (entry) => isStructuredStatePromptSource(entry?.payload?.source || ''),
+      )) || 0;
+    } catch (error) {
+      logger?.warn?.(`agent local relay failed pruning structured prompts source=${source || '-'} workspace=${JSON.stringify(normalizedWorkspace)} error=${error.message}`);
+    }
+  }
+  if (Array.isArray(session?.agentHistory?.context?.items)) {
+    const before = session.agentHistory.context.items.length;
+    session.agentHistory.context.items = session.agentHistory.context.items.filter((entry) => {
+      if (String(entry?.kind || '').trim() !== 'prompt_context') return true;
+      return !isStructuredStatePromptSource(entry?.payload?.source || '');
+    });
+    removed += Math.max(0, before - session.agentHistory.context.items.length);
+  }
+  if (removed > 0) {
+    logger?.info?.(`agent local relay pruned structured state prompts source=${source || '-'} workspace=${JSON.stringify(normalizedWorkspace)} removed=${removed}`);
+  }
+  return removed;
+}
+
+function isPlanStateLikelyForeignToWorkspace(planState = null, workspaceRoot = '') {
+  if (!planState || typeof planState !== 'object') return false;
+  const normalizedWorkspace = normalizeWorkspacePath(workspaceRoot || '');
+  if (!normalizedWorkspace) return false;
+  const planUri = String(planState.plan_uri || '').trim();
+  if (planUri) {
+    try {
+      const decodedUri = decodeURIComponent(planUri.replace(/^file:\/\/\//i, '').replace(/\//g, path.sep));
+      const normalizedPlanPath = normalizeWorkspacePath(decodedUri);
+      if (normalizedPlanPath && !normalizedPlanPath.toLowerCase().startsWith(normalizedWorkspace.toLowerCase()) && /\\\.cursor\\plans\\/i.test(normalizedPlanPath.replace(/\//g, '\\'))) {
+        return true;
+      }
+    } catch {
+      /* ignore malformed uri */
+    }
+  }
+  const planText = String(planState.plan_text || planState.plan || '').trim();
+  if (!planText) return false;
+  const lowerText = planText.toLowerCase();
+  const lowerWorkspace = normalizedWorkspace.toLowerCase().replace(/\//g, '\\');
+  if (/[a-z]:\\/.test(planText) && !lowerText.includes(lowerWorkspace)) {
+    return true;
+  }
+  return false;
+}
+
 function mapTodoStatusToOfficial(todo = {}) {
   const normalized = normalizeTodoStatus(todo?.status);
   if (normalized === 'in_progress') return 'TODO_STATUS_IN_PROGRESS';
@@ -4235,7 +4454,7 @@ function formatOfficialTodoListPrompt(session = {}) {
 
 function syncOfficialPlanState(session = {}, options = {}) {
   if (!session?.agentHistory?.state) return null;
-  const planState = getLatestSessionPlanState(session);
+  const planState = getWorkspaceBoundPlanState(session);
   if (!planState) return null;
   const planText = String(planState.plan_text || planState.plan || '').trim();
   const planUri = String(planState.plan_uri || '').trim();
@@ -4317,7 +4536,7 @@ function buildFallbackPendingPlanExecution(session = {}) {
 }
 
 function buildSyntheticPlanExecutionResponse(session = {}, conversationAction = {}) {
-  const latestPlanState = getLatestSessionPlanState(session) || {};
+  const latestPlanState = getWorkspaceBoundPlanState(session) || {};
   const actionPlanText = String(
     conversationAction?.planFileContent
     || conversationAction?.plan
@@ -4577,6 +4796,13 @@ function beginSessionHistoryTurn(session, config, options = {}) {
   session.conversationId = String(conversation?.id || stableConversationId || session.requestId || '').trim();
   session.agentTurnSeq = turnSeq;
   session.historyCompleted = false;
+  if (
+    session.latestPlanState
+    && isPlanStateLikelyForeignToWorkspace(session.latestPlanState, getSessionWorkspaceRoot(session))
+  ) {
+    pruneForeignStructuredPlanContexts(session, getSessionWorkspaceRoot(session), session?.logger || null, 'begin_turn_foreign_plan');
+    clearSessionPlanPresentationState(session, { clearTodos: true });
+  }
   if (
     shouldTreatPlanTurnAsFreshRequest(session)
     && !isPlanExecutionActionKind(getCurrentConversationActionKind(session))
@@ -5696,7 +5922,11 @@ function buildPendingInteractionResumeMessages(session = {}, pendingInteraction 
         'Do not restart or restate the original task. Continue strictly from the preserved turn context, prior assistant output, and prior tool results above.',
       ].join('\n'),
     },
-  ];
+  ].filter((message) => {
+    const content = String(message?.content || '');
+    if (!content.includes('<current_plan>')) return true;
+    return Boolean(getWorkspaceBoundPlanState(session));
+  });
 }
 
 function appendInteractionResponseToHistory(session = {}, pendingInteraction = {}, interactionResponse = {}) {
@@ -10124,6 +10354,7 @@ async function continueAgentStreamLoop(session, options = {}) {
         break;
       }
       let postToolRecoveryCount = 0;
+      startPlanningProgressTimer(session, logger, `post_tool_wait_step_${toolStep}`);
       upstreamMessages = [
         ...upstreamMessages,
         { role: 'assistant', content: streamed.text?.trim() || `Called ${toolCalls.length} tool(s).` },
@@ -10165,6 +10396,7 @@ async function continueAgentStreamLoop(session, options = {}) {
           ));
           upstreamMode = resumedMode || upstreamMode;
           if (!upstream.ok) {
+            clearPlanningProgressTimer(session);
             const errorText = await upstream.text().catch(() => '');
             upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
             recordUpstreamUsagePhase(session, config, {
@@ -10199,6 +10431,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             finalText = streamed.text;
             finalReasoning = streamed.reasoning;
             upstreamError = streamed.upstreamError;
+            clearPlanningProgressTimer(session);
             lastStreamSawDone = streamed.sawDone === true;
             lastStreamStopReason = String(streamed.stopReason || '').trim();
             if (shouldRetryReasoningTimeoutWithoutThinking(streamed, reasoningTimeoutRecoveryCount)) {
@@ -10231,6 +10464,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             });
           }
         } catch (error) {
+          clearPlanningProgressTimer(session);
           if (session.aborted) return null;
           upstreamError = summarizeFetchError(error);
           toolCalls = [];
@@ -10300,6 +10534,7 @@ async function continueAgentStreamLoop(session, options = {}) {
         finalText = '';
         upstreamError = '';
         completionVerificationCount += 1;
+        startPlanningProgressTimer(session, logger, completionPhase);
         compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: completionPhase });
         upstreamMessages = compacted.messages;
         usageMeta = compacted.usage;
@@ -10325,6 +10560,7 @@ async function continueAgentStreamLoop(session, options = {}) {
           ));
           upstreamMode = resumedMode || upstreamMode;
           if (!upstream.ok) {
+            clearPlanningProgressTimer(session);
             const errorText = await upstream.text().catch(() => '');
             upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
             recordUpstreamUsagePhase(session, config, {
@@ -10355,6 +10591,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             finalText = streamed.text;
             finalReasoning = streamed.reasoning;
             upstreamError = streamed.upstreamError;
+            clearPlanningProgressTimer(session);
             lastStreamSawDone = streamed.sawDone === true;
             lastStreamStopReason = String(streamed.stopReason || '').trim();
             if (shouldRetryReasoningTimeoutWithoutThinking(streamed, reasoningTimeoutRecoveryCount)) {
@@ -10387,6 +10624,7 @@ async function continueAgentStreamLoop(session, options = {}) {
             });
           }
         } catch (error) {
+          clearPlanningProgressTimer(session);
           if (session.aborted) return null;
           upstreamError = summarizeFetchError(error);
           toolCalls = [];
@@ -10443,6 +10681,7 @@ async function continueAgentStreamLoop(session, options = {}) {
       finalText = '';
       upstreamError = '';
       incompletePostMutationContinuationCount += 1;
+      startPlanningProgressTimer(session, logger, continuationPhase);
       compacted = compactRelayMessagesForContext(upstreamMessages, config, logger, { requestId, phase: continuationPhase });
       upstreamMessages = compacted.messages;
       usageMeta = compacted.usage;
@@ -10469,6 +10708,7 @@ async function continueAgentStreamLoop(session, options = {}) {
         ));
         upstreamMode = resumedMode || upstreamMode;
         if (!upstream.ok) {
+          clearPlanningProgressTimer(session);
           const errorText = await upstream.text().catch(() => '');
           upstreamError = summarizeUpstreamFailure(upstream.status, errorText);
           recordUpstreamUsagePhase(session, config, {
@@ -10499,6 +10739,7 @@ async function continueAgentStreamLoop(session, options = {}) {
           finalText = streamed.text;
           finalReasoning = streamed.reasoning;
           upstreamError = streamed.upstreamError;
+          clearPlanningProgressTimer(session);
           lastStreamSawDone = streamed.sawDone === true;
           lastStreamStopReason = String(streamed.stopReason || '').trim();
           if (shouldAbortForNoVisibleProgress(streamed, getRuntimeTuningValue(config, 'postToolNoVisibleProgressTimeoutMs', POST_TOOL_NO_VISIBLE_PROGRESS_TIMEOUT_MS))) {
@@ -10528,6 +10769,7 @@ async function continueAgentStreamLoop(session, options = {}) {
           });
         }
       } catch (error) {
+        clearPlanningProgressTimer(session);
         if (session.aborted) return null;
         upstreamError = summarizeFetchError(error);
         toolCalls = [];
@@ -11442,7 +11684,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       const session = reattachWaitingInteractionSession(existingWaitingSession, req, res, rawBody, logger);
       if (pendingCapture) {
         session.lastUserMessageCapture = pendingCapture;
-        session.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || session.workspaceRoot || '');
+        syncSessionWorkspaceRoot(session, pendingCapture.workspaceRoot || session.workspaceRoot || '', logger, 'runsse_reattach_pending_capture');
         pendingAgentMessages.delete(requestId);
       }
       res.on('close', () => {
@@ -11471,7 +11713,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       const session = reattachWaitingInteractionSession(crossRequestWaitingSession, req, res, rawBody, logger);
       if (pendingCapture) {
         session.lastUserMessageCapture = pendingCapture;
-        session.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || session.workspaceRoot || '');
+        syncSessionWorkspaceRoot(session, pendingCapture.workspaceRoot || session.workspaceRoot || '', logger, 'runsse_cross_request_pending_capture');
         pendingAgentMessages.delete(requestId);
       }
       res.on('close', () => {
@@ -11506,7 +11748,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
           const fallbackSession = reattachWaitingInteractionSession(candidate, req, res, rawBody, logger);
           if (pendingCapture) {
             fallbackSession.lastUserMessageCapture = pendingCapture;
-            fallbackSession.workspaceRoot = normalizeWorkspacePath(pendingCapture.workspaceRoot || fallbackSession.workspaceRoot || '');
+            syncSessionWorkspaceRoot(fallbackSession, pendingCapture.workspaceRoot || fallbackSession.workspaceRoot || '', logger, 'runsse_fallback_pending_capture');
             pendingAgentMessages.delete(requestId);
           }
           res.on('close', () => {
@@ -11550,7 +11792,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
       execClientControls: [],
       generatedChunks: [],
       lastUserMessageCapture: null,
-      workspaceRoot: '',
+      workspaceRoot: readRecentWorkspaceRoot() || '',
       completedAgentTurns,
       pendingAgentInteractions,
     };
@@ -11561,7 +11803,10 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
     } catch {
       logger.info(`agent local relay runner code mtime requestId=${requestId || '-'} file=${JSON.stringify(__filename)} mtime=unavailable`);
     }
-    beginInterceptedAgentSession(session, logger);
+    if (!beginInterceptedAgentSession(session, logger)) {
+      failAgentRelaySession(session, logger, new Error('Missing RunSSE response stream during session bootstrap'), 'runsse_bootstrap');
+      return;
+    }
     if (requestId) {
       const previous = agentSessions.get(requestId);
       if (previous && previous !== session) {
@@ -11598,7 +11843,7 @@ async function handleAgentRunSse(req, res, config, logger, stats, agentSessions,
         pendingAgentMessages.delete(requestId);
         session.lastUserMessageCapture = pending.capture || null;
         session.agentMode = normalizeAgentModeName(pending.capture?.mode || session.agentMode || 'AGENT_MODE_AGENT');
-        session.workspaceRoot = normalizeWorkspacePath(pending.workspaceRoot || pending.capture?.workspaceRoot || session.workspaceRoot || '');
+        syncSessionWorkspaceRoot(session, pending.workspaceRoot || pending.capture?.workspaceRoot || session.workspaceRoot || '', logger, 'runsse_pending_user_message');
         if (pending.completedTurn) {
           completeDuplicateAgentSession(session, logger, 'completed_scope_replay_pending', pending.completedTurn);
           return;
@@ -11734,16 +11979,17 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         return;
       }
       if (isStartPlan) {
+        const fallbackPlanState = getWorkspaceBoundPlanState(session) || {};
         ensureOpenSessionHistoryTurn(session, config, {
           includeUserMessage: false,
           includeRequestContext: false,
           includeModePromptContexts: false,
         });
         const planState = {
-          plan: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan || '').trim(),
-          plan_text: String(action.plan || action.userText || getLatestSessionPlanState(session)?.plan_text || '').trim(),
-          plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
-          todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+          plan: String(action.plan || action.userText || fallbackPlanState.plan || '').trim(),
+          plan_text: String(action.plan || action.userText || fallbackPlanState.plan_text || '').trim(),
+          plan_uri: String(action.planFileUri || fallbackPlanState.plan_uri || '').trim(),
+          todos: Array.isArray(fallbackPlanState.todos) ? fallbackPlanState.todos : [],
         };
         rememberSessionPlanState(session, planState);
         updatePlanWorkflowForConversationAction(session, actionKind, action);
@@ -11762,6 +12008,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         ack();
         return;
       }
+      const fallbackPlanState = getWorkspaceBoundPlanState(session) || {};
       if (isExecutePlan) {
         ensureOpenSessionHistoryTurn(session, config, {
           includeUserMessage: false,
@@ -11769,10 +12016,10 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
           includeModePromptContexts: false,
         });
         const planState = {
-          plan: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan || '').trim(),
-          plan_text: String(action.planFileContent || action.plan || getLatestSessionPlanState(session)?.plan_text || '').trim(),
-          plan_uri: String(action.planFileUri || getLatestSessionPlanState(session)?.plan_uri || '').trim(),
-          todos: Array.isArray(getLatestSessionPlanState(session)?.todos) ? getLatestSessionPlanState(session).todos : [],
+          plan: String(action.planFileContent || action.plan || fallbackPlanState.plan || '').trim(),
+          plan_text: String(action.planFileContent || action.plan || fallbackPlanState.plan_text || '').trim(),
+          plan_uri: String(action.planFileUri || fallbackPlanState.plan_uri || '').trim(),
+          todos: Array.isArray(fallbackPlanState.todos) ? fallbackPlanState.todos : [],
         };
         rememberSessionPlanState(session, planState);
         updatePlanWorkflowForConversationAction(session, actionKind, action);
@@ -11854,15 +12101,19 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
             stableConversationId: userStableConvId,
             debug: decoded.debug || null,
           };
-          session.workspaceRoot = userWorkspaceRoot || session.workspaceRoot || '';
-          beginInterceptedAgentSession(session, logger);
+          syncSessionWorkspaceRoot(session, userWorkspaceRoot || session.workspaceRoot || '', logger, 'conversation_action_user_message');
+          if (!beginInterceptedAgentSession(session, logger)) {
+            failAgentRelaySession(session, logger, new Error('Missing response stream for conversation_action user_message'), 'conversation_action_user_message');
+            ack();
+            return;
+          }
           relayAgentUserMessage(session, normalizedUserText, config, logger, stats)
             .catch((error) => failAgentRelaySession(session, logger, error, 'conversation_action_user_message'));
           ack();
           return;
         }
         if (session?.active && session.relaying) {
-          session.workspaceRoot = userWorkspaceRoot || session.workspaceRoot || '';
+          syncSessionWorkspaceRoot(session, userWorkspaceRoot || session.workspaceRoot || '', logger, 'conversation_action_user_message_queue');
           enqueueQueuedAgentMessage(session, {
             userText: normalizedUserText,
             workspaceRoot: userWorkspaceRoot,
@@ -12150,7 +12401,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
         rebindWaitingSessionRequestId(waitingSession, decoded.requestId, logger);
         waitingSession.agentMode = capture.mode;
         waitingSession.lastUserMessageCapture = capture;
-        waitingSession.workspaceRoot = workspaceRoot || waitingSession.workspaceRoot || '';
+        syncSessionWorkspaceRoot(waitingSession, workspaceRoot || waitingSession.workspaceRoot || '', logger, 'user_message_waiting_session_rebind');
         logger.info(`agent local relay mapped new request to waiting session requestId=${decoded.requestId} previousRequestId=${waitingSession.requestId || '-'} stableConversationId=${JSON.stringify(stableConversationId)} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(waitingSession))}`);
         ack();
         return;
@@ -12158,7 +12409,7 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       if (session?.active && session.waitingForInteraction && !session.relaying) {
         session.agentMode = capture.mode;
         session.lastUserMessageCapture = capture;
-        session.workspaceRoot = workspaceRoot || session.workspaceRoot || '';
+        syncSessionWorkspaceRoot(session, workspaceRoot || session.workspaceRoot || '', logger, 'user_message_waiting_session');
         logger.info(
           `agent local relay waiting user_message acked requestId=${decoded.requestId} handoff=${session.planTurnHandoff || session.modeTurnHandoff || '-'} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))} textLen=${normalizedUserText.length}`,
         );
@@ -12177,9 +12428,18 @@ async function handleBidiAppend(req, res, config, logger, stats, agentSessions, 
       if (session?.active) {
         session.agentMode = capture.mode;
         session.lastUserMessageCapture = capture;
-        session.workspaceRoot = workspaceRoot || session.workspaceRoot || '';
+        syncSessionWorkspaceRoot(session, workspaceRoot || session.workspaceRoot || '', logger, 'user_message_active_session');
         logger.info(`agent local relay workspace requestId=${decoded.requestId} workspaceRoot=${JSON.stringify(getSessionWorkspaceRoot(session))}`);
-        beginInterceptedAgentSession(session, logger);
+        if (!beginInterceptedAgentSession(session, logger)) {
+          parkActiveRelaySessionForRunsseRebind(session, logger, 'active_user_message_missing_response_stream');
+          enqueueQueuedAgentMessage(session, {
+            userText: normalizedUserText,
+            workspaceRoot,
+            capture,
+          }, logger, { priority: true, source: 'active_user_message_missing_response_stream' });
+          ack();
+          return;
+        }
         relayAgentUserMessage(session, normalizedUserText, config, logger, stats)
           .catch((error) => failAgentRelaySession(session, logger, error, 'async'));
         ack();
@@ -13075,10 +13335,12 @@ function startProxy(config) {
   };
 
   let shuttingDown = false;
-  function shutdown() {
+  const launcherWatchdog = startLauncherWatchdog((reason) => shutdown(reason));
+  function shutdown(reason = 'shutdown') {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info('shutting down cursor relay proxy');
+    logger.info(`shutting down cursor relay proxy reason=${reason}`);
+    try { clearInterval(launcherWatchdog); } catch { /* ignore */ }
     try { stateGuard.stopStateGuard(); } catch { /* ignore */ }
     try {
       for (const session of Array.from(agentSessions.values())) {

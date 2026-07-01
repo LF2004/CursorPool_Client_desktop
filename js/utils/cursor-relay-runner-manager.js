@@ -838,6 +838,7 @@ async function scheduleRunnerRestart(payload, exitCode, exitSignal) {
     console.log('[relay-runner] 延迟期间检测到主动停止，取消自动重启');
     return;
   }
+  await waitForRunnerDown(Number(payload?.port || runnerConfig?.port || DEFAULT_PORT), 10, 100).catch(() => null);
   // 已有新 runner 在运行则取消
   if (runnerChild && !runnerChild.killed) {
     console.log('[relay-runner] 已有 runner 在运行，取消自动重启');
@@ -998,6 +999,14 @@ async function startLocalRelayRunner(payload = {}) {
   }
 
   await stopLocalRelayRunner({ port, fast: true });
+  const down = await waitForRunnerDown(port, 15, 120);
+  if (!down) {
+    const lingeringPids = findListeningPidsByPort(port);
+    if (lingeringPids.length) {
+      lingeringPids.forEach((pid) => terminateRunnerPid(pid, { force: true }));
+      await waitForRunnerDown(port, 10, 150);
+    }
+  }
   appendRunnerLog(
     `[info] runner restart requested requestedModel=${String(upstream.modelName || '')} forceRestart=${forceRestartRunner ? '1' : '0'} mode=${mode}`,
     customRoot,
@@ -1036,6 +1045,7 @@ async function startLocalRelayRunner(payload = {}) {
   const spawnEnv = {
     ...process.env,
     ELECTRON_RUN_AS_NODE: '1',
+    CURSOR_RELAY_LAUNCHER_PID: String(process.ppid || process.pid || ''),
   };
   if (written.config.outboundProxy?.enabled && written.config.outboundProxy.url) {
     const proxyUrl = String(written.config.outboundProxy.url).trim();
@@ -1086,6 +1096,11 @@ async function startLocalRelayRunner(payload = {}) {
     isExpected: (result) => runnerHealthMatchesWrittenConfig(result, written, mode),
   });
   if (!health.ok) {
+    const portPids = findListeningPidsByPort(port);
+    if (portPids.length) {
+      portPids.forEach((pid) => terminateRunnerPid(pid, { force: true }));
+      await waitForRunnerDown(port, 8, 120);
+    }
     const latestLog = await readRunnerLogTail(customRoot, 120).catch(() => null);
     const portOpen = await isPortOpen(port).catch(() => false);
     if (portOpen) {

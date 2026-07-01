@@ -71,6 +71,24 @@ let relayFieldHintEl = null;
 let relayFieldHintTimer = null;
 const CONFIG_PAGE_SIZE = 6;
 const configPageByProvider = { openai: 1, anthropic: 1, deepseek: 1, gemini: 1, mimo: 1, custom: 1 };
+const RELAY_RUNTIME_TUNING_STORAGE_KEY = 'cursor_relay_runtime_tuning_v1';
+const RELAY_RUNTIME_TUNING_DEFAULTS = Object.freeze({
+  upstreamFetchTimeoutMs: 300000,
+  postToolNoVisibleProgressTimeoutMs: 25000,
+  upstreamStreamIdleTimeoutMs: 90000,
+  postToolUpstreamTimeoutMs: 300000,
+  postToolStreamIdleTimeoutMs: 45000,
+  postToolMutationStreamIdleTimeoutMs: 25000,
+  postMutationSummaryTimeoutMs: 8000,
+  postMutationSummaryIdleTimeoutMs: 3000,
+  mutationToolStreamIdleTimeoutMs: 30000,
+  mutationToolStreamMaxDurationMs: 60000,
+  deepseekReasoningOnlyStreamMaxMs: 12000,
+  maxIncompletePostMutationContinuations: 3,
+  maxReadOnlyExplorationContinuations: 2,
+  emitEditToolPlaceholderFrames: false,
+});
+let relayRuntimeTuning = { ...RELAY_RUNTIME_TUNING_DEFAULTS };
 function syncReviewBridgeToggleFromStorage() {
   // Review bridge injection is now managed manually in Preferences.
 }
@@ -138,6 +156,81 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function sanitizeRuntimeTuning(raw = {}) {
+  const merged = { ...RELAY_RUNTIME_TUNING_DEFAULTS };
+  if (!raw || typeof raw !== 'object') return merged;
+  Object.keys(RELAY_RUNTIME_TUNING_DEFAULTS).forEach((key) => {
+    const defaultValue = RELAY_RUNTIME_TUNING_DEFAULTS[key];
+    const value = raw[key];
+    if (typeof defaultValue === 'boolean') {
+      merged[key] = value === true;
+      return;
+    }
+    const num = Number(value);
+    if (Number.isFinite(num) && num >= 0) {
+      merged[key] = Math.floor(num);
+    }
+  });
+  return merged;
+}
+
+function loadRelayRuntimeTuning() {
+  try {
+    const raw = localStorage.getItem(RELAY_RUNTIME_TUNING_STORAGE_KEY);
+    if (!raw) return { ...RELAY_RUNTIME_TUNING_DEFAULTS };
+    return sanitizeRuntimeTuning(JSON.parse(raw));
+  } catch {
+    return { ...RELAY_RUNTIME_TUNING_DEFAULTS };
+  }
+}
+
+function saveRelayRuntimeTuningToStorage(nextValue = {}) {
+  relayRuntimeTuning = sanitizeRuntimeTuning(nextValue);
+  try {
+    localStorage.setItem(RELAY_RUNTIME_TUNING_STORAGE_KEY, JSON.stringify(relayRuntimeTuning));
+  } catch {
+    /* ignore */
+  }
+  return relayRuntimeTuning;
+}
+
+function renderRelayRuntimeTuningForm() {
+  const tuning = sanitizeRuntimeTuning(relayRuntimeTuning);
+  if ($('relayTuneUpstreamFetchTimeoutMs')) $('relayTuneUpstreamFetchTimeoutMs').value = String(tuning.upstreamFetchTimeoutMs);
+  if ($('relayTunePostToolNoVisibleProgressTimeoutMs')) $('relayTunePostToolNoVisibleProgressTimeoutMs').value = String(tuning.postToolNoVisibleProgressTimeoutMs);
+  if ($('relayTuneUpstreamStreamIdleTimeoutMs')) $('relayTuneUpstreamStreamIdleTimeoutMs').value = String(tuning.upstreamStreamIdleTimeoutMs);
+  if ($('relayTunePostToolUpstreamTimeoutMs')) $('relayTunePostToolUpstreamTimeoutMs').value = String(tuning.postToolUpstreamTimeoutMs);
+  if ($('relayTunePostToolStreamIdleTimeoutMs')) $('relayTunePostToolStreamIdleTimeoutMs').value = String(tuning.postToolStreamIdleTimeoutMs);
+  if ($('relayTunePostToolMutationStreamIdleTimeoutMs')) $('relayTunePostToolMutationStreamIdleTimeoutMs').value = String(tuning.postToolMutationStreamIdleTimeoutMs);
+  if ($('relayTunePostMutationSummaryTimeoutMs')) $('relayTunePostMutationSummaryTimeoutMs').value = String(tuning.postMutationSummaryTimeoutMs);
+  if ($('relayTunePostMutationSummaryIdleTimeoutMs')) $('relayTunePostMutationSummaryIdleTimeoutMs').value = String(tuning.postMutationSummaryIdleTimeoutMs);
+  if ($('relayTuneMutationToolStreamIdleTimeoutMs')) $('relayTuneMutationToolStreamIdleTimeoutMs').value = String(tuning.mutationToolStreamIdleTimeoutMs);
+  if ($('relayTuneMutationToolStreamMaxDurationMs')) $('relayTuneMutationToolStreamMaxDurationMs').value = String(tuning.mutationToolStreamMaxDurationMs);
+  if ($('relayTuneDeepseekReasoningOnlyStreamMaxMs')) $('relayTuneDeepseekReasoningOnlyStreamMaxMs').value = String(tuning.deepseekReasoningOnlyStreamMaxMs);
+  if ($('relayTuneMaxIncompletePostMutationContinuations')) $('relayTuneMaxIncompletePostMutationContinuations').value = String(tuning.maxIncompletePostMutationContinuations);
+  if ($('relayTuneMaxReadOnlyExplorationContinuations')) $('relayTuneMaxReadOnlyExplorationContinuations').value = String(tuning.maxReadOnlyExplorationContinuations);
+  if ($('relayTuneEmitEditToolPlaceholderFrames')) $('relayTuneEmitEditToolPlaceholderFrames').checked = tuning.emitEditToolPlaceholderFrames === true;
+}
+
+function collectRelayRuntimeTuningForm() {
+  return sanitizeRuntimeTuning({
+    upstreamFetchTimeoutMs: $('relayTuneUpstreamFetchTimeoutMs')?.value,
+    postToolNoVisibleProgressTimeoutMs: $('relayTunePostToolNoVisibleProgressTimeoutMs')?.value,
+    upstreamStreamIdleTimeoutMs: $('relayTuneUpstreamStreamIdleTimeoutMs')?.value,
+    postToolUpstreamTimeoutMs: $('relayTunePostToolUpstreamTimeoutMs')?.value,
+    postToolStreamIdleTimeoutMs: $('relayTunePostToolStreamIdleTimeoutMs')?.value,
+    postToolMutationStreamIdleTimeoutMs: $('relayTunePostToolMutationStreamIdleTimeoutMs')?.value,
+    postMutationSummaryTimeoutMs: $('relayTunePostMutationSummaryTimeoutMs')?.value,
+    postMutationSummaryIdleTimeoutMs: $('relayTunePostMutationSummaryIdleTimeoutMs')?.value,
+    mutationToolStreamIdleTimeoutMs: $('relayTuneMutationToolStreamIdleTimeoutMs')?.value,
+    mutationToolStreamMaxDurationMs: $('relayTuneMutationToolStreamMaxDurationMs')?.value,
+    deepseekReasoningOnlyStreamMaxMs: $('relayTuneDeepseekReasoningOnlyStreamMaxMs')?.value,
+    maxIncompletePostMutationContinuations: $('relayTuneMaxIncompletePostMutationContinuations')?.value,
+    maxReadOnlyExplorationContinuations: $('relayTuneMaxReadOnlyExplorationContinuations')?.value,
+    emitEditToolPlaceholderFrames: $('relayTuneEmitEditToolPlaceholderFrames')?.checked === true,
+  });
 }
 
 async function reloadProfilesStore() {
@@ -899,6 +992,7 @@ function collectRelayRuntimeOptions() {
     localNativeAgentTools: true,
     structuredAgentToolCalls: true,
     emitSyntheticLocalNativeToolFrames: false,
+    runtimeTuning: sanitizeRuntimeTuning(relayRuntimeTuning),
   };
 }
 
@@ -1746,14 +1840,42 @@ function bindRelayLogButtons() {
 
 export async function refreshProxyStatus() {
   await reloadProfilesStore();
+  relayRuntimeTuning = loadRelayRuntimeTuning();
+  renderRelayRuntimeTuningForm();
   renderConfigGrid();
   await refreshRelayStatus();
 }
 
 export async function bindProxyEvents() {
   applyRelayAdminVisibility();
+  relayRuntimeTuning = loadRelayRuntimeTuning();
+  renderRelayRuntimeTuningForm();
   await initProfilesUi();
   bindRelayLogButtons();
+
+  const relayRuntimeTuningSaveBtn = $('relayRuntimeTuningSaveBtn');
+  if (relayRuntimeTuningSaveBtn) {
+    relayRuntimeTuningSaveBtn.onclick = async () => {
+      relayRuntimeTuning = saveRelayRuntimeTuningToStorage(collectRelayRuntimeTuningForm());
+      renderRelayRuntimeTuningForm();
+      await showAlert('全局 Relay 运行调优已保存。重新启用 Relay 后将使用新设置；如果当前 Relay 正在运行，下次切换模型或重新启用也会自动带上。', {
+        title: '运行调优已保存',
+        tone: 'success',
+      });
+    };
+  }
+
+  const relayRuntimeTuningResetBtn = $('relayRuntimeTuningResetBtn');
+  if (relayRuntimeTuningResetBtn) {
+    relayRuntimeTuningResetBtn.onclick = async () => {
+      relayRuntimeTuning = saveRelayRuntimeTuningToStorage(RELAY_RUNTIME_TUNING_DEFAULTS);
+      renderRelayRuntimeTuningForm();
+      await showAlert('已恢复默认的全局 Relay 运行调优设置。', {
+        title: '已恢复默认',
+        tone: 'info',
+      });
+    };
+  }
 
   const relayAgentTestBtn = $('relayAgentTestBtn');
   if (relayAgentTestBtn) {

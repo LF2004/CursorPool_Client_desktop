@@ -146,7 +146,13 @@ function buildPlanWorkflowUpdateForInteractionResponse({
   const responseKind = String(interactionResponse?.kind || '').trim();
   if (responseKind === 'ask_question_interaction_response') {
     const status = getAskQuestionResponseStatus(interactionResponse);
-    if (status === 'success' || hasAskQuestionResponseResolution(interactionResponse)) {
+    const answers = Array.isArray(interactionResponse?.askQuestion?.answers) ? interactionResponse.askQuestion.answers : [];
+    const hasConcreteAnswer = answers.some((answer) => {
+      if (!answer || typeof answer !== 'object') return false;
+      if (Array.isArray(answer.selectedOptionIds) && answer.selectedOptionIds.length > 0) return true;
+      return String(answer.freeformText || '').trim().length > 0;
+    });
+    if ((status === 'success' || hasAskQuestionResponseResolution(interactionResponse)) && hasConcreteAnswer) {
       return buildPlanWorkflowStateUpdate(state, PLAN_WORKFLOW_PHASES.ANSWERS_COLLECTED, {
         lastInteractionKind: responseKind,
         needsFreshExploreAfterAnswers: true,

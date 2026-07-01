@@ -96,6 +96,51 @@ function updateConversationState(conversation, patch = {}) {
   saveConversation(conversation);
 }
 
+function updateConversationWorkspaceRoot(conversation, workspaceRoot = '') {
+  if (!conversation) return false;
+  const normalized = String(workspaceRoot || '').trim();
+  if (!normalized) return false;
+  conversation.state = conversation.state && typeof conversation.state === 'object'
+    ? conversation.state
+    : {};
+  if (String(conversation.state.workspace_root || '').trim() === normalized) return false;
+  conversation.state.workspace_root = normalized;
+  if (conversation.state.last_capture && typeof conversation.state.last_capture === 'object') {
+    conversation.state.last_capture.workspace_root = normalized;
+  }
+  saveConversation(conversation);
+  return true;
+}
+
+function pruneStructuredStatePromptContexts(conversation, predicate = null) {
+  if (!conversation || typeof conversation !== 'object') return 0;
+  const items = Array.isArray(conversation.context?.items) ? conversation.context.items : [];
+  if (!items.length) return 0;
+  const shouldRemove = typeof predicate === 'function'
+    ? predicate
+    : (entry) => {
+        const source = String(entry?.payload?.source || '').trim();
+        return source === 'structured_state/current_plan'
+          || source === 'structured_state/todo_list'
+          || source === 'structured_state/todo_reminder';
+      };
+  const kept = [];
+  let removed = 0;
+  for (const entry of items) {
+    const isPromptContext = String(entry?.kind || '').trim() === 'prompt_context';
+    if (isPromptContext && shouldRemove(entry)) {
+      removed += 1;
+      continue;
+    }
+    kept.push(entry);
+  }
+  if (!removed) return 0;
+  conversation.context.items = kept;
+  conversation.context.version = Math.max(0, ...kept.map((entry) => Number(entry?.seq) || 0));
+  saveConversation(conversation);
+  return removed;
+}
+
 function mergeConversationMetadata(conversation, patch = {}) {
   if (!conversation || !patch || typeof patch !== 'object') return;
   conversation.state = conversation.state && typeof conversation.state === 'object'
@@ -198,6 +243,8 @@ module.exports = {
   getConversationId,
   getHistoryRoot,
   mergeConversationMetadata,
+  pruneStructuredStatePromptContexts,
   updateConversationState,
+  updateConversationWorkspaceRoot,
   updateUsage,
 };
